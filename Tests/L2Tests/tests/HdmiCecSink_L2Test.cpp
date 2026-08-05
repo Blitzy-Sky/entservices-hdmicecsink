@@ -90,6 +90,8 @@ typedef enum : uint32_t {
     ARC_INITIATION_EVENT = 0x00000100,
     ARC_TERMINATION_EVENT = 0x00000200,
     REPORT_AUDIO_DEVICE_CONNECTED = 0x00000400,
+    ON_KEY_PRESS_EVENT = 0x00000800, // Unique value to avoid overlap
+    ON_KEY_RELEASE_EVENT = 0x00001000, // Unique value to avoid overlap
     ON_REPORT_AUDIO_STATUS = 0x10000000, // Unique value to avoid overlap
     REPORT_FEATURE_ABORT = 0x20000000, // Unique value to avoid overlap
     REPORT_CEC_ENABLED = 0x40000000, // Unique value to avoid overlap
@@ -106,13 +108,19 @@ private:
     std::mutex m_mutex;
     std::condition_variable m_condition_variable;
     uint32_t m_event_signalled;
+    int m_logicalAddress;
+    int m_keyCode;
 
     BEGIN_INTERFACE_MAP(Notification)
     INTERFACE_ENTRY(Exchange::IHdmiCecSink::INotification)
     END_INTERFACE_MAP
 
 public:
-    HdmiCecSinkNotificationHandler() {}
+    HdmiCecSinkNotificationHandler()
+        : m_logicalAddress(0)
+        , m_keyCode(0)
+    {
+    }
     ~HdmiCecSinkNotificationHandler() {}
 
     // Event handlers with data storage for validation
@@ -263,6 +271,28 @@ public:
         m_condition_variable.notify_one();
     }
 
+    void OnKeyPressEvent(const int logicalAddress, const int keyCode) override
+    {
+        TEST_LOG("OnKeyPressEvent event received, logicalAddress: %d, keyCode: %d", logicalAddress, keyCode);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_logicalAddress = logicalAddress;
+        m_keyCode = keyCode;
+        m_event_signalled |= ON_KEY_PRESS_EVENT;
+        m_condition_variable.notify_one();
+    }
+
+    void OnKeyReleaseEvent(const int logicalAddress) override
+    {
+        TEST_LOG("OnKeyReleaseEvent event received, logicalAddress: %d", logicalAddress);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_logicalAddress = logicalAddress;
+        m_event_signalled |= ON_KEY_RELEASE_EVENT;
+        m_condition_variable.notify_one();
+    }
+
+    int GetLogicalAddress() const { return m_logicalAddress; }
+    int GetKeyCode() const { return m_keyCode; }
+
     uint32_t WaitForRequestStatus(uint32_t timeout_ms, HdmiCecSinkL2test_async_events_t expected_status)
     {
         std::unique_lock<std::mutex> lock(m_mutex);
@@ -307,6 +337,8 @@ public:
     MOCK_METHOD(void, shortAudiodescriptorEvent, (const JsonObject& message));
     MOCK_METHOD(void, standbyMessageReceived, (const JsonObject& message));
     MOCK_METHOD(void, reportAudioDevicePowerStatus, (const JsonObject& message));
+    MOCK_METHOD(void, onKeyPressEvent, (const JsonObject& message));
+    MOCK_METHOD(void, onKeyReleaseEvent, (const JsonObject& message));
 };
 
 class HdmiCecSink_L2Test : public L2TestMocks {
@@ -335,6 +367,8 @@ public:
     void shortAudiodescriptorEvent(const JsonObject& message);
     void standbyMessageReceived(const JsonObject& message);
     void reportAudioDevicePowerStatus(const JsonObject& message);
+    void onKeyPressEvent(const JsonObject& message);
+    void onKeyReleaseEvent(const JsonObject& message);
 
 protected:
     Exchange::IHdmiCecSink* m_cecSinkPlugin = nullptr;
@@ -345,6 +379,8 @@ protected:
     FrameListener* registeredListener = nullptr;
     std::vector<FrameListener*> listeners;
     device::Host::IHdmiInEvents* g_registeredHdmiInListener = nullptr;
+    int m_logicalAddress = 0;
+    int m_keyCode = 0;
 
     Core::ProxyType<RPC::InvokeServerType<1, 0, 4>> HdmiCecSink_Engine;
     Core::ProxyType<RPC::CommunicatorClient> HdmiCecSink_Client;
@@ -993,6 +1029,41 @@ void HdmiCecSink_L2Test::reportAudioDevicePowerStatus(const JsonObject& message)
 
     /* Notify the requester thread. */
     m_event_signalled |= REPORT_AUDIO_DEVICE_POWER_STATUS;
+    m_condition_variable.notify_one();
+}
+
+void HdmiCecSink_L2Test::onKeyPressEvent(const JsonObject& message)
+{
+    TEST_LOG("onKeyPressEvent event triggered ***\n");
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    std::string str;
+    message.ToString(str);
+
+    TEST_LOG("onKeyPressEvent received: %s\n", str.c_str());
+
+    m_logicalAddress = message["logicalAddress"].Number();
+    m_keyCode = message["keyCode"].Number();
+
+    /* Notify the requester thread. */
+    m_event_signalled |= ON_KEY_PRESS_EVENT;
+    m_condition_variable.notify_one();
+}
+
+void HdmiCecSink_L2Test::onKeyReleaseEvent(const JsonObject& message)
+{
+    TEST_LOG("onKeyReleaseEvent event triggered ***\n");
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    std::string str;
+    message.ToString(str);
+
+    TEST_LOG("onKeyReleaseEvent received: %s\n", str.c_str());
+
+    m_logicalAddress = message["logicalAddress"].Number();
+
+    /* Notify the requester thread. */
+    m_event_signalled |= ON_KEY_RELEASE_EVENT;
     m_condition_variable.notify_one();
 }
 
@@ -3739,6 +3810,458 @@ TEST_F(HdmiCecSink_L2Test, InjectPollingFrame)
         if (listener)
             listener->notify(frame);
     }
+}
+
+// Inject User Control Pressed and verify both JSON-RPC and COMRPC notifications
+TEST_F(HdmiCecSink_L2Test, InjectUserControlPressedFrameAndVerifyEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+    uint32_t directSignalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onKeyPressEvent"),
+        &AsyncHandlerMock_HdmiCecSink::onKeyPressEvent,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    EXPECT_NE(nullptr, m_controller_cecSink);
+    EXPECT_NE(nullptr, m_cecSinkPlugin);
+    if (m_cecSinkPlugin) {
+        EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->Register(&m_notificationHandler));
+    }
+
+    EXPECT_CALL(async_handler, onKeyPressEvent(::testing::_))
+        .WillOnce(Invoke(this, &HdmiCecSink_L2Test::onKeyPressEvent));
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // User Control Pressed from Playback Device 1 (4) to TV (0), Volume Up (0x41)
+    uint8_t buffer[] = { 0x40, 0x44, 0x41 };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_KEY_PRESS_EVENT);
+    EXPECT_TRUE(signalled & ON_KEY_PRESS_EVENT);
+    EXPECT_EQ(4, m_logicalAddress);
+    EXPECT_EQ(0x41, m_keyCode);
+
+    directSignalled = m_notificationHandler.WaitForRequestStatus(EVNT_TIMEOUT, ON_KEY_PRESS_EVENT);
+    EXPECT_TRUE(directSignalled & ON_KEY_PRESS_EVENT);
+    EXPECT_EQ(4, m_notificationHandler.GetLogicalAddress());
+    EXPECT_EQ(0x41, m_notificationHandler.GetKeyCode());
+
+    if (m_cecSinkPlugin) {
+        EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->Unregister(&m_notificationHandler));
+        m_cecSinkPlugin->Release();
+        m_cecSinkPlugin = nullptr;
+    }
+    if (m_controller_cecSink) {
+        m_controller_cecSink->Release();
+        m_controller_cecSink = nullptr;
+    }
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onKeyPressEvent"));
+}
+
+// Inject User Control Released and verify both JSON-RPC and COMRPC notifications
+TEST_F(HdmiCecSink_L2Test, InjectUserControlReleasedFrameAndVerifyEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+    uint32_t directSignalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onKeyReleaseEvent"),
+        &AsyncHandlerMock_HdmiCecSink::onKeyReleaseEvent,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    EXPECT_NE(nullptr, m_controller_cecSink);
+    EXPECT_NE(nullptr, m_cecSinkPlugin);
+    if (m_cecSinkPlugin) {
+        EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->Register(&m_notificationHandler));
+    }
+
+    EXPECT_CALL(async_handler, onKeyReleaseEvent(::testing::_))
+        .WillOnce(Invoke(this, &HdmiCecSink_L2Test::onKeyReleaseEvent));
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // User Control Released from Playback Device 1 (4) to TV (0)
+    uint8_t buffer[] = { 0x40, 0x45 };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_KEY_RELEASE_EVENT);
+    EXPECT_TRUE(signalled & ON_KEY_RELEASE_EVENT);
+    EXPECT_EQ(4, m_logicalAddress);
+
+    directSignalled = m_notificationHandler.WaitForRequestStatus(EVNT_TIMEOUT, ON_KEY_RELEASE_EVENT);
+    EXPECT_TRUE(directSignalled & ON_KEY_RELEASE_EVENT);
+    EXPECT_EQ(4, m_notificationHandler.GetLogicalAddress());
+
+    if (m_cecSinkPlugin) {
+        EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->Unregister(&m_notificationHandler));
+        m_cecSinkPlugin->Release();
+        m_cecSinkPlugin = nullptr;
+    }
+    if (m_controller_cecSink) {
+        m_controller_cecSink->Release();
+        m_controller_cecSink = nullptr;
+    }
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onKeyReleaseEvent"));
+}
+
+// Verify the minimum one-byte UI command is forwarded without validation
+TEST_F(HdmiCecSink_L2Test, InjectUserControlPressedMinimumKeyCodeAndVerifyEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onKeyPressEvent"),
+        &AsyncHandlerMock_HdmiCecSink::onKeyPressEvent,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onKeyPressEvent(::testing::_))
+        .WillOnce(Invoke(this, &HdmiCecSink_L2Test::onKeyPressEvent));
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // Select is the minimum named UI command (0x00)
+    uint8_t buffer[] = { 0x40, 0x44, 0x00 };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_KEY_PRESS_EVENT);
+    EXPECT_TRUE(signalled & ON_KEY_PRESS_EVENT);
+    EXPECT_EQ(4, m_logicalAddress);
+    EXPECT_EQ(0x00, m_keyCode);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onKeyPressEvent"));
+}
+
+// Verify the highest named one-byte UI command is forwarded
+TEST_F(HdmiCecSink_L2Test, InjectUserControlPressedMaximumNamedKeyCodeAndVerifyEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onKeyPressEvent"),
+        &AsyncHandlerMock_HdmiCecSink::onKeyPressEvent,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onKeyPressEvent(::testing::_))
+        .WillOnce(Invoke(this, &HdmiCecSink_L2Test::onKeyPressEvent));
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // Power On Function is the highest named UI command (0x6D)
+    uint8_t buffer[] = { 0x40, 0x44, 0x6D };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_KEY_PRESS_EVENT);
+    EXPECT_TRUE(signalled & ON_KEY_PRESS_EVENT);
+    EXPECT_EQ(4, m_logicalAddress);
+    EXPECT_EQ(0x6D, m_keyCode);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onKeyPressEvent"));
+}
+
+// Verify an unrecognised one-byte UI command is forwarded verbatim
+TEST_F(HdmiCecSink_L2Test, InjectUserControlPressedOutOfRangeKeyCodeAndVerifyEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onKeyPressEvent"),
+        &AsyncHandlerMock_HdmiCecSink::onKeyPressEvent,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onKeyPressEvent(::testing::_))
+        .WillOnce(Invoke(this, &HdmiCecSink_L2Test::onKeyPressEvent));
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // 0xFF is outside the named UI command set but remains a valid raw byte
+    uint8_t buffer[] = { 0x40, 0x44, 0xFF };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_KEY_PRESS_EVENT);
+    EXPECT_TRUE(signalled & ON_KEY_PRESS_EVENT);
+    EXPECT_EQ(4, m_logicalAddress);
+    EXPECT_EQ(255, m_keyCode);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onKeyPressEvent"));
+}
+
+// Image View On broadcast frames must not notify clients
+TEST_F(HdmiCecSink_L2Test, InjectImageViewOnFrameBroadcastAndVerifyNoEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onImageViewOnMsg"),
+        &AsyncHandlerMock_HdmiCecSink::onImageViewOnMsg,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onImageViewOnMsg(::testing::_))
+        .Times(0);
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // Image View On from Playback Device 1 (4) to broadcast (15)
+    uint8_t buffer[] = { 0x4F, 0x04 };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_IMAGE_VIEW_ON);
+    EXPECT_FALSE(signalled & ON_IMAGE_VIEW_ON);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onImageViewOnMsg"));
+}
+
+// Text View On broadcast frames must not notify clients
+TEST_F(HdmiCecSink_L2Test, InjectTextViewOnFrameBroadcastAndVerifyNoEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onTextViewOnMsg"),
+        &AsyncHandlerMock_HdmiCecSink::onTextViewOnMsg,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onTextViewOnMsg(::testing::_))
+        .Times(0);
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // Text View On from Playback Device 1 (4) to broadcast (15)
+    uint8_t buffer[] = { 0x4F, 0x0D };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_TEXT_VIEW_ON);
+    EXPECT_FALSE(signalled & ON_TEXT_VIEW_ON);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onTextViewOnMsg"));
+}
+
+// Inject Image View On and verify the enabled onImageViewOnMsg path
+TEST_F(HdmiCecSink_L2Test, InjectImageViewOnFrameAndVerifyEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onImageViewOnMsg"),
+        &AsyncHandlerMock_HdmiCecSink::onImageViewOnMsg,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onImageViewOnMsg(::testing::_))
+        .WillOnce(Invoke(this, &HdmiCecSink_L2Test::onImageViewOnMsg));
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // Image View On from Playback Device 1 (4) to TV (0)
+    uint8_t buffer[] = { 0x40, 0x04 };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_IMAGE_VIEW_ON);
+    EXPECT_TRUE(signalled & ON_IMAGE_VIEW_ON);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onImageViewOnMsg"));
+}
+
+// Image View On from the unregistered initiator must not notify clients
+TEST_F(HdmiCecSink_L2Test, InjectImageViewOnFromUnregisteredAddressAndVerifyNoEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onImageViewOnMsg"),
+        &AsyncHandlerMock_HdmiCecSink::onImageViewOnMsg,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onImageViewOnMsg(::testing::_))
+        .Times(0);
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // Image View On from unregistered logical address (15) to TV (0)
+    uint8_t buffer[] = { 0xF0, 0x04 };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_IMAGE_VIEW_ON);
+    EXPECT_FALSE(signalled & ON_IMAGE_VIEW_ON);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onImageViewOnMsg"));
+}
+
+// Text View On from the unregistered initiator must not notify clients
+TEST_F(HdmiCecSink_L2Test, InjectTextViewOnFromUnregisteredAddressAndVerifyNoEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onTextViewOnMsg"),
+        &AsyncHandlerMock_HdmiCecSink::onTextViewOnMsg,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onTextViewOnMsg(::testing::_))
+        .Times(0);
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // Text View On from unregistered logical address (15) to TV (0)
+    uint8_t buffer[] = { 0xF0, 0x0D };
+    CECFrame frame(buffer, sizeof(buffer));
+
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(frame);
+        }
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_TEXT_VIEW_ON);
+    EXPECT_FALSE(signalled & ON_TEXT_VIEW_ON);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onTextViewOnMsg"));
+}
+
+// Establish a device through CEC, disconnect its HDMI port, and verify removal
+TEST_F(HdmiCecSink_L2Test, HdmiHotplugDisconnectAndVerifyDeviceRemovedEvent)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+    uint32_t status = Core::ERROR_GENERAL;
+    uint32_t signalled = HDMICECSINK_STATUS_INVALID;
+
+    status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("onDeviceRemoved"),
+        &AsyncHandlerMock_HdmiCecSink::onDeviceRemoved,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+
+    EXPECT_CALL(async_handler, onDeviceRemoved(::testing::_))
+        .WillRepeatedly(Invoke(this, &HdmiCecSink_L2Test::onDeviceRemoved));
+
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+    EXPECT_NE(nullptr, g_registeredHdmiInListener);
+
+    // Announce every peer through the production frame path so at least one
+    // remains present regardless of where the asynchronous poll sweep started.
+    for (uint8_t logicalAddress = 1; logicalAddress < LogicalAddress::UNREGISTERED; ++logicalAddress) {
+        uint8_t buffer[] = { static_cast<uint8_t>((logicalAddress << 4) | LogicalAddress::BROADCAST), 0x84, 0x20, 0x00, 0x04 };
+        CECFrame frame(buffer, sizeof(buffer));
+
+        for (auto* listener : listeners) {
+            if (listener) {
+                listener->notify(frame);
+            }
+        }
+    }
+
+    EXPECT_CALL(*p_connectionMock, ping(::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Invoke(
+            [](const LogicalAddress&, const LogicalAddress&, const Throw_e&) {
+                throw CECNoAckException();
+            }));
+
+    if (g_registeredHdmiInListener) {
+        g_registeredHdmiInListener->OnHdmiInEventHotPlug(dsHDMI_IN_PORT_1, true);
+        g_registeredHdmiInListener->OnHdmiInEventHotPlug(dsHDMI_IN_PORT_1, false);
+    }
+
+    signalled = WaitForRequestStatus(EVNT_TIMEOUT, ON_DEVICE_REMOVED);
+    EXPECT_TRUE(signalled & ON_DEVICE_REMOVED);
+
+    jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("onDeviceRemoved"));
 }
 
 // Active Source (0x82) and verify onWakeupFromStandby event
