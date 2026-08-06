@@ -1278,6 +1278,17 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, powerModeChange)
 
 // DEFECTIVE-TEST DISPOSITION: DOCUMENTED CANNOT-FIX. Left disabled, in place and unmodified.
 //
+// RECLASSIFICATION, stated here because this is the file the decision lives in: the plan's
+// defect-ledger item #5 (AAP §0.6.3 and §0.7.1) reads "Repair - restore the commented-out mock
+// expectation and enable". That planned disposition is WRONG ON ITS PREMISE and is reclassified
+// to DOCUMENTED-CANNOT-FIX. The commented-out expectation is not why this test fails, so
+// restoring it changes nothing; measured at runtime, the invocation below returns 22
+// (Core::ERROR_UNKNOWN_METHOD) with an empty response, which is the dispatcher reporting that
+// no such method exists - not an unmet expectation. The Directive 7 traceability report must
+// therefore record item #5 as documented-cannot-fix and carry the BLOCKED entry below, rather
+// than claiming a repair that did not happen; and the one disabled test this suite reports is
+// this one, by decision, not by oversight.
+//
 // This test invokes a JSON-RPC method "getCecVersion" that the plugin does not publish, so no
 // arrangement of mocks can make it pass:
 //   * IHdmiCecSink.h declares no getCecVersion in its @text method set, and
@@ -1288,10 +1299,22 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, powerModeChange)
 //   * HdmiCecSinkImplementation::getCecVersion() does exist, but it is an internal RFC helper
 //     that returns void and is called only from Configure(); it was never a JSON-RPC endpoint.
 // Restoring the commented-out RFC expectation below would therefore not help: the expectation is
-// not why the test fails. Enabling it would require publishing a new JSON-RPC method in
-// entservices-apis and the plugin - a production change, which is out of scope here - so the
-// REQUIRED CHANGE is recorded rather than made, and the test stays where it is because removal is
-// prohibited on this pass.
+// not why the test fails.
+//
+// BLOCKED - REQUIRED PRODUCTION CHANGE, REPORTED NOT MADE (Directive 6's escape clause):
+// enabling this test needs (1) a getCecVersion method declared on Exchange::IHdmiCecSink in
+// entservices-apis, so ThunderTools generates its JSON-RPC binding, and (2) an implementation of
+// it in the plugin, so Exchange::JHdmiCecSink::Register (HdmiCecSink.cpp:86) publishes it. Both
+// are production source changes, and Directive 6 says to report such a gap with the change it
+// would require rather than make it. The test stays exactly where it is - removal is prohibited
+// on this pass, and a rename would be a delete plus a create.
+//
+// COMPENSATING COVERAGE, delivered and passing: HdmiCecSinkDsTest
+// .cecVersionFromRfc_ReportedTwoPointZero_ChangesTheGiveFeaturesResponse covers the behaviour
+// this test was reaching for, and covers it more strictly than a JSON-RPC read-back could. It
+// asserts the RFC caller id and the exact TR181 parameter name, proves via a counter that
+// Configure() really consults RFC, and then proves the behavioural consequence on the bus: a 2.0
+// sink answers <Give Features> with a broadcast <Report Features> and a 1.4 sink stays silent.
 // The corresponding client command has been removed from the sink vDevice suite
 // (Tests/vDeviceTests/HdmiCECSink_Curl.py) so that no test asset presents this internal helper as
 // a published endpoint. The CEC version is observable instead through the <Give CEC Version>
@@ -5763,10 +5786,27 @@ TEST_F(HdmiCecSinkDsTest, cecVersionFromRfc_ReportedTwoPointZero_ChangesTheGiveF
     Plugin::HdmiCecSinkFrameListener restoredListener(restoredProcessor);
     EXPECT_NO_THROW(restoredListener.notify(giveFeaturesFrame));
 
-    // A 1.4 sink stays silent, so nothing at all should have been recorded for this frame.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // A 1.4 sink stays silent on <Give Features>, and the absence of a send is what has to be
+    // asserted here.  Waiting on a clock for that would only ever prove that the clock advanced,
+    // so the negative is fenced behind a positive instead: <Get CEC Version> is answered by the
+    // SAME processor, on this thread (HdmiCecSinkFrameListener::notify decodes inline), through
+    // the SAME sendToAsync seam the recorder watches - so once its reply has been recorded, a
+    // <Report Features> broadcast would already have been recorded too if the sink had produced
+    // one.  The barrier earns its place twice over: the directed <CEC Version> reply is the answer
+    // only a sink whose RFC version is NOT 2.0 sends (HdmiCecSinkImplementation.cpp:208-228), so
+    // it also asserts the 1.4 arm positively rather than inferring it from silence.
+    // Playback Device 1 (LA=4) sent both frames, so its own address is where the reply must go.
+    const int initiator = 0x4;
+    // 0x9F is <Get CEC Version>, directed to the TV - the handler ignores broadcast addressing.
+    const uint8_t getCecVersion[] = { 0x40, 0x9F };
+    CECFrame getCecVersionFrame(getCecVersion, sizeof(getCecVersion));
+    EXPECT_NO_THROW(restoredListener.notify(getCecVersionFrame));
+
+    EXPECT_EQ(1u, waitForRecordedMessage(initiator, kAsyncSend))
+        << "a 1.4 sink must answer <Get CEC Version> with a directed <CEC Version>";
+
     for (const SentMessage& message : recordedMessages()) {
-        EXPECT_NE(kAsyncSend, message.timeout)
+        EXPECT_FALSE((message.timeout == kAsyncSend) && (message.to == static_cast<int>(LogicalAddress::BROADCAST)))
             << "a 1.4 sink must not answer <Give Features> at all";
     }
 }
@@ -5788,11 +5828,16 @@ TEST_F(HdmiCecSinkDsTest, PluginNotificationSink_DeactivationHook_ActsOnlyOnItsO
     RemoteConnectionDouble ownConnection(0);
     RemoteConnectionDouble foreignConnection(4321);
 
+    // Signalled from the worker thread that runs the submitted job, so the wait below can be woken
+    // by the event itself rather than by a clock.  The counter is written on that thread and read on
+    // this one, and the event is what orders the two.
+    Core::Event deactivationDispatched(false, true);
     uint32_t deactivationsRequested = 0;
     ON_CALL(service, Deactivate(::testing::_))
         .WillByDefault(::testing::Invoke(
             [&](const PluginHost::IShell::reason) {
                 ++deactivationsRequested;
+                deactivationDispatched.SetEvent();
                 return Core::ERROR_NONE;
             }));
 
@@ -5818,12 +5863,11 @@ TEST_F(HdmiCecSinkDsTest, PluginNotificationSink_DeactivationHook_ActsOnlyOnItsO
     ASSERT_TRUE(sinkWasCaptured) << "the plugin never handed its notification sink to the COM link";
 
     // Deactivated() submits a job rather than calling the shell inline, so the request arrives on
-    // the fixture's worker pool. Bounded wait - never an unbounded one - so a lost job fails this
-    // test instead of hanging the suite.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
-    while ((deactivationsRequested == 0) && (std::chrono::steady_clock::now() < deadline)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
+    // the fixture's worker pool. Waiting on the event returns the instant the job runs and reports
+    // ERROR_TIMEDOUT if it never does - bounded, never unbounded, and with no wall-clock interval
+    // to guess at.  Matches the idiom the sibling deactivation case below uses.
+    EXPECT_EQ(Core::ERROR_NONE, deactivationDispatched.Lock(5000))
+        << "the deactivation job never reached the shell";
 
     EXPECT_EQ(1u, deactivationsRequested)
         << "exactly the plugin's own connection should have triggered a shell deactivation";

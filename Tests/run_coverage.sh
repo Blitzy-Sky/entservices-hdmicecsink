@@ -59,14 +59,18 @@
 #       and the two side effects it does have are stated here rather than buried:
 #         (a) $HOME/.lcovrc -- CI plants a branch-disabled copy there (see 1. above) and
 #             lcov reads it silently, so the lcov steps must run with no home
-#             configuration in effect.  An existing $HOME/.lcovrc is therefore MOVED
-#             ASIDE into a private temporary directory for the duration of the run and
-#             RESTORED on exit, including on failure, via an EXIT trap -- capture and
-#             restore, never unconditional deletion, so a developer's own lcov
-#             configuration survives the run.  The stash path is logged, so even a run
-#             killed with SIGKILL (the one signal a trap cannot service) leaves a named,
-#             recoverable copy rather than a hole.  Nothing else in $HOME is read or
-#             written, and /etc/lcovrc is never touched.
+#             configuration in effect.  Whatever is at that path -- regular file, symlink
+#             or directory -- is therefore MOVED ASIDE into a private temporary directory
+#             BEFORE THE FIRST lcov INVOCATION OF THE RUN and RESTORED on exit, including
+#             on failure and on a signal, from the single cleanup trap this script installs
+#             at start-up.  It is a move in both directions, never a copy and never a
+#             deletion, so the entry comes back exactly as it was: a symlink stays a
+#             symlink, a directory keeps its contents, permissions and timestamps are
+#             untouched.  The stash path is logged, so even a run killed with SIGKILL (the
+#             one signal a trap cannot service) leaves a named, recoverable copy rather
+#             than a hole.  An unset HOME is not an error -- there is simply nothing to
+#             move.  Nothing else in $HOME is read or written, and /etc/lcovrc is never
+#             touched.
 #         (b) Artifacts -- the fixed names listed under ARTIFACTS below are CREATED AND
 #             OVERWRITTEN WITHOUT PROMPTING, exactly as CI overwrites them in
 #             $GITHUB_WORKSPACE.  They are written into a per-plugin, per-level directory
@@ -421,7 +425,15 @@ GENHTML_BIN="$(resolve_tool genhtml)"
 FIND_BIN="$(resolve_tool find)"
 MKTEMP_BIN="$(resolve_tool mktemp)"
 VALGRIND_BIN="$(resolve_tool valgrind)"
-readonly LCOV_BIN GENHTML_BIN FIND_BIN MKTEMP_BIN VALGRIND_BIN
+# gcov is not invoked by this script -- lcov drives it -- so it is resolved only to name its
+# version in the banner.  `id` is used for one advisory line (install-tree ownership), so it
+# is resolved rather than assumed: on a stripped PATH an unguarded `id` produced a raw
+# "id: command not found" in the middle of a validation step, which is noise attached to a
+# check that is informational anyway.  Both are optional: absent, the run continues and says
+# what it could not report.
+GCOV_BIN="$(resolve_tool gcov)"
+ID_BIN="$(resolve_tool id)"
+readonly LCOV_BIN GENHTML_BIN FIND_BIN MKTEMP_BIN VALGRIND_BIN GCOV_BIN ID_BIN
 
 # Private staging directory for artifacts in progress; created on first use and removed by
 # the cleanup trap.  Empty until then, so the trap is safe at any point.
@@ -541,46 +553,158 @@ rule() { printf '%s\n' '--------------------------------------------------------
 # would suppress the branch data this script exists to produce, so the lcov steps have to
 # run with no home configuration in effect.
 #
-# That does NOT justify destroying a developer's own configuration.  The file is moved
+# That does NOT justify destroying a developer's own configuration.  The entry is moved
 # aside into a private temporary directory and moved back on exit -- including when a step
-# fails, because the restore is installed as an EXIT trap the moment the stash is taken.
-# The stash path is logged, so a run killed with SIGKILL (the one signal no trap can
-# service) leaves a named, recoverable copy.  Contract clause 3(a) documents this.
+# fails, because the restore runs from the single cleanup trap installed at start-up.  The
+# stash path is logged, so a run killed with SIGKILL (the one signal no trap can service)
+# leaves a named, recoverable copy.  Contract clause 3(a) documents this.
+#
+# WHEN it happens matters as much as that it happens.  A home configuration that merely
+# disables branch collection makes the FIGURES wrong; one that lcov cannot parse makes EVERY
+# lcov invocation fail outright -- setting both `lcov_branch_coverage` and
+# `genhtml_branch_coverage` produces "ERROR: unexpected ARRAY for branch_coverage value" and
+# exit 255 from `lcov --version` itself, and an entry that is a DIRECTORY produces "unable to
+# close …: Is a directory" and exit 21.  Both of those used to surface as a bare lcov error
+# from the counter-zeroing step, because the stash was taken later, in capture_coverage.  It
+# is therefore taken in main(), before the first lcov call of the run, and re-checked per
+# level so a file that reappears mid-run is still handled.
+#
+# WHAT is moved matters too: `-f` is not the test, because `~/.lcovrc` can legitimately be a
+# symlink into a dotfiles repository, and it can be a directory by mistake.  Any existing
+# entry is moved, whatever its type, and `mv` in both directions means it returns exactly as
+# it was -- a symlink stays a symlink, a directory keeps its contents -- because nothing is
+# ever copied or recreated.
 # ------------------------------------------------------------------------------------
 HOME_LCOVRC_STASH=""
 
 restore_home_lcovrc() {
-    local status=$?
-    if [ -n "$HOME_LCOVRC_STASH" ] && [ -f "$HOME_LCOVRC_STASH" ]; then
-        if mv -f "$HOME_LCOVRC_STASH" "$HOME/.lcovrc"; then
+    [ -n "$HOME_LCOVRC_STASH" ] || return 0
+    local stash="$HOME_LCOVRC_STASH"
+    HOME_LCOVRC_STASH=""
+    # -e is false for a dangling symlink, so -L is tested too: the entry goes back whatever
+    # its type, which is the point of moving rather than copying.
+    if [ -e "$stash" ] || [ -L "$stash" ]; then
+        if [ -n "${HOME:-}" ] && mv -f -- "$stash" "$HOME/.lcovrc"; then
             log "restored $HOME/.lcovrc"
         else
-            warn "could not restore $HOME/.lcovrc -- your original is intact at $HOME_LCOVRC_STASH; move it back by hand"
+            warn "could not restore ${HOME:-\$HOME}/.lcovrc -- your original is intact at $stash"
+            warn "    move it back by hand:  mv '$stash' '${HOME:-\$HOME}/.lcovrc'"
+            return 0
         fi
     fi
-    if [ -n "$HOME_LCOVRC_STASH" ]; then
-        rmdir "$(dirname -- "$HOME_LCOVRC_STASH")" 2>/dev/null || true
-        HOME_LCOVRC_STASH=""
-    fi
-    # Never let the housekeeping above change the status the caller is exiting with.
-    return "$status"
+    rmdir -- "$(dirname -- "$stash")" 2>/dev/null || true
+    return 0
 }
 
 stash_home_lcovrc() {
     [ -n "${HOME:-}" ] || return 0
-    [ -f "$HOME/.lcovrc" ] || return 0
     [ -z "$HOME_LCOVRC_STASH" ] || return 0        # already stashed earlier in this run
+    local rc_path="$HOME/.lcovrc"
+    [ -e "$rc_path" ] || [ -L "$rc_path" ] || return 0
 
+    [ -n "$MKTEMP_BIN" ] || die "mktemp is not available; it is required to move $rc_path aside safely"
     local stash_dir
-    stash_dir="$(mktemp -d "${TMPDIR:-/tmp}/run_coverage_lcovrc.XXXXXX")" \
-        || die "cannot create a temporary directory to stash $HOME/.lcovrc"
+    stash_dir="$("$MKTEMP_BIN" -d "${TMPDIR:-/tmp}/run_coverage_lcovrc.XXXXXX")" \
+        || die "cannot create a temporary directory to stash $rc_path"
+    chmod 0700 -- "$stash_dir" 2>/dev/null || true
+    # Record the stash path BEFORE the move, so an interrupt between the two cannot lose the
+    # file and a failed move leaves no orphaned stash directory behind either.
     HOME_LCOVRC_STASH="$stash_dir/.lcovrc"
-    # Install the restore BEFORE the move, so an interrupt between the two cannot lose the
-    # file and a failure in any later step still puts it back.
-    trap restore_home_lcovrc EXIT
-    mv -f "$HOME/.lcovrc" "$HOME_LCOVRC_STASH" \
-        || die "cannot move $HOME/.lcovrc aside; refusing to run lcov against an unknown home configuration"
-    log "moved $HOME/.lcovrc aside to $HOME_LCOVRC_STASH (CI plants a branch-disabled copy there); it is restored on exit"
+    if [ ! -f "$rc_path" ] || [ -L "$rc_path" ]; then
+        local rc_kind='special file'
+        if [ -L "$rc_path" ]; then
+            rc_kind='symbolic link'
+        elif [ -d "$rc_path" ]; then
+            rc_kind='directory'
+        fi
+        log "note: $rc_path is a $rc_kind, not a regular file; it is moved aside as-is and moved back unchanged"
+    fi
+    local mv_err
+    if ! mv_err="$(mv -f -- "$rc_path" "$HOME_LCOVRC_STASH" 2>&1)"; then
+        # Distinguish "it is gone" from "it will not move".  A sibling runner sharing this
+        # $HOME -- the source-plugin and middleware runners are routinely run against the same
+        # one -- can move the file aside between the existence check above and this move, and
+        # the owner can remove it in the same window.  What this needs is only that NO home
+        # configuration is in effect while lcov runs, and in that case none is: continue, and
+        # leave the other run's stash to the other run rather than fighting over it.  A file
+        # that is still there and still will not move is a genuine failure.
+        if [ ! -e "$rc_path" ] && [ ! -L "$rc_path" ]; then
+            rmdir -- "$stash_dir" 2>/dev/null || true
+            HOME_LCOVRC_STASH=""
+            log "$rc_path disappeared while being moved aside (a concurrent run moved it, or it was"
+            log "    removed); no home configuration is in effect, which is all this step needs"
+            return 0
+        fi
+        die "cannot move $rc_path aside: ${mv_err:-mv failed}
+       Refusing to run lcov against an unknown home configuration, and refusing to delete
+       your file to get around it.  Fix the permissions on \$HOME and retry."
+    fi
+    log "moved $rc_path aside to $HOME_LCOVRC_STASH (CI plants a branch-disabled copy there); it is restored on exit"
+}
+
+# ------------------------------------------------------------------------------------
+# Tooling pre-flight.  Two checks, in this order, and the order is the point.
+#
+# PRESENCE first, and before any side effect.  resolve_tool() returns an empty string for a
+# tool that is not on PATH, and an empty command word does not announce itself: it produces
+# `line NNN: : command not found` and exit 127 from whichever step happens to be first --
+# which was the counter-zeroing step, after the configuration banner, the level banner, the
+# pre-flight and the provenance result had all been printed as though the run were healthy.
+# Naming the missing tool up front costs one line and turns exit 127 into a diagnosis.
+#
+# USABILITY second, and only after the home configuration has been moved aside, because a
+# home file lcov cannot parse makes `lcov --version` itself fail: probing before the stash
+# would report a perfectly good lcov as broken.
+# ------------------------------------------------------------------------------------
+check_tooling() {
+    local missing=0
+    [ -n "$LCOV_BIN" ]    || { warn "lcov not found on PATH";    missing=1; }
+    [ -n "$GENHTML_BIN" ] || { warn "genhtml not found on PATH"; missing=1; }
+    [ -n "$FIND_BIN" ]    || { warn "find not found on PATH";    missing=1; }
+    [ -n "$MKTEMP_BIN" ]  || { warn "mktemp not found on PATH";  missing=1; }
+    [ "$missing" -eq 0 ] || die "missing coverage tooling.
+       lcov and genhtml are what this script measures and reports with, and find and mktemp
+       are how it counts counter files and stages artifacts.  On a Debian/Ubuntu host:
+           sudo apt-get install -y lcov
+       lcov 2.x is required specifically: this script uses --fail-under-lines and
+       --rc branch_coverage=1, and neither exists in lcov 1.x."
+    if [ -z "$GCOV_BIN" ]; then
+        log "gcov is not on PATH; it is only needed to (re)generate .gcda data, not to read it"
+    fi
+}
+
+check_lcov_usable() {
+    if ! "$LCOV_BIN" --version >/dev/null 2>&1; then
+        die "$LCOV_BIN cannot even report its version, so it is unusable in this environment.
+       The usual cause is an lcov configuration file it cannot parse.  This run has already
+       moved \$HOME/.lcovrc aside, so the remaining candidates are /etc/lcovrc (system-wide,
+       and deliberately never touched by this script) and this repository's own
+       Tests/L1Tests/.lcovrc_l1.  Reproduce with:  $LCOV_BIN --version
+       For example, setting both 'lcov_branch_coverage' and 'genhtml_branch_coverage' makes
+       lcov 2.0-1 fail every invocation with 'unexpected ARRAY for branch_coverage value'."
+    fi
+    if ! "$LCOV_BIN" --help 2>&1 | grep -q -- '--fail-under-lines'; then
+        die "this lcov does not support --fail-under-lines, so the ${COVERAGE_MIN}% gate cannot be
+       enforced.  Install lcov 2.0 or newer; refusing to report coverage without the gate."
+    fi
+}
+
+# The artifact tree is disposable build output, and the default -- $WS/coverage-artifacts,
+# mirroring CI writing into $GITHUB_WORKSPACE -- lands INSIDE the checkout, where neither this
+# repository's .gitignore nor the superproject's covers it.  A default-path run therefore
+# leaves untracked directories in `git status`, and `git add -A` would stage them.  Editing a
+# .gitignore is out of scope here, so the condition is reported rather than silently accepted.
+warn_artifact_root_in_tree() {
+    case "$ARTIFACT_ROOT" in
+        "$REPO_ROOT"|"$REPO_ROOT"/*|"$WS"|"$WS"/*)
+            warn "the artifact root is inside the working tree ($ARTIFACT_ROOT)."
+            warn "    coverage_<level>.info, filtered_coverage_<level>.info and coverage_<level>/ are"
+            warn "    NOT covered by any .gitignore here, so they WILL show up in git status.  They are"
+            warn "    build output: do not commit them.  Point ARTIFACT_ROOT outside the checkout to"
+            warn "    keep the tree clean, e.g. ARTIFACT_ROOT=\"\${TMPDIR:-/tmp}/$REPO_NAME-coverage\"."
+            ;;
+        *)  ;;   # outside the checkout: the intended case, nothing to say
+    esac
 }
 
 usage() {
@@ -641,10 +765,11 @@ Artifacts (fixed names, no timestamps) in \$ARTIFACT_ROOT/$REPO_NAME/<level>/:
   artifact directory afterwards.
 
 Outside \$WS the run touches exactly one path: lcov reads \$HOME/.lcovrc silently and CI
-plants a branch-disabled copy there, so an existing \$HOME/.lcovrc is moved aside into a
-temporary directory for the duration of the lcov steps and restored on exit, including on
-failure.  Nothing is deleted, and the stash path is logged.  For a run that touches your
-home directory not at all:  HOME="\$(mktemp -d)" $(basename -- "$SCRIPT_PATH") l1
+plants a branch-disabled copy there, so an existing \$HOME/.lcovrc -- of any type -- is moved
+aside into a temporary directory before the first lcov invocation and moved back on exit,
+including on failure and on a signal.  Nothing is copied or deleted, the entry returns with
+its original type, and the stash path is logged.  For a run that touches your home directory
+not at all:  HOME="\$(mktemp -d)" $(basename -- "$SCRIPT_PATH") l1
 
 Build the plugin AND rebuild entservices-testframework against it before running: both
 plugins emit identically named test libraries, so a stale framework build silently
@@ -772,11 +897,18 @@ validate_install_dir() {
        test binary.  Tighten its permissions (chmod o-w) or point INSTALL_DIR elsewhere."
     fi
 
+    # Ownership is ADVISORY, so it is skipped rather than fatal when `id` is unavailable:
+    # a stripped PATH must not turn an informational line into a raw "command not found"
+    # in the middle of a validation step.
     owner="$(stat -c '%u' -- "$canonical" 2>/dev/null || echo '')"
-    if [ -n "$owner" ] && [ "$owner" != "$(id -u)" ] && [ "$owner" != '0' ]; then
-        warn "install tree $canonical is owned by uid $owner, which is neither this user
-         ($(id -u)) nor root.  The test binary will load libraries from a tree this run does
+    if [ -n "$owner" ] && [ -n "$ID_BIN" ]; then
+        local self
+        self="$("$ID_BIN" -u 2>/dev/null || echo '')"
+        if [ -n "$self" ] && [ "$owner" != "$self" ] && [ "$owner" != '0' ]; then
+            warn "install tree $canonical is owned by uid $owner, which is neither this user
+         ($self) nor root.  The test binary will load libraries from a tree this run does
          not own; treat the figures as suspect unless that is intended."
+        fi
     fi
     printf '%s' "$canonical"
 }
@@ -807,7 +939,9 @@ assert_safe_artifact_path() {
 
 # A private mode-0700 staging directory, so an artifact under construction is never
 # readable or replaceable by another account while it is being written.  Created on first
-# use; removed by the cleanup trap on every exit path, including an interrupt.
+# use; removed at the end of the level, and by the cleanup trap on every exit path -- normal
+# exit, failure, and interrupt -- including inside the per-level subshells that `all` uses,
+# which re-arm the handler because bash resets traps in a subshell.
 ensure_stage_dir() {
     [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR" ] && return 0
     [ -n "$MKTEMP_BIN" ] || die "mktemp is not available; it is required to stage artifacts safely"
@@ -820,11 +954,34 @@ cleanup_stage_dir() {
     if [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR" ]; then
         rm -rf -- "$STAGE_DIR"
     fi
+    STAGE_DIR=''
+    return 0
 }
-trap cleanup_stage_dir EXIT
-trap 'trap - INT;  cleanup_stage_dir; kill -INT  $$' INT
-trap 'trap - TERM; cleanup_stage_dir; kill -TERM $$' TERM
-trap 'trap - HUP;  cleanup_stage_dir; kill -HUP  $$' HUP
+
+# ONE cleanup handler, servicing both side effects this script has, installed once.
+#
+# Two separate EXIT traps cannot coexist: bash keeps a single handler per signal, so the
+# second `trap … EXIT` REPLACES the first.  That is exactly how an empty staging directory
+# used to be left behind in ${TMPDIR:-/tmp} on every run that had a $HOME/.lcovrc to move
+# aside -- the stash installed its own restore trap over the staging cleanup, and the
+# staging directory then had nobody to remove it.  Both actions live in this one handler
+# instead, and both are idempotent, so running it on a normal exit and again on a signal is
+# harmless.
+#
+# The signal traps `exit` rather than re-raising, because a shell terminated by a signal with
+# its default disposition never runs its EXIT trap: re-raising would have skipped both the
+# staging cleanup and the home-configuration restore. `exit 130/143/129` reports the same
+# status a signalled shell would while guaranteeing the handler runs.
+on_exit() {
+    local rc=$?
+    cleanup_stage_dir
+    restore_home_lcovrc
+    return "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # Publish a staged artifact over its final name.  mv replaces the directory entry itself,
 # so even if the check above raced with a link being planted, the link is replaced rather
@@ -925,9 +1082,20 @@ zero_counters() {
     before="$(gcda_count "$LEVEL_BUILD_DIR")"
     log "zeroing ${level^^} execution counters in $LEVEL_BUILD_DIR ($before *.gcda present)"
 
+    # Same configuration arguments as every other lcov call in this script, and a `|| die` of
+    # its own.  Both matter: without --config-file this one invocation would read whatever
+    # configuration the environment happens to offer -- which is precisely how a hostile
+    # $HOME/.lcovrc used to abort the run here with a bare lcov error and no diagnostic of
+    # ours -- and without the `|| die` a zeroing failure would surface as an unattributed
+    # non-zero exit instead of naming the tree it could not clear.
     "$LCOV_BIN" --zerocounters \
         --directory "$LEVEL_BUILD_DIR" \
-        --rc branch_coverage=1 >/dev/null
+        "${LCOV_CONFIG_ARGS[@]}" \
+        --rc branch_coverage=1 >/dev/null \
+        || die "'lcov --zerocounters' failed for $LEVEL_BUILD_DIR.
+       The counters could not be cleared, so a capture taken now could mix this run's data
+       with an earlier run's.  Refusing to measure rather than report an accumulated figure.
+       Check the directory's permissions, and that no test process is still running against it."
 
     after="$(gcda_count "$LEVEL_BUILD_DIR")"
     [ "$after" -eq 0 ] || die "$after *.gcda files still remain under $LEVEL_BUILD_DIR after
@@ -1435,12 +1603,21 @@ run_level() {
     setup_runtime_env
     preflight "$level"
     resolve_lcov_config "$level"
+    # Before the FIRST lcov invocation of the level -- which is the counter zeroing below,
+    # not the capture.  main() has already done this for the run; it is repeated here (and is
+    # idempotent) so that a home configuration which reappears between levels cannot be in
+    # effect for the level that follows it.
+    stash_home_lcovrc
     zero_counters "$level"
     run_suite "$level"
     verify_fresh_counters "$level"
     capture_coverage "$level"
     per_file_report "$level"
     apply_gate "$level"
+    # The staging directory has served its purpose by here.  The cleanup trap would remove it
+    # anyway; removing it now keeps a long `all` run from holding two levels' staging space
+    # and means the common path leaves nothing behind even before the trap fires.
+    cleanup_stage_dir
 }
 
 # ------------------------------------------------------------------------------------
@@ -1484,6 +1661,27 @@ check_all_admissible() {
     log "'all' admissible: L1 and L2 resolve to separate build and install trees"
 }
 
+# One level of `all`, in a subshell, so that a failure is reported by main() rather than
+# ending the script mid-sequence.
+#
+# The subshell RE-ARMS the cleanup handlers, because bash resets traps in a subshell to the
+# dispositions the parent inherited: the parent's EXIT trap does not run when a subshell
+# exits, so a staging directory created inside one had nobody to remove it -- which is how an
+# `all` run used to leak one empty ${TMPDIR:-/tmp}/run_coverage_stage.* per level.  Only the
+# staging cleanup is re-armed: STAGE_DIR is set inside the subshell and so is the subshell's
+# to remove, whereas the home configuration was moved aside by main() and belongs to the
+# parent, whose own EXIT trap puts it back once BOTH levels are done.  Restoring it here
+# would hand level L2 the very file this run took out of the way.
+run_level_in_subshell() { # $1 = level
+    (
+        trap cleanup_stage_dir EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap 'exit 129' HUP
+        run_level_rebuild_hook "$1" && run_level "$1"
+    )
+}
+
 # Switch a shared tree to the level about to run.  Only used by `all`, and only when the
 # caller supplied a hook; a failing hook fails that level rather than being ignored.
 run_level_rebuild_hook() {
@@ -1519,12 +1717,48 @@ main() {
             exit 2
             ;;
     esac
-    [ "$#" -le 1 ] || die "unexpected extra arguments after '$cmd': ${*:2}"
+    # Same shape as the two arms above -- usage on stderr, exit 2 -- because "you called it
+    # wrong" is one failure mode and it should not be reported with two different statuses.
+    if [ "$#" -gt 1 ]; then
+        printf '[run_coverage] ERROR: unexpected extra arguments after '\''%s'\'': %s\n\n' "$cmd" "${*:2}" >&2
+        usage >&2
+        exit 2
+    fi
+
+    # Every input is validated BEFORE the first side effect: nothing is created, zeroed,
+    # deleted or moved aside until the configuration this run would use is known to be sane.
+    check_tooling
 
     [ -d "$WS" ] || die "WS does not exist: $WS"
     case "$COVERAGE_MIN" in
         ''|*[!0-9]*) die "COVERAGE_MIN must be a non-negative integer, got '$COVERAGE_MIN'" ;;
     esac
+    # Range as well as shape.  An out-of-range bar is not harmless just because it fails
+    # safe: 101 means every run fails the gate no matter how good the coverage is, and a
+    # gate that cannot pass is as uninformative as one that cannot fail.  The sibling
+    # runners refuse >100 for the same reason.
+    [ "$COVERAGE_MIN" -le 100 ] || die "COVERAGE_MIN must be between 0 and 100, got '$COVERAGE_MIN'.
+       A bar above 100% can never be met, so the gate could only ever fail and would say
+       nothing about the tests."
+
+    # ARTIFACT_ROOT is validated before it is used, because every level's report directory is
+    # derived from it and republishing a report removes the previous one with `rm -rf`.  A
+    # relative value would resolve against whatever directory this run happens to be in, and
+    # '/' or a one-directory-deep root would put the derived <plugin>/<level> tree somewhere
+    # nobody intended -- observed once: ARTIFACT_ROOT=/ wrote a full report set to
+    # /entservices-hdmicecsink/l1/ and exited 0 as though that were normal.
+    case "$ARTIFACT_ROOT" in
+        /)   die "ARTIFACT_ROOT must not be '/'.  Artifacts are written to
+       \$ARTIFACT_ROOT/$REPO_NAME/<level>/ and that directory is replaced on every run; the
+       filesystem root is not a place to do that." ;;
+        /*)  : ;;
+        *)   die "ARTIFACT_ROOT must be an absolute path (got '$ARTIFACT_ROOT').  A relative
+       value would resolve against this run's working directory -- which is \$WS, not the
+       directory you invoked from -- and land somewhere you did not choose." ;;
+    esac
+    [ "${#ARTIFACT_ROOT}" -gt 4 ] || die "ARTIFACT_ROOT '$ARTIFACT_ROOT' is implausibly short;
+       refusing to create and replace report directories underneath it.  Give a path that is
+       unmistakably yours, for example \"\${TMPDIR:-/tmp}/$REPO_NAME-coverage\"."
 
     # The working directory must be "$WS": the L2 controller reads
     # "./install/etc/WPEFramework/plugins/" relative to it, and nothing here may depend on
@@ -1532,9 +1766,18 @@ main() {
     # $ARTIFACT_ROOT so they stay attributable to this plugin and level.
     cd "$WS" || die "cannot enter WS: $WS"
 
+    # Move any home lcov configuration aside HERE, before the first lcov invocation of the
+    # run (the capability probe below is one), not later at capture time: a home file that
+    # lcov cannot parse breaks `lcov --version` itself, so probing first would misreport a
+    # working lcov as a broken one -- and the counter-zeroing step would have failed with a
+    # bare lcov error before the capture ever ran.
+    stash_home_lcovrc
+    check_lcov_usable
+
     log "repository  : $REPO_ROOT"
     log "workspace   : $WS"
     log "artifacts   : $ARTIFACT_ROOT/$REPO_NAME/<level>"
+    warn_artifact_root_in_tree
     log "L1 build    : $L1_BUILD_DIR"
     log "L1 install  : $L1_INSTALL_DIR"
     log "L2 build    : $L2_BUILD_DIR"
@@ -1553,10 +1796,10 @@ main() {
             check_all_admissible
             # Fail fast and say so: each level is run in a subshell so that a failure is
             # reported here rather than silently ending the script mid-sequence.
-            if ! ( run_level_rebuild_hook l1 && run_level l1 ); then
+            if ! run_level_in_subshell l1; then
                 die "level L1 failed, so level L2 was not run.  Fix L1 and re-run 'all'."
             fi
-            if ! ( run_level_rebuild_hook l2 && run_level l2 ); then
+            if ! run_level_in_subshell l2; then
                 die "level L1 passed but level L2 failed."
             fi
             ;;

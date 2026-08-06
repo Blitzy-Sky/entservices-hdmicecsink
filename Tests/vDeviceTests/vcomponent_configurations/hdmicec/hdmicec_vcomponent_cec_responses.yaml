@@ -80,15 +80,13 @@ HdmiCec:
     # one-byte [System Audio Status] operand (Messages.hpp SetSystemAudioMode); 0x01 is ON,
     # matching this peer's power_status "on" and the setupARCRouting flows that drive it.
     - request: { opcode: "SystemAudioModeRequest", type: "Direct", payload: null}
-      response: { opcode: "SetSystemAudioMode", type: "Direct", payload: null}
+      response: { opcode: "SetSystemAudioMode", type: "Direct", payload: ["0x01"]}
     # No Give System Audio Mode Status / System Audio Mode Status exchange is tabled. Both are
     # real HDMI-CEC opcodes (0x7D, 0x7E), but the middleware defines no message class for
     # either - hdmicec/ccec/include/ccec/Messages.hpp carries only SystemAudioModeRequest
     # (0x70) and SetSystemAudioMode (0x72) - and the sink plugin never references them, so the
     # device under test can neither send nor decode that exchange. A row for it would sit here
     # permanently unreachable; add one only alongside the production support it needs.
-    - request: { opcode: "GetCecVersion", type: "Direct", payload: null}
-      response: { opcode: "CecVersion", type: "Direct", payload: ["cec_version"]}
     # Sink-only opcodes the peer absorbs without replying, including peer-originated messages.
     #
     # The two ARC rows below are spelled with the WIRE opcode names, which is what the
