@@ -1,0 +1,7 @@
+HdmiCec:
+  command: update_device_status
+  description: Emulate HAL open failure by marking the target as faulted
+  device:
+    name: "VAUDIO"
+    power_status: "on"
+    fault: yes
