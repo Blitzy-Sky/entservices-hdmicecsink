@@ -19,6 +19,14 @@
 # * limitations under the License.
 # *
 #* ******************************************************************************
+# Emulated peer for the sink (TV) device under test.
+#
+# device_type "AudioSystem" fixes this peer's CEC logical address: the vComponent's
+# vcDevice_AllocateLogicalAddress offers an audio system exactly one candidate,
+# LOGICAL_ADDRESS_AUDIOSYSTEM == 5, so every directed command a test case sends to this peer -
+# and every directed reply defined in hdmicec_vcomponent_cec_responses.yaml - is addressed to
+# logical address 5. The client commands in ../../HdmiCECSink_Curl.py are written against that
+# address; changing device_type here without changing them there would break the pairing.
 HdmiCec:
   name: "VAUDIO"
   language: "eng"

@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# =====================================================================================
-#  run_coverage.sh -- gcov/lcov coverage runner and >=80% line-coverage gate for the
-#                     HDMI-CEC *sink* plugin, covering BOTH test levels (L1 and L2).
-# =====================================================================================
+# run_coverage.sh -- gcov/lcov coverage runner and line-coverage gate for the HDMI-CEC
+# sink plugin's L1 and L2 test suites.
 #
-#  WHY THIS SCRIPT EXISTS
-#  ----------------------
-#  The two CI workflows in ../.github/workflows/ already capture coverage, but they do
-#  two things that make the >=80% line-coverage requirement unverifiable:
+# PURPOSE
+#   Run a suite, capture coverage from the instrumented build tree, write an HTML report,
+#   print a per-file table derived from the trace records, and fail when line coverage is
+#   below the bar.  It exists because this repository's workflows already capture coverage
+#   but install an lcov configuration that sets lcov_branch_coverage = 0, so branch data is
+#   discarded, and apply no numeric threshold.  Everything else -- the capture directory,
+#   the exclusion globs and the genhtml title -- is reproduced from
+#   .github/workflows/L1-tests.yml and L2-tests.yml, this repository's own recipe.
 #
 #    1. They copy the *test framework's* lcov configuration over ~/.lcovrc
 #       (L1-tests.yml:681 -> entservices-testframework/Tests/L1Tests/.lcovrc_l1,
@@ -16,17 +18,21 @@
 #       discarded in CI.  Note that they are NOT this repository's own
 #       Tests/L1Tests/.lcovrc_l1 -- the plugin's own copy is never read by CI, which is
 #       why enabling branch collection there is complementary but NOT sufficient.
-#       This script therefore removes ~/.lcovrc and passes `--rc branch_coverage=1`
-#       explicitly on every lcov/genhtml invocation.  The legacy `lcov_branch_coverage`
-#       key is deprecated in lcov 2.x and defaults to zero, so the run-time override is
-#       the authoritative enablement mechanism.
+#       This script therefore moves ~/.lcovrc aside for the duration of the run -- into a
+#       private mktemp file, restored by an EXIT/INT/TERM trap however the run ends -- and
+#       passes `--rc branch_coverage=1` explicitly on every lcov/genhtml invocation.  The
+#       legacy `lcov_branch_coverage` key is deprecated in lcov 2.x and defaults to zero,
+#       so the run-time override is the authoritative enablement mechanism.
 #    2. They apply no numeric threshold at all.  No coverage gate of any kind exists
 #       anywhere in this workspace today; the `--fail-under-lines` invocation below is
 #       the first one.
 #
-#  Everything else -- the capture directory, the exclusion globs, the genhtml title, the
-#  runtime environment, the valgrind options -- is reproduced from those workflows
-#  verbatim, because the workflows are this repository's own authoritative recipe.
+# INPUTS (environment, all optional)
+#   WS            workspace root; resolved by walking up from this script.
+#   BUILD_DIR     directory passed to `lcov -c -d`; must hold this plugin's *.gcno/*.gcda.
+#   INSTALL_DIR   install tree providing the test binaries and the plugin libraries.
+#   COVERAGE_MIN  line-coverage bar, default 80.
+#   RUN_VALGRIND  run the suite under valgrind memcheck when set to a truthy value.
 #
 #  GOVERNING CONTRACT
 #  ------------------
@@ -37,25 +43,59 @@
 #    1. Repository convention is authoritative -- the workflows win over instinct; where
 #       they disagree with expectation the tension is documented, not silently resolved
 #       (see the doubled glob token and the gate spelling notes below).
-#    2. No new framework, tool or dependency -- bash, lcov, genhtml, gcov, awk, sort,
-#       grep and (optionally) valgrind only.  No gcovr, no jq, no python.
-#    3. Additive-by-default -- this script mutates nothing.  It does not touch
-#       Tests/gcc-with-coverage.cmake, Tests/clang.cmake, either CMakeLists.txt, the
-#       workflows, /etc/lcovrc, or anything under plugin/.  The ONLY file it deletes is
-#       ~/.lcovrc, and only because CI itself plants one there.
+#    2. No new framework, tool or dependency -- bash plus the coreutils/POSIX primitives
+#       it already needs (printf, grep, awk, sed, sort, find, wc, head, tr, cat, dirname,
+#       basename, mv, mktemp, rmdir), lcov 2.0-1, genhtml, gcov 13.3.0 and, when asked
+#       for, valgrind.  No gcovr, no jq, no python.
+#    3. Additive-by-default -- this script modifies no repository production or source
+#       file.  Its measurement tools (lcov, genhtml, find, mktemp, valgrind) are resolved to
+#       absolute paths from the inherited environment BEFORE any install tree becomes a
+#       search path, the level's install tree is refused if it is world-writable, and every
+#       artifact destination is refused if it is a symlink or the wrong kind of object; the
+#       HTML report is built in a private mode-0700 staging directory and published by
+#       rename, and that directory is removed by an EXIT/INT/TERM/HUP trap.  It does not touch Tests/gcc-with-coverage.cmake, Tests/clang.cmake, either
+#       CMakeLists.txt, the workflows, /etc/lcovrc, or anything under plugin/, and it
+#       never regenerates a committed build file.  It is NOT, however, side-effect free,
+#       and the two side effects it does have are stated here rather than buried:
+#         (a) $HOME/.lcovrc -- CI plants a branch-disabled copy there (see 1. above) and
+#             lcov reads it silently, so the lcov steps must run with no home
+#             configuration in effect.  An existing $HOME/.lcovrc is therefore MOVED
+#             ASIDE into a private temporary directory for the duration of the run and
+#             RESTORED on exit, including on failure, via an EXIT trap -- capture and
+#             restore, never unconditional deletion, so a developer's own lcov
+#             configuration survives the run.  The stash path is logged, so even a run
+#             killed with SIGKILL (the one signal a trap cannot service) leaves a named,
+#             recoverable copy rather than a hole.  Nothing else in $HOME is read or
+#             written, and /etc/lcovrc is never touched.
+#         (b) Artifacts -- the fixed names listed under ARTIFACTS below are CREATED AND
+#             OVERWRITTEN WITHOUT PROMPTING, exactly as CI overwrites them in
+#             $GITHUB_WORKSPACE.  They are written into a per-plugin, per-level directory
+#             under $ARTIFACT_ROOT rather than straight into the workspace root, so two
+#             plugins and two levels cannot overwrite each other's evidence.  Fixed names
+#             are a deliberate choice (see 5. below), so do not keep anything you care
+#             about under those names inside that directory.
+#         If you would rather the run touch nothing at all under your home directory, give
+#         it a home of its own:  HOME="$(mktemp -d)" ./Tests/run_coverage.sh l1
 #    4. Measured claims only -- every number printed is derived from the trace captured
-#       moments earlier.  No figure is hard-coded, defaulted or estimated, and an empty
-#       capture is a loud failure rather than a plausible-looking number.
-#    5. Deterministic and isolated -- fixed artifact names, no timestamps, no wall-clock
-#       sleeps, and no reliance on the caller's cwd (the script cd's to "$WS").  The
-#       report is a pure function of the trace it reads, so the same trace always yields
-#       byte-identical output.  Measured caveat, stated rather than glossed over: because
-#       gcov counters accumulate and a few paths in this plugin's threaded code are
-#       timing-dependent, re-running the *suite* can add a handful of hits.  Across four
-#       consecutive L1 runs the figures were identical for the first two
-#       (1446/1771 on HdmiCecSinkImplementation.cpp) and then drifted UP by four lines
-#       and two branches (1450/1771) -- never down, and never in the denominator.  Delete
-#       *.gcda first if you need runs to be exactly comparable.
+#       moments earlier, and that trace is derived from counters produced by THIS run.
+#       gcov counters ACCUMULATE across runs, so a stale *.gcda keeps a line marked hit
+#       long after the test that hit it stopped running -- which would let a gate pass on
+#       an earlier run's evidence.  The script therefore zeroes the level's counters before
+#       the suite and refuses to capture unless the suite produced fresh ones.  No figure
+#       is hard-coded, defaulted or estimated, and an empty capture is a loud failure
+#       rather than a plausible-looking number.
+#    5. Deterministic and isolated -- fixed artifact names inside a per-plugin, per-level
+#       artifact directory, no timestamps, no wall-clock sleeps, and no reliance on the
+#       caller's cwd (the script cd's to "$WS").  The report is a pure function of the
+#       trace it reads, so the same trace always yields byte-identical output, and the HTML
+#       directory is purged before genhtml so no page from a larger earlier trace can
+#       survive into a smaller later one.  Residual caveat, stated rather than glossed
+#       over: a few paths in this plugin's threaded code are timing-dependent, so two runs
+#       of the *suite* can still differ by a handful of hits (observed: four lines and two
+#       branches more on HdmiCecSinkImplementation.cpp, upward, never in the denominator).
+#       That is suite non-determinism, not measurement carry-over; zeroing the counters
+#       removes the carry-over half of the problem, which is the half that could otherwise
+#       manufacture a pass.
 #    6. Honest reporting over convenient numbers -- the exclusion globs are reproduced
 #       verbatim and NOTHING is added to them.  Those globs are what keep the coverage
 #       denominator production-source-only, which is what forces coverage to move by
@@ -77,46 +117,107 @@
 #  one plugin overwrites the other's.  Evidence: after a sink build, symbol inspection of
 #  the resulting library found 3,673 sink symbols and zero source symbols, and the two
 #  RdkServicesL1Test binaries were byte-identical.  A mixed tree is easy to produce and
-#  silently measures the wrong plugin, so `preflight` below warns when the discoverable
-#  test library carries the other plugin's fixtures.
+#  silently measures the wrong plugin, so `preflight` below HARD-FAILS unless the
+#  discoverable test library is present and positively identifiable as this plugin's: a
+#  library carrying the other plugin's fixtures, a library carrying neither plugin's
+#  fixtures, a library carrying both, and a missing library are all fatal.  Warning and
+#  proceeding was not enough -- gcov counters accumulate, so a run of the wrong suite still
+#  produces a plausible-looking trace, and the results-file check further down counts tests
+#  without being able to tell whose tests they are.
 #
-#  The sequence is therefore, PER PLUGIN, STRICTLY SEQUENTIALLY:
-#      build the plugin
-#   -> rm -rf the entservices-testframework build directory and rebuild it against
-#      THIS plugin            <-- skipping this rebuild is exactly where the collision bites
-#   -> run the suite
-#   -> capture coverage
-#   -> only then move to the other plugin.
-#  RdkServicesL1Test itself compiles only test_JSON.cpp; the plugin's own cases live in
-#  the shared libWPEFrameworkL1TestsIO.so, which is why the framework rebuild is what
-#  decides whose tests actually run.
+# GATE
+#   Line coverage only, applied twice: to the level aggregate through lcov's own
+#   --fail-under-lines, and to every file in the filtered trace, because the requirement is
+#   per target and a healthy aggregate can hide a below-bar file.  Files named in the
+#   level's gate-exemption array are still measured and printed but do not fail the gate;
+#   the reason for each is recorded beside that array.  Branch coverage is reported as
+#   evidence and never gated, because gcov counts branches as control-flow-graph arcs and
+#   those include compiler-generated exception and static-destruction arcs no test reaches.
+#   A suite that exits non-zero, or that leaves no results file written by this run, fails
+#   before coverage is considered at all.
+#
+# OUTPUTS (fixed names, written under $ARTIFACT_ROOT/<repo>/<level>/)
+#   coverage_<level>.info, filtered_coverage_<level>.info, coverage_<level>/index.html,
+#   the archived rdk<LEVEL>TestResults.json, and valgrind_log when RUN_VALGRIND is enabled.
+#   CI writes the same names into $GITHUB_WORKSPACE; here they are grouped per repository and
+#   per level so an `all` run cannot have one level overwrite the other's evidence.
+#
+# WHAT IT CHANGES
+#   It writes the artifacts above and exports PATH, LD_LIBRARY_PATH and GTEST_OUTPUT for the
+#   suite it launches.  It reads production source and committed build files but never writes to
+#   them, and it neither creates, modifies nor deletes any user or system lcov configuration:
+#   this level's versioned Tests/L<n>Tests/.lcovrc_l<n> is passed with --config-file, which lcov
+#   reads in place of ~/.lcovrc and /etc/lcovrc, and branch collection is forced with
+#   `--rc branch_coverage=1`, which outranks every configuration file.  A caller's
+#   home-directory configuration is moved aside for the lcov steps and restored on exit -- read
+#   past, never removed.
+#
+# PREREQUISITES
+#   * The plugin and entservices-testframework must already be built and installed, with the
+#     framework built against THIS plugin.  Tests/L1Tests/CMakeLists.txt and
+#     Tests/L2Tests/CMakeLists.txt name their libraries L1TestsIO and L2TestsIO, and the
+#     HDMI-CEC source plugin uses the same names, so a stale framework build would make the run
+#     execute the other plugin's tests while capturing this plugin's objects.  preflight()
+#     hard-fails on that rather than warning.  Build and measure one plugin, and one level, at
+#     a time.
+#   * lcov 2.x, genhtml and gcov on PATH; valgrind only when RUN_VALGRIND is enabled.  The
+#     measurement tools are resolved to absolute paths before any install tree joins PATH.
+#   * For l2, $WS/install/etc/WPEFramework/plugins must exist: the test framework's L2
+#     controller opens that path relative to the working directory before starting Thunder.
 #
 #  L1 and L2 additionally use different -I / -include / -D / -Wl blocks and the mocks
 #  library must be rebuilt per level, so a single tree cannot hold both levels at once.
-#  Consequently the `all` subcommand is meaningful only for a tree that genuinely
-#  contains both levels' artifacts (a CI-style flow that rebuilds between levels); for
-#  the local per-level build model, run `l1` and `l2` separately around their builds.
+#  `all` therefore does NOT assume one tree can serve both levels.  It requires one of two
+#  arrangements, and refuses to run before touching anything if neither is supplied:
+#
+#    (i)  SEPARATE TREES -- point L1_BUILD_DIR/L1_INSTALL_DIR and L2_BUILD_DIR/
+#         L2_INSTALL_DIR at the two level-specific trees you already built.  Each level is
+#         then measured against its own objects and its own install tree, and the runtime
+#         search paths are recomputed per level from the pristine PATH/LD_LIBRARY_PATH.
+#    (ii) A REBUILD HOOK -- set LEVEL_REBUILD_CMD to a command that switches a shared tree
+#         to a given level.  It is invoked as `$LEVEL_REBUILD_CMD <level>` immediately
+#         before each level runs, and a non-zero exit from it fails that level.  The hook
+#         is what makes a shared tree legitimate: it is responsible for the full documented
+#         sequence -- rebuild the plugin for the level, then `rm -rf` the
+#         entservices-testframework build directory and rebuild/install it against THIS
+#         plugin, then rebuild the mocks library for the level.
+#
+#  With neither arrangement, `all` would run one level against the other level's artifacts,
+#  so it exits non-zero with an actionable message BEFORE any suite is launched or any
+#  counter is zeroed.  `l1` and `l2` on their own are unaffected: they measure the tree the
+#  caller built for that level, exactly as the local per-level build model expects.
 #
 #  ----------------------------------------------------------------------------------
 #  BUILD RECIPE (verified working; run from the workspace root, i.e. "$WS")
 #  ----------------------------------------------------------------------------------
+#  Every command below spells the CMake binary out as /opt/cmake316/bin/cmake ON PURPOSE.
+#  CMake 3.16.9 is a hard requirement (see the constraints below) and an unqualified
+#  `cmake` is whatever happens to be first on PATH -- on a developer host that is usually a
+#  much newer CMake, which fails the plugin test-library configuration step.  If you would
+#  rather type `cmake`, put the pinned one in front FIRST and check that you got it:
+#      export PATH=/opt/cmake316/bin:$PATH
+#      cmake --version        # must report exactly: cmake version 3.16.9
 #  L1:
-#    cmake -S entservices-hdmicecsink -B build/entservices-hdmicecsink \
+#    /opt/cmake316/bin/cmake -S entservices-hdmicecsink -B build/entservices-hdmicecsink \
 #      -DPLUGIN_HDMICECSINK=ON -DRDK_SERVICES_L1_TEST=ON \
 #      -DUSE_THUNDER_R4=ON -DCMAKE_BUILD_TYPE=Debug
-#    cmake --build build/entservices-hdmicecsink -j"$(nproc)"
-#    cmake --install build/entservices-hdmicecsink
+#    /opt/cmake316/bin/cmake --build build/entservices-hdmicecsink -j"$(nproc)"
+#    /opt/cmake316/bin/cmake --install build/entservices-hdmicecsink
 #    rm -rf build/entservices-testframework      # then reconfigure/build/install the
-#                                                # framework against THIS plugin
+#                                                # framework against THIS plugin, with the
+#                                                # same pinned cmake binary
 #  L2:
-#    configure with -DPLUGIN_L2Tests=ON -DRDK_SERVICE_L2_TEST=ON and apply the L2 Thunder
-#    timeout patch (entservices-testframework/patches/Increase_Timout_For_L2Tests_Plugin.patch)
+#    configure with -DPLUGIN_L2Tests=ON -DRDK_SERVICE_L2_TEST=ON -- again with
+#    /opt/cmake316/bin/cmake -- and apply the L2 Thunder timeout patch
+#    (entservices-testframework/patches/Increase_Timout_For_L2Tests_Plugin.patch)
 #    before building Thunder.  The flag spellings differ and BOTH are correct:
 #    RDK_SERVICES_L1_TEST is plural, RDK_SERVICE_L2_TEST is singular.
 #
 #  Constraints that the recipe depends on:
-#    * CMake 3.16.9 is a HARD requirement (available at /opt/cmake316); 3.20+ fails the
-#      plugin test-library configuration step.
+#    * CMake 3.16.9 is a HARD requirement (available at /opt/cmake316/bin/cmake); 3.20+
+#      fails the plugin test-library configuration step.  This script neither builds nor
+#      checks the build, so nothing here can enforce it for you -- that is exactly why the
+#      recipe above names the binary explicitly instead of relying on PATH.
 #    * Dependency order: ThunderTools (patched) -> Thunder (patched) -> published
 #      interfaces -> external empty headers -> GoogleTest -> helpers -> mocks -> plugin
 #      -> test framework.
@@ -127,10 +228,15 @@
 #      They exist only because the local host is newer than the CI image.
 #    * Coverage instrumentation needs no work: Tests/gcc-with-coverage.cmake already
 #      appends --coverage to CMAKE_CXX_FLAGS for both the plugin and the framework build.
-#    * gcov counters ACCUMULATE across runs.  Delete *.gcda before a measured baseline if
-#      you want raw execution counts to be comparable; the hit-versus-found ratios this
-#      script reports are unaffected by accumulation, which is why two consecutive runs
-#      report identical percentages.
+#    * gcov counters ACCUMULATE across runs, and that is a correctness problem rather than
+#      a cosmetic one: a *.gcda left behind by an earlier run keeps its lines marked hit
+#      even if this run never executes them, so a percentage -- and therefore the gate --
+#      can be satisfied by evidence the current tests did not produce.  This script
+#      removes that failure mode itself: it runs `lcov --zerocounters` on the level's build
+#      tree immediately before the suite (verified to delete *.gcda while leaving the
+#      *.gcno instrumentation intact), then refuses to capture unless the suite wrote fresh
+#      counters.  Nothing outside BUILD_DIR is touched, and no manual `find -delete` step
+#      is needed before a measured baseline.
 #    * Before an L2 run, remove install/etc/WPEFramework/plugins/L1TestsIO.json if an L1
 #      build previously installed it.  That is a build-step prerequisite; this script
 #      deliberately does not delete it (see contract clause 3).
@@ -160,19 +266,23 @@
 #                     branches 36.2% (1106/3053).
 #
 #  The L2 baseline had NEVER been measured before this script existed; capturing it with
-#  `run_coverage.sh l2` is a required first step and its figures complete the "before"
-#  column of the workspace-root COVERAGE_TRACEABILITY_REPORT.md.  No L2 figure is
-#  hard-coded here, deliberately -- the script must measure it, not assert it.
+#  `run_coverage.sh l2` is a required first step, and its figures will supply the "before"
+#  column for L2 in the workspace-root COVERAGE_TRACEABILITY_REPORT.md once that report is
+#  written -- it does not exist yet.  No L2 figure is hard-coded here, deliberately -- the
+#  script must measure it, not assert it.
 #
 #  ----------------------------------------------------------------------------------
-#  DOWNSTREAM CONTRACT
+#  DOWNSTREAM CONTRACT (a forward commitment: none of the three files named here exists
+#  yet -- they land later in this engagement, and this block is what they will consume)
 #  ----------------------------------------------------------------------------------
-#  This script's per-file table and its filtered_coverage_<level>.info traces are a
-#  declared input to the workspace-root COVERAGE_TRACEABILITY_REPORT.md, which names this
-#  script explicitly alongside hdmicec/tests/L1Tests/run_coverage.sh and
-#  entservices-hdmicecsource/Tests/run_coverage.sh.
+#  This script's per-file table and its filtered_coverage_<level>.info traces are intended
+#  as an input to the workspace-root COVERAGE_TRACEABILITY_REPORT.md, which will name this
+#  script explicitly alongside the two sibling runners planned for the other in-scope
+#  repositories, hdmicec/tests/L1Tests/run_coverage.sh and
+#  entservices-hdmicecsource/Tests/run_coverage.sh.  Until those three files land, this
+#  script stands alone: it is fully usable on its own and nothing in it depends on them.
 #
-#  That report attributes coverage to tests by COVERAGE_GAPS.md section 6.2 rank plus the
+#  That report will attribute coverage to tests by COVERAGE_GAPS.md section 6.2 rank plus the
 #  stable HTML anchor id and by symbol name -- NEVER by line number, because this pass
 #  shifts line numbers.  The six sink anchors are:
 #      #gap-plugin-sink-vdevicetests        rank 22  P1
@@ -189,24 +299,40 @@
 #  pass/fail.
 #
 #  ACCEPTANCE CONDITION ENFORCED HERE:
-#      RdkServicesL1Test and RdkServicesL2Test both exit 0, AND
-#      plugin/HdmiCecSinkImplementation.cpp, plugin/HdmiCecSinkImplementation.h and
-#      plugin/HdmiCecSink.cpp each measure >= COVERAGE_MIN (80) percent line coverage.
+#      the level's test binary exits 0 and wrote its own results file during this run with a
+#      non-zero test count, AND the level aggregate meets COVERAGE_MIN (80) percent line
+#      coverage, AND every non-exempt file left in the filtered trace meets it too.  The
+#      per-file half of the gate is applied to whatever the trace contains, not to a
+#      hand-picked list, so a file added to the plugin later is gated automatically.  The
+#      only exemption is plugin/Module.cpp at L1 (L1_GATE_EXEMPT): its single instrumented
+#      line comes from the module-declaration macro and is reachable only through a real
+#      Thunder plugin load, which the in-process L1 model never performs.  L2 exempts
+#      nothing (L2_GATE_EXEMPT is empty) because L2 does run a real Thunder host and that
+#      same line is hit there -- measured at 1/1 below.
 #  A red suite under a green coverage number is worthless, so a non-zero exit from a test
 #  binary fails this script immediately -- the test invocation is never `|| true`'d.  Nor is
-#  a zero exit taken on trust: the run must also have written its own results file, during
-#  this run, with a non-zero test count.  That check exists because it caught a real false
-#  pass during validation -- in a tree built for L1, RdkServicesL2Test started Thunder, ran
-#  no test, exited 0, and left the previous run's results file in place, after which the
-#  coverage capture reported the L1 run's accumulated data as if it were L2's.
+#  a zero exit taken on trust.  The observed false pass that motivated this: in a tree built
+#  for L1, RdkServicesL2Test started Thunder, never activated the L2 test plugin, ran no
+#  test at all, exited 0, and left the previous run's results file in place -- after which
+#  the capture reported the L1 run's accumulated counters as if they were L2's.  Both halves
+#  of that failure are now closed by construction rather than by inspection:
+#      * the level's results file is DELETED before the binary is launched, so the file that
+#        exists afterwards can only have been written by this run.  It must exist, report a
+#        non-zero test count, and name at least one HdmiCecSink* suite or class -- which is
+#        what proves the SINK suite ran rather than the other plugin's or test_JSON.cpp's;
+#      * the level's *.gcda counters are ZEROED before the binary is launched, and the
+#        capture is refused unless the run produced new ones, so no percentage can rest on
+#        an earlier run's execution data.
 #
-#  What that condition looks like on today's tree, measured with this script rather than
-#  assumed: at L1 both the aggregate and all three named targets clear the bar and `l1`
-#  exits 0.  At L2 the suite is green but the aggregate and those same three targets sit
-#  BELOW the bar, so `l2` -- and therefore `all` -- exits non-zero.  That is a true
-#  measurement, not a defect in this script: L2 is a functional suite that exercises a
-#  narrower slice of each file, and the sink's per-target >=80% line target is met by the
-#  L1 suite.  Do not "fix" it by adding an exclusion glob, by lowering COVERAGE_MIN in a
+#  What that condition looked like when this script was written, measured with it rather
+#  than assumed: at L1 both the aggregate and all three named targets cleared the bar and
+#  `l1` exited 0.  At L2 the suite was green but the aggregate and those same three targets
+#  sat BELOW the bar, so `l2` -- and therefore `all` -- exited non-zero.  Those two
+#  sentences are a dated observation, not a promise about the tree you are looking at: the
+#  figures move whenever the suites or the plugin move, and re-measuring them is precisely
+#  this script's job.  The L2 shortfall in particular is a true measurement rather than a
+#  defect in this script: L2 is a functional suite that exercises a narrower slice of each
+#  file, and the sink's per-target >=80% line target is met by the L1 suite.  Do not "fix" it by adding an exclusion glob, by lowering COVERAGE_MIN in a
 #  committed caller, or by merging the two levels into one trace; the first two are
 #  dishonest and merging is deliberately out of scope (this script has exactly three
 #  subcommands and adds no lcov -a step).  Close it by adding L2 cases.
@@ -238,26 +364,68 @@
 #      consequence of the branch-collection requirement, not a way to hide a problem: the
 #      condition is reported as a warning and the resulting figures are unchanged.
 #
-#  ARTIFACTS (fixed names, written to "$WS", exactly as CI writes them to
-#  $GITHUB_WORKSPACE):
-#      coverage_<level>.info            raw capture
-#      filtered_coverage_<level>.info   after the repository's exclusion globs
-#      coverage_<level>/index.html      genhtml report
-#      rdk<LEVEL>TestResults.json       GoogleTest machine-readable results
-#      valgrind_log                     only when RUN_VALGRIND is enabled
+#  ARTIFACTS (fixed names -- no timestamps -- inside a per-plugin, per-level directory):
+#
+#      $ARTIFACT_ROOT/entservices-hdmicecsink/<level>/
+#          coverage_<level>.info            raw capture
+#          filtered_coverage_<level>.info   after the repository's exclusion globs
+#          coverage_<level>/index.html      genhtml report
+#          rdk<LEVEL>TestResults.json       GoogleTest machine-readable results
+#          valgrind_log                     only when RUN_VALGRIND is enabled
+#
+#  ARTIFACT_ROOT defaults to "$WS/coverage-artifacts".
+#
+#  WHY THIS DIVERGES FROM CI'S FLAT LAYOUT, deliberately: CI writes coverage.info,
+#  filtered_coverage.info, coverage/ and rdkL1TestResults.json straight into
+#  $GITHUB_WORKSPACE, which is safe there because each workflow run measures exactly one
+#  plugin in a throwaway workspace.  Here, three runners -- this one,
+#  entservices-hdmicecsource/Tests/run_coverage.sh and hdmicec/tests/L1Tests/run_coverage.sh
+#  -- share one long-lived "$WS", so flat names mean the second run silently overwrites the
+#  first run's evidence and the traceability report can no longer attribute a trace to a
+#  plugin.  The per-plugin/per-level directory keeps CI's file NAMES (so the recipe is still
+#  recognisable) while making every artifact attributable.  The sibling runners follow the
+#  same convention: $ARTIFACT_ROOT/<repository name>/<level>/.
+#
+#  ONE ARTIFACT CANNOT BE REDIRECTED, and it is documented rather than papered over: at L2
+#  the results file is written by out-of-scope framework code.
+#  entservices-testframework/Tests/L2Tests/L2testController.cpp:91-93 spawns WPEFramework
+#  with `export GTEST_OUTPUT="json:$PWD/rdkL2TestResults.json"`, overriding whatever this
+#  script exports, so the L2 file always appears at "$WS/rdkL2TestResults.json".  The script
+#  therefore deletes that fixed path before launching L2, requires the run to recreate it,
+#  and then archives it into the level's artifact directory, which is the copy the report
+#  consumes.  At L1 the binary honours GTEST_OUTPUT, so the file is written into the
+#  artifact directory directly.
 # =====================================================================================
 
 set -euo pipefail
 
-# ------------------------------------------------------------------------------------
-# Location resolution.  Tests/ -> repository root -> workspace root.  Nothing is
-# hard-coded to an absolute path and nothing depends on the caller's cwd.
-# ------------------------------------------------------------------------------------
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"          # <repo>/Tests
 REPO_ROOT="$(dirname -- "$SCRIPT_DIR")"            # <repo>            (entservices-hdmicecsink)
 REPO_NAME="$(basename -- "$REPO_ROOT")"
 readonly SCRIPT_PATH SCRIPT_DIR REPO_ROOT REPO_NAME
+
+# ------------------------------------------------------------------------------------
+# Measurement tooling resolved to absolute paths HERE, from the environment as inherited,
+# BEFORE this script goes anywhere near INSTALL_DIR.  INSTALL_DIR is a caller-supplied
+# build input and the test binaries in it genuinely have to be reached through it, but
+# nothing else does: resolving lcov, genhtml, find, sort, awk, sed, grep, mktemp and
+# valgrind up front means none of them can be picked up from that tree once the runtime
+# search paths point into it.
+# ------------------------------------------------------------------------------------
+resolve_tool() { # $1=tool name  -> absolute path on stdout, empty when absent
+    command -v -- "$1" 2>/dev/null || true
+}
+LCOV_BIN="$(resolve_tool lcov)"
+GENHTML_BIN="$(resolve_tool genhtml)"
+FIND_BIN="$(resolve_tool find)"
+MKTEMP_BIN="$(resolve_tool mktemp)"
+VALGRIND_BIN="$(resolve_tool valgrind)"
+readonly LCOV_BIN GENHTML_BIN FIND_BIN MKTEMP_BIN VALGRIND_BIN
+
+# Private staging directory for artifacts in progress; created on first use and removed by
+# the cleanup trap.  Empty until then, so the trap is safe at any point.
+STAGE_DIR=''
 
 # ------------------------------------------------------------------------------------
 # Environment inputs -- every one overridable, with the documented defaults.
@@ -268,31 +436,58 @@ INSTALL_DIR="${INSTALL_DIR:-$WS/install}"
 COVERAGE_MIN="${COVERAGE_MIN:-80}"                            # the line-coverage bar
 RUN_VALGRIND="${RUN_VALGRIND:-0}"
 
+# Per-level overrides.  L1 and L2 need differently configured trees (different -I /
+# -include / -D / -Wl blocks and a level-specific mocks library), so each level resolves
+# its own build and install directory.  Both default to the single-tree values above, which
+# is exactly right for `l1` or `l2` on their own; `all` additionally requires that the two
+# levels do not resolve to the same tree unless LEVEL_REBUILD_CMD switches it between them.
+L1_BUILD_DIR="${L1_BUILD_DIR:-$BUILD_DIR}"
+L1_INSTALL_DIR="${L1_INSTALL_DIR:-$INSTALL_DIR}"
+L2_BUILD_DIR="${L2_BUILD_DIR:-$BUILD_DIR}"
+L2_INSTALL_DIR="${L2_INSTALL_DIR:-$INSTALL_DIR}"
+
+# Optional hook that switches a shared tree to a level.  Invoked as `$LEVEL_REBUILD_CMD
+# <level>` immediately before each level runs under `all`; empty means "no hook", in which
+# case `all` demands separate per-level trees.  Never invoked for a single-level run: there
+# the caller has already built the tree for the level being measured.
+LEVEL_REBUILD_CMD="${LEVEL_REBUILD_CMD:-}"
+
+# Artifact root.  Every artifact is written under $ARTIFACT_ROOT/<repository>/<level>/ so
+# that this runner's evidence cannot be overwritten by, or confused with, the sibling
+# source-plugin and middleware runners that share the same workspace.
+ARTIFACT_ROOT="${ARTIFACT_ROOT:-$WS/coverage-artifacts}"
+
+# Resolved per level by run_level() before anything else happens.
+LEVEL_BUILD_DIR=''
+LEVEL_INSTALL_DIR=''
+LEVEL_ARTIFACT_DIR=''
+
+# Pristine search paths, captured once so that per-level runtime environments are computed
+# from the same base and a second level cannot inherit the first level's install tree.
+readonly BASE_PATH="${PATH:-}"
+readonly BASE_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+
 # genhtml title, identical for both levels because both workflows use the same one.
 readonly GENHTML_TITLE="$REPO_NAME coverage"
 
-# lcov error categories ignored during capture, reproduced from the documented recipe.
-# `category` is absent on purpose -- it is not a valid value and hard-fails (caveat 3).
 readonly LCOV_CAPTURE_IGNORE="mismatch,gcov,unused,empty,negative,source,graph,inconsistent,corrupt"
-# The filter/summary/gate steps need `inconsistent` for the reason given in caveat 6, and
-# `unused` because an exclusion glob that matches nothing is an error in lcov 2.x and the
-# glob lists are reproduced verbatim rather than pruned to this tree.
+# `unused` is needed downstream because an exclusion glob that matches nothing is an error
+# in lcov 2.x, and the glob lists are reproduced verbatim rather than pruned to this tree.
 readonly LCOV_FILTER_IGNORE="unused,empty,inconsistent"
 readonly LCOV_SUMMARY_IGNORE="empty,inconsistent"
 
+# Filled by resolve_lcov_config() with `--config-file <this level's .lcovrc>` when the
+# repository ships one.  That file then replaces ~/.lcovrc and /etc/lcovrc for the run, so
+# the settings in effect are the ones this repository versions rather than whatever the
+# caller's home directory holds -- and the caller's file is read past, not removed.
+LCOV_CONFIG_ARGS=()
+
 # ------------------------------------------------------------------------------------
-# Exclusion globs -- reproduced VERBATIM from this repository's own workflows, in the
-# workflow's order, with nothing added and nothing removed.  They are what keeps the
-# coverage denominator production-source-only.
-#
-#   L1: .github/workflows/L1-tests.yml lines 689-695   (7 globs)
-#   L2: .github/workflows/L2-tests.yml lines 771-780  (10 globs)
-#
-# NOTE ON THE DOUBLED TOKEN: the L2 list really does contain
-# `*/build/entservices-entservices-testframework/_deps/*` with "entservices-" doubled.
-# That is verified against L2-tests.yml:774 and is reproduced here deliberately, NOT
-# corrected: "fixing" it would change the set of paths removed and therefore change the
-# coverage denominator, so the workflow wins and the tension is recorded here instead.
+# Reproduced verbatim from .github/workflows/L1-tests.yml and L2-tests.yml, in the
+# workflow's order.  They are what keeps the coverage denominator production-source-only,
+# so nothing may be added or removed here.  The doubled token in the L2 list
+# (`entservices-entservices-testframework`) is in the workflow too; correcting it would
+# change which paths are removed and therefore the denominator, so it is kept as-is.
 # ------------------------------------------------------------------------------------
 readonly L1_EXCLUDES=(
     '/usr/include/*'
@@ -317,41 +512,76 @@ readonly L2_EXCLUDES=(
 )
 
 # ------------------------------------------------------------------------------------
-# Per-target gate exemptions.
+# Files whose line-coverage gate is waived at a given level.  They stay in the denominator
+# and are still measured and printed; only the pass/fail verdict is waived.
 #
-# The aggregate gate is lcov's own --fail-under-lines.  On top of it this script applies
-# the same bar per target, because the requirement is ">=80% line coverage per in-scope
-# target" and a healthy aggregate can otherwise hide a below-bar file.
-#
-# Exactly one file is exempt, and only at L1:
-#
-#   plugin/Module.cpp -- its single instrumented line and both functions come from the
-#   plugin module-declaration macro, which expands to build-reference and service-metadata
-#   accessors that only the Thunder plugin loader invokes at load time.  An in-process L1
-#   GoogleTest binary never loads the plugin through a live Thunder host, so the line is
-#   unreachable from L1 by construction.  Reaching it would need either a test that loads
-#   the plugin through a live Thunder host (outside the L1 execution model) or a change to
-#   the module declaration (production source, forbidden).  It is enumerated here with
-#   that reason rather than excluded from the denominator, and it still appears in the
-#   per-file table with its real measured figures -- the exemption waives the gate, never
-#   the reporting.
-#
-#   At L2 there is NO exemption: the L2 suite drives an in-process Thunder host that does
-#   load the plugin, and Module.cpp measures 1/1 there.  That is precisely why this list
-#   is level-aware instead of unconditional.
+#   plugin/Module.cpp at L1 -- its one instrumented line and both functions come from the
+#   plugin module-declaration macro, whose build-reference and service-metadata accessors
+#   only the Thunder plugin loader calls at load time.  An in-process L1 GoogleTest binary
+#   never loads the plugin through a live host, so the line is unreachable from L1 without
+#   either a live-host test (outside the L1 execution model) or a change to the module
+#   declaration (production source).  The list is level-aware because the L2 suite does
+#   drive an in-process host and therefore can reach it.
 # ------------------------------------------------------------------------------------
 readonly L1_GATE_EXEMPT=(
     'plugin/Module.cpp'
 )
 readonly L2_GATE_EXEMPT=()
 
-# ------------------------------------------------------------------------------------
-# Output helpers.  Diagnostics go to stderr so that stdout stays a clean report.
-# ------------------------------------------------------------------------------------
 log()  { printf '[run_coverage] %s\n' "$*"; }
 warn() { printf '[run_coverage] WARNING: %s\n' "$*" >&2; }
 die()  { printf '[run_coverage] ERROR: %s\n' "$*" >&2; exit 1; }
 rule() { printf '%s\n' '-------------------------------------------------------------------------------'; }
+
+# ------------------------------------------------------------------------------------
+# $HOME/.lcovrc handling -- capture and restore, never unconditional deletion.
+#
+# lcov reads $HOME/.lcovrc silently whenever it exists, and the CI workflows plant a
+# branch-disabled copy there (L1-tests.yml:681, L2-tests.yml:763).  A copy left in place
+# would suppress the branch data this script exists to produce, so the lcov steps have to
+# run with no home configuration in effect.
+#
+# That does NOT justify destroying a developer's own configuration.  The file is moved
+# aside into a private temporary directory and moved back on exit -- including when a step
+# fails, because the restore is installed as an EXIT trap the moment the stash is taken.
+# The stash path is logged, so a run killed with SIGKILL (the one signal no trap can
+# service) leaves a named, recoverable copy.  Contract clause 3(a) documents this.
+# ------------------------------------------------------------------------------------
+HOME_LCOVRC_STASH=""
+
+restore_home_lcovrc() {
+    local status=$?
+    if [ -n "$HOME_LCOVRC_STASH" ] && [ -f "$HOME_LCOVRC_STASH" ]; then
+        if mv -f "$HOME_LCOVRC_STASH" "$HOME/.lcovrc"; then
+            log "restored $HOME/.lcovrc"
+        else
+            warn "could not restore $HOME/.lcovrc -- your original is intact at $HOME_LCOVRC_STASH; move it back by hand"
+        fi
+    fi
+    if [ -n "$HOME_LCOVRC_STASH" ]; then
+        rmdir "$(dirname -- "$HOME_LCOVRC_STASH")" 2>/dev/null || true
+        HOME_LCOVRC_STASH=""
+    fi
+    # Never let the housekeeping above change the status the caller is exiting with.
+    return "$status"
+}
+
+stash_home_lcovrc() {
+    [ -n "${HOME:-}" ] || return 0
+    [ -f "$HOME/.lcovrc" ] || return 0
+    [ -z "$HOME_LCOVRC_STASH" ] || return 0        # already stashed earlier in this run
+
+    local stash_dir
+    stash_dir="$(mktemp -d "${TMPDIR:-/tmp}/run_coverage_lcovrc.XXXXXX")" \
+        || die "cannot create a temporary directory to stash $HOME/.lcovrc"
+    HOME_LCOVRC_STASH="$stash_dir/.lcovrc"
+    # Install the restore BEFORE the move, so an interrupt between the two cannot lose the
+    # file and a failure in any later step still puts it back.
+    trap restore_home_lcovrc EXIT
+    mv -f "$HOME/.lcovrc" "$HOME_LCOVRC_STASH" \
+        || die "cannot move $HOME/.lcovrc aside; refusing to run lcov against an unknown home configuration"
+    log "moved $HOME/.lcovrc aside to $HOME_LCOVRC_STASH (CI plants a branch-disabled copy there); it is restored on exit"
+}
 
 usage() {
     cat <<USAGE
@@ -361,30 +591,60 @@ Runs a HDMI-CEC sink test suite, captures gcov/lcov coverage with branch data en
 writes an HTML report, prints a per-file table derived from the trace records, and applies
 a >=${COVERAGE_MIN}% line-coverage gate.
 
+Each level zeroes its own *.gcda counters before running the suite, so the figures come
+from this run only, and writes every artifact into a per-plugin, per-level directory.
+
 Subcommands:
   l1     Run RdkServicesL1Test, then capture, report and gate the L1 coverage.
   l2     Run RdkServicesL2Test, then capture, report and gate the L2 coverage.
   all    Run l1 and then l2, sequentially.  Fails if either level fails; on failure the
-         remaining level is not run and the level that failed is named.
+         remaining level is not run and the level that failed is named.  Because an L1 tree
+         and an L2 tree are not interchangeable, 'all' requires EITHER separate per-level
+         build/install directories OR a LEVEL_REBUILD_CMD hook, and refuses to start
+         without one of them.
 
 Environment variables (all optional; shown with their defaults):
   WS=<workspace root>            Resolved by walking up from this script
-                                 (Tests/ -> repository -> workspace).  Artifacts are
-                                 written here, mirroring CI's \$GITHUB_WORKSPACE.
+                                 (Tests/ -> repository -> workspace).  The script runs
+                                 from here, mirroring CI's \$GITHUB_WORKSPACE.
                                  Currently: $WS
   BUILD_DIR=\$WS/build/$REPO_NAME
                                  Directory passed to 'lcov -c -d', matching both
                                  workflows.  Currently: $BUILD_DIR
   INSTALL_DIR=\$WS/install        Install tree providing the test binaries and the
                                  plugin libraries.  Currently: $INSTALL_DIR
+  L1_BUILD_DIR / L2_BUILD_DIR    Per-level build trees; default to BUILD_DIR.
+                                 Currently: $L1_BUILD_DIR
+                                        and $L2_BUILD_DIR
+  L1_INSTALL_DIR / L2_INSTALL_DIR
+                                 Per-level install trees; default to INSTALL_DIR.
+                                 Currently: $L1_INSTALL_DIR
+                                        and $L2_INSTALL_DIR
+  LEVEL_REBUILD_CMD=<unset>      Command that switches a shared tree to a level.  Invoked
+                                 as '<cmd> <level>' before each level under 'all'; it owns
+                                 the documented plugin -> testframework -> mocks rebuild
+                                 sequence.  Currently: ${LEVEL_REBUILD_CMD:-<unset>}
+  ARTIFACT_ROOT=\$WS/coverage-artifacts
+                                 Root of the artifact tree; this run writes to
+                                 \$ARTIFACT_ROOT/$REPO_NAME/<level>/.
+                                 Currently: $ARTIFACT_ROOT
   COVERAGE_MIN=80                Line-coverage bar, applied to the level aggregate and to
                                  each target.  Currently: $COVERAGE_MIN
   RUN_VALGRIND=0                 Set to 1/true/yes/on to run the suite under valgrind
                                  memcheck with the options CI uses.  Currently: $RUN_VALGRIND
 
-Artifacts written to \$WS (fixed names, no timestamps):
+Artifacts (fixed names, no timestamps) in \$ARTIFACT_ROOT/$REPO_NAME/<level>/:
   coverage_<level>.info, filtered_coverage_<level>.info, coverage_<level>/index.html,
   rdk<LEVEL>TestResults.json, and valgrind_log when RUN_VALGRIND is enabled.
+  At L2 the framework itself writes \$WS/rdkL2TestResults.json (it exports GTEST_OUTPUT
+  before spawning WPEFramework); that file is deleted before the run and archived into the
+  artifact directory afterwards.
+
+Outside \$WS the run touches exactly one path: lcov reads \$HOME/.lcovrc silently and CI
+plants a branch-disabled copy there, so an existing \$HOME/.lcovrc is moved aside into a
+temporary directory for the duration of the lcov steps and restored on exit, including on
+failure.  Nothing is deleted, and the stash path is logged.  For a run that touches your
+home directory not at all:  HOME="\$(mktemp -d)" $(basename -- "$SCRIPT_PATH") l1
 
 Build the plugin AND rebuild entservices-testframework against it before running: both
 plugins emit identically named test libraries, so a stale framework build silently
@@ -392,7 +652,6 @@ measures the other plugin.  See the header comment of this script for the full r
 USAGE
 }
 
-# valgrind opt-in: accept the usual truthy spellings, default off.
 valgrind_enabled() {
     case "$(printf '%s' "$RUN_VALGRIND" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|on) return 0 ;;
@@ -401,63 +660,292 @@ valgrind_enabled() {
 }
 
 # ------------------------------------------------------------------------------------
-# Pre-flight.  Two checks only, both earned rather than speculative:
-#   * a missing or object-free build tree means there is nothing to measure, which is a
-#     hard error -- reporting a number in that situation would be a fabricated claim;
-#   * a test library carrying the OTHER plugin's fixtures means the tree is mixed, which
-#     is the collision documented in the header.  That is a warning with an actionable
-#     message, because the caller may knowingly be measuring a partially built tree.
+# Pre-flight.  Two checks only, both earned rather than speculative, and BOTH fatal:
+#   * a missing or object-free build tree means there is nothing to measure -- reporting
+#     a number in that situation would be a fabricated claim;
+#   * the level's installed test library must be present AND positively identifiable as
+#     THIS plugin's.  Because both plugins emit byte-identically named test libraries
+#     (see the SEQUENCING CONSTRAINT above), a library that carries the other plugin's
+#     fixtures means the run would execute the WRONG SUITE while capturing this plugin's
+#     objects.  gcov counters accumulate across runs, so the resulting trace can look
+#     entirely plausible while describing a suite that never ran, and the downstream
+#     non-zero-test-count check cannot tell the two suites apart -- it counts tests, not
+#     whose tests they are.  A coverage figure whose provenance is unknown is worse than
+#     no figure, so every branch below that cannot prove provenance is a hard failure
+#     rather than a warning.  There is deliberately no override flag: the remedy is a
+#     30-second rebuild, and an escape hatch here would reintroduce exactly the
+#     unverifiable claim this script exists to prevent.
 # ------------------------------------------------------------------------------------
 preflight() {
-    local level="$1" lib gcno_count sink_hits other_hits
+    local level="$1" lib gcno_count sink_hits other_hits own_marker other_marker
     log "pre-flight for $level"
 
-    [ -d "$BUILD_DIR" ] || die "BUILD_DIR does not exist: $BUILD_DIR
+    [ -d "$LEVEL_BUILD_DIR" ] || die "the ${level^^} build directory does not exist: $LEVEL_BUILD_DIR
        Build the plugin first (see the build recipe in this script's header), or point
-       BUILD_DIR at the directory that holds the instrumented objects."
+       BUILD_DIR (or ${level^^}_BUILD_DIR) at the directory that holds the instrumented objects."
 
-    gcno_count="$(find "$BUILD_DIR" -name '*.gcno' -type f 2>/dev/null | wc -l)"
-    [ "$gcno_count" -gt 0 ] || die "no *.gcno files under $BUILD_DIR -- the tree is not
+    gcno_count="$("$FIND_BIN" "$LEVEL_BUILD_DIR" -name '*.gcno' -type f 2>/dev/null | wc -l)"
+    [ "$gcno_count" -gt 0 ] || die "no *.gcno files under $LEVEL_BUILD_DIR -- the tree is not
        instrumented, so there is nothing to measure.  Tests/gcc-with-coverage.cmake must
        be in effect (it appends --coverage); rebuild the plugin with the documented recipe."
-    log "found $gcno_count instrumented translation units under $BUILD_DIR"
+    log "found $gcno_count instrumented translation units under $LEVEL_BUILD_DIR"
 
-    lib="$INSTALL_DIR/usr/lib/libWPEFramework${level^^}TestsIO.so"
-    if [ -f "$lib" ]; then
-        # grep -a keeps this to a tool already in use; the fixture-class names are the
-        # cheapest reliable flavour marker in the library.
-        sink_hits="$(grep -ac 'HdmiCecSink' "$lib" || true)"
-        other_hits="$(grep -ac 'HdmiCecSource' "$lib" || true)"
-        if [ "${sink_hits:-0}" -eq 0 ] && [ "${other_hits:-0}" -gt 0 ]; then
-            warn "$(basename -- "$lib") contains HDMI-CEC *source* fixtures and no sink
-         fixtures, so the installed ${level^^} test library belongs to the other plugin.
-         The run would execute the wrong suite while capturing this plugin's objects.
-         Rebuild: cmake --build/--install $REPO_NAME, then rm -rf the
-         entservices-testframework build directory and rebuild/install it with
-         -DPLUGIN_HDMICECSINK=ON.  Proceeding, but treat the figures as suspect."
-        else
-            log "$(basename -- "$lib") carries this plugin's fixtures ($sink_hits markers)"
-        fi
-    else
-        log "note: $lib not present; relying on the binary's own link-time libraries"
+    # The rebuild instruction is identical for every failure mode below, so it is composed
+    # once and appended to each message.
+    local rebuild_hint="Rebuild in this order, from \"\$WS\":
+           cmake --build build/$REPO_NAME && cmake --install build/$REPO_NAME
+           rm -rf build/entservices-testframework
+           reconfigure/build/install entservices-testframework with -DPLUGIN_HDMICECSINK=ON
+         The framework rebuild is the step that decides whose tests the binary runs."
+
+    lib="$LEVEL_INSTALL_DIR/usr/lib/libWPEFramework${level^^}TestsIO.so"
+    [ -f "$lib" ] || die "$lib is not present.
+       ${level^^} test cases live in that shared library -- RdkServicesL1Test itself compiles
+       only test_JSON.cpp -- so without it the binary cannot run this plugin's suite and no
+       coverage figure taken now could be attributed to it.
+       $rebuild_hint"
+
+    # Flavour markers.  GoogleTest's TEST_F macro derives a class from the named fixture, so
+    # a fixture-class name appears in the library if and only if that plugin's cases were
+    # compiled into it -- which makes the top-level fixture of each plugin's suite a precise,
+    # level-aware discriminator.  Verified on real libraries: a sink-built L1 library carries
+    # HdmiCecSinkDsTest and no HdmiCecSourceTest, and a source-built L2 library carries
+    # HdmiCecSource_L2Test and no HdmiCecSink_L2Test.  grep -a keeps this to a tool already in
+    # use here; no nm/objdump dependency is introduced.
+    case "$level" in
+        l1) own_marker='HdmiCecSinkDsTest';  other_marker='HdmiCecSourceTest' ;;
+        l2) own_marker='HdmiCecSink_L2Test'; other_marker='HdmiCecSource_L2Test' ;;
+        *)  die "preflight: unknown level '$level'" ;;
+    esac
+    sink_hits="$(grep -ac "$own_marker" "$lib" || true)"
+    other_hits="$(grep -ac "$other_marker" "$lib" || true)"
+
+    if [ "${sink_hits:-0}" -eq 0 ] && [ "${other_hits:-0}" -gt 0 ]; then
+        die "$(basename -- "$lib") carries the HDMI-CEC *source* fixture $other_marker
+       ($other_hits markers) and no $own_marker, so the installed ${level^^} test library
+       belongs to the other plugin.  Running now would execute the wrong suite while capturing
+       this plugin's objects -- the library-name collision documented in this script's header.
+       $rebuild_hint"
     fi
+    if [ "${sink_hits:-0}" -eq 0 ]; then
+        die "$(basename -- "$lib") carries no $own_marker marker, so the installed ${level^^}
+       test library cannot be identified as this plugin's.  An unidentifiable test library is
+       treated exactly like the wrong one: the run's provenance would be unprovable, and an
+       accumulated .gcda set can make the resulting figures look plausible regardless.
+       $rebuild_hint"
+    fi
+    if [ "${other_hits:-0}" -gt 0 ]; then
+        die "$(basename -- "$lib") carries BOTH $own_marker ($sink_hits) and $other_marker
+       ($other_hits), so the install tree is mixed and which suite would run is undecidable.
+       $rebuild_hint"
+    fi
+    log "$(basename -- "$lib") carries this plugin's fixtures ($sink_hits $own_marker markers, no $other_marker)"
 }
 
 
 # ------------------------------------------------------------------------------------
-# Runtime environment for the test binaries, exactly what the workflows export.
-# The wpeframework/plugins directory is mandatory: without it the plugin under test does
-# not load and the whole run is meaningless.  Exported once so that `all` cannot grow the
-# search paths by repeating itself.
+# Directory normalisation, in pure bash so the tool set stays bash/lcov/genhtml/gcov/awk/
+# sort/grep/sed (contract clause 2 -- no realpath, no python).  An existing directory
+# resolves to its physical path; anything else is returned unchanged, which is all the
+# `all` pre-check needs (it compares two configured inputs, not arbitrary strings).
+# ------------------------------------------------------------------------------------
+norm_dir() {
+    ( cd -- "$1" 2>/dev/null && pwd -P ) || printf '%s' "$1"
+}
+
+# ------------------------------------------------------------------------------------
+# A level's install tree becomes a library search path for the test binary, so it is
+# validated before it is used as one.  A world-writable search-path root is a
+# library-injection vector and is refused outright rather than trusted because it was
+# configured; a tree owned by neither this user nor root is reported, because the binary
+# would then load libraries from a tree this run does not own.
+# ------------------------------------------------------------------------------------
+validate_install_dir() {
+    local dir="$1" canonical owner
+    canonical="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" \
+        || die "the install directory is not usable: $dir"
+
+    if [ -n "$("$FIND_BIN" "$canonical" -maxdepth 0 -perm -0002 2>/dev/null)" ]; then
+        die "refusing to use a world-writable install tree as a library search path:
+       $canonical
+       Anything on this machine could plant a library there and it would be loaded by the
+       test binary.  Tighten its permissions (chmod o-w) or point INSTALL_DIR elsewhere."
+    fi
+
+    owner="$(stat -c '%u' -- "$canonical" 2>/dev/null || echo '')"
+    if [ -n "$owner" ] && [ "$owner" != "$(id -u)" ] && [ "$owner" != '0' ]; then
+        warn "install tree $canonical is owned by uid $owner, which is neither this user
+         ($(id -u)) nor root.  The test binary will load libraries from a tree this run does
+         not own; treat the figures as suspect unless that is intended."
+    fi
+    printf '%s' "$canonical"
+}
+
+# ------------------------------------------------------------------------------------
+# Artifact-destination safety.  Every artifact this script writes is a fixed name inside
+# the level's artifact directory, and a fixed name is a name somebody else can prepare
+# first: `test -L` does not follow a link, so a planted symlink is refused rather than
+# written through, and a directory standing where a file belongs (or the reverse) is
+# reported instead of half-overwritten.
+#   $1 = path, $2 = expected kind: file|dir
+# ------------------------------------------------------------------------------------
+assert_safe_artifact_path() {
+    local path="$1" kind="$2"
+    if [ -L "$path" ]; then
+        die "refusing to write $path: it is a symbolic link.
+       Artifact destinations must be regular files or directories created by this run, never
+       links into somebody else's file.  Remove it, or point ARTIFACT_ROOT at a directory
+       this run owns."
+    fi
+    if [ -e "$path" ]; then
+        case "$kind" in
+            file) [ -f "$path" ] || die "refusing to write $path: it exists and is not a regular file" ;;
+            dir)  [ -d "$path" ] || die "refusing to write $path: it exists and is not a directory" ;;
+        esac
+    fi
+}
+
+# A private mode-0700 staging directory, so an artifact under construction is never
+# readable or replaceable by another account while it is being written.  Created on first
+# use; removed by the cleanup trap on every exit path, including an interrupt.
+ensure_stage_dir() {
+    [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR" ] && return 0
+    [ -n "$MKTEMP_BIN" ] || die "mktemp is not available; it is required to stage artifacts safely"
+    STAGE_DIR="$("$MKTEMP_BIN" -d "${TMPDIR:-/tmp}/run_coverage_stage.XXXXXXXX")" \
+        || die "could not create a staging directory"
+    chmod 0700 -- "$STAGE_DIR"
+}
+
+cleanup_stage_dir() {
+    if [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR" ]; then
+        rm -rf -- "$STAGE_DIR"
+    fi
+}
+trap cleanup_stage_dir EXIT
+trap 'trap - INT;  cleanup_stage_dir; kill -INT  $$' INT
+trap 'trap - TERM; cleanup_stage_dir; kill -TERM $$' TERM
+trap 'trap - HUP;  cleanup_stage_dir; kill -HUP  $$' HUP
+
+# Publish a staged artifact over its final name.  mv replaces the directory entry itself,
+# so even if the check above raced with a link being planted, the link is replaced rather
+# than written through.
+publish_artifact() { # $1=staged path  $2=final path  $3=file|dir
+    local staged="$1" final="$2" kind="$3"
+    assert_safe_artifact_path "$final" "$kind"
+    if [ "$kind" = 'dir' ] && [ -d "$final" ]; then
+        rm -rf -- "$final"
+    fi
+    mv -f -- "$staged" "$final" || die "could not publish $final"
+}
+
+# ------------------------------------------------------------------------------------
+# Resolve the level-specific inputs.  Every later step reads these rather than the
+# single-tree values, which is what lets `all` measure two differently configured trees.
+# ------------------------------------------------------------------------------------
+resolve_level_inputs() {
+    local level="$1"
+    case "$level" in
+        l1) LEVEL_BUILD_DIR="$L1_BUILD_DIR"; LEVEL_INSTALL_DIR="$L1_INSTALL_DIR" ;;
+        l2) LEVEL_BUILD_DIR="$L2_BUILD_DIR"; LEVEL_INSTALL_DIR="$L2_INSTALL_DIR" ;;
+        *)  die "resolve_level_inputs: unknown level '$level'" ;;
+    esac
+    LEVEL_ARTIFACT_DIR="$ARTIFACT_ROOT/$REPO_NAME/$level"
+    mkdir -p "$LEVEL_ARTIFACT_DIR" || die "cannot create the artifact directory: $LEVEL_ARTIFACT_DIR"
+    # The install directory is caller-supplied and becomes a library search path for the test
+    # binary, so it is required to be ABSOLUTE before anything else happens to it.  Canonicalising
+    # a relative value (validate_install_dir below would happily do so) would resolve it against
+    # whatever directory the script was invoked from and could select a different install tree than
+    # the one intended, silently measuring the wrong build.  This is the shape check; existence,
+    # permissions and ownership are checked immediately after it.
+    case "$LEVEL_INSTALL_DIR" in
+        /*) : ;;
+        *)  die "the ${level^^} install directory must be an absolute path, got '$LEVEL_INSTALL_DIR'.
+       It is prepended to PATH and LD_LIBRARY_PATH, so a relative value would resolve against the
+       current working directory.  Set INSTALL_DIR (or ${level^^}_INSTALL_DIR) to an absolute path." ;;
+    esac
+
+    [ -d "$LEVEL_INSTALL_DIR" ] || die "the ${level^^} install directory does not exist: $LEVEL_INSTALL_DIR
+       Install the plugin and the test framework first (see this script's build recipe), or
+       point INSTALL_DIR (or ${level^^}_INSTALL_DIR) at the install tree for this level."
+
+    # It is about to become a library search path for the test binary, so vet it first.
+    LEVEL_INSTALL_DIR="$(validate_install_dir "$LEVEL_INSTALL_DIR")"
+    log "${level^^} install dir (canonical): $LEVEL_INSTALL_DIR"
+
+    assert_safe_artifact_path "$LEVEL_ARTIFACT_DIR" dir
+}
+
+# ------------------------------------------------------------------------------------
+# Runtime environment for the test binaries, exactly what the workflows export, but
+# recomputed per level from the pristine search paths captured at start-up.  The
+# wpeframework/plugins directory is mandatory: without it the plugin under test does not
+# load and the whole run is meaningless.  Recomputing from the base (rather than
+# prepending to whatever the previous level left behind) means `all` can point the two
+# levels at different install trees and neither can leak into the other, and repeating a
+# level cannot grow the search paths.
 # ------------------------------------------------------------------------------------
 setup_runtime_env() {
-    PATH="$INSTALL_DIR/usr/bin:$PATH"
-    if [ -n "${LD_LIBRARY_PATH:-}" ]; then
-        LD_LIBRARY_PATH="$INSTALL_DIR/usr/lib:$INSTALL_DIR/usr/lib/wpeframework/plugins:$LD_LIBRARY_PATH"
-    else
-        LD_LIBRARY_PATH="$INSTALL_DIR/usr/lib:$INSTALL_DIR/usr/lib/wpeframework/plugins"
-    fi
+    PATH="$LEVEL_INSTALL_DIR/usr/bin${BASE_PATH:+:$BASE_PATH}"
+    LD_LIBRARY_PATH="$LEVEL_INSTALL_DIR/usr/lib:$LEVEL_INSTALL_DIR/usr/lib/wpeframework/plugins${BASE_LD_LIBRARY_PATH:+:$BASE_LD_LIBRARY_PATH}"
     export PATH LD_LIBRARY_PATH
+}
+
+# ------------------------------------------------------------------------------------
+# Counter hygiene -- the difference between measuring this run and measuring history.
+#
+# gcov counters accumulate: a *.gcda written by an earlier run keeps its lines marked hit
+# forever, so a gate can be satisfied by execution data the current tests never produced.
+# `lcov --zerocounters` removes the *.gcda files while leaving the *.gcno instrumentation
+# in place, so after it the tree is instrumented but has recorded nothing.  Anything that
+# exists afterwards was therefore written by the run in between -- which is what makes
+# verify_fresh_counters() a proof rather than a heuristic.
+#
+# Scope is deliberately narrow: only the level's own build tree, never $WS, never the
+# install tree, never a sibling plugin's tree.
+# ------------------------------------------------------------------------------------
+gcda_count() {
+    "$FIND_BIN" "$1" -name '*.gcda' -type f 2>/dev/null | wc -l
+}
+
+# Discard the counters left behind by any previous run, so the figures this script prints
+# describe THIS run and nothing else.
+#
+# gcov counters accumulate: a *.gcda file is merged into, not replaced, every time an
+# instrumented binary exits.  Left alone, a second run of the suite reports the union of both
+# runs, which quietly inflates coverage and makes two runs incomparable -- and it hides the
+# very regression a gate exists to catch, because a line covered only by a run that has since
+# been deleted still counts.
+#
+# The reset is verified rather than assumed: a counter file that survives -- because it is
+# read-only, or owned by another user, or the tree is mounted read-only -- would silently
+# reintroduce exactly the contamination this exists to prevent, so a survivor is a hard
+# failure with the directory named.
+zero_counters() {
+    local level="$1" before after
+    before="$(gcda_count "$LEVEL_BUILD_DIR")"
+    log "zeroing ${level^^} execution counters in $LEVEL_BUILD_DIR ($before *.gcda present)"
+
+    "$LCOV_BIN" --zerocounters \
+        --directory "$LEVEL_BUILD_DIR" \
+        --rc branch_coverage=1 >/dev/null
+
+    after="$(gcda_count "$LEVEL_BUILD_DIR")"
+    [ "$after" -eq 0 ] || die "$after *.gcda files still remain under $LEVEL_BUILD_DIR after
+       'lcov --zerocounters'.  Coverage captured now could include execution data this run
+       did not produce, so the measurement is refused rather than reported.  Check the
+       directory's permissions, and that no test process is still running against it."
+    log "${level^^} counters zeroed; the tree is instrumented and has recorded nothing"
+}
+
+verify_fresh_counters() {
+    local level="$1" count
+    count="$(gcda_count "$LEVEL_BUILD_DIR")"
+    [ "$count" -gt 0 ] || die "the ${level^^} suite produced no *.gcda counters under $LEVEL_BUILD_DIR.
+       The counters were zeroed immediately before the run, so an empty tree means the
+       binary executed none of these instrumented objects -- usually because it linked
+       another tree's libraries, or because the level's test plugin never activated.
+       Refusing to capture: there is nothing this run measured."
+    log "${level^^} suite produced $count fresh *.gcda counter files"
 }
 
 # ------------------------------------------------------------------------------------
@@ -470,77 +958,89 @@ setup_runtime_env() {
 # validating this script: in a tree built for L1, RdkServicesL2Test started Thunder, never
 # activated the L2 test plugin, ran no test at all and still exited 0 -- and the coverage
 # then captured was the L1 run's accumulated data, which cleared the bar.  A green number
-# over a suite that tested nothing is the worst possible outcome, so the run is also
-# required to have produced a results file of its own, from this run, containing a non-zero
-# test count.
-verify_results_fresh() {
-    local binary="$1" results="$2" start_epoch="$3" count
+# over a suite that tested nothing is the worst possible outcome, so the results file is
+# deleted before the binary is launched and three things are then required of it:
+#   * it exists -- which, because it was deleted, can only mean this run wrote it;
+#   * it reports a non-zero test count;
+#   * it names at least one HdmiCecSink suite or class, which is what distinguishes this
+#     plugin's fixtures from the other plugin's and from the framework's own test_JSON.cpp
+#     cases.  This is the post-run counterpart to preflight's library check: preflight can
+#     only warn, whereas this refuses the evidence.
+verify_results() {
+    local binary="$1" results="$2" count
 
     [ -f "$results" ] || die "$binary exited 0 but wrote no results file at $results.
-       There is no evidence any test ran, so this is treated as a failure rather than a
-       pass.  Check that the level's test plugin is installed and activatable in this tree
-       -- a tree built for the other level is the usual cause."
-
-    # GNU find (already used by preflight) answers "was this file written by this run?"
-    # without needing a timestamp-parsing tool.  One second of slack absorbs the truncation
-    # of $EPOCHSECONDS relative to the file's mtime.
-    if [ -z "$(find "$results" -newermt "@$((start_epoch - 1))" 2>/dev/null)" ]; then
-        die "$binary exited 0 but $results was not written by this run -- it predates it.
-       The binary therefore ran no tests and left an earlier run's results in place, so its
-       zero exit status is not evidence of anything.  Rebuild this level (including
-       entservices-testframework) before measuring; see this script's header."
-    fi
+       The file was deleted immediately before the run, so its absence means the binary
+       produced no results at all and there is no evidence any test ran.  Check that the
+       level's test plugin is installed and activatable in this tree -- a tree built for the
+       other level is the usual cause."
 
     count="$(sed -n 's/^[[:space:]]*"tests"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$results" | head -1)"
     if [ -z "$count" ] || [ "$count" -le 0 ]; then
         die "$binary exited 0 but $results reports no tests (\"tests\": ${count:-absent}).
        An empty suite cannot substantiate a coverage figure."
     fi
-    log "$binary reported $count test cases in $results"
+
+    if ! grep -Eq '"(classname|name)"[[:space:]]*:[[:space:]]*"HdmiCecSink' "$results"; then
+        die "$binary exited 0 and $results reports $count tests, but not one of them belongs
+       to an HdmiCecSink suite or class.  The run therefore exercised something other than
+       this plugin -- the other plugin's test library, or only the framework's own JSON
+       cases -- while the capture would credit this plugin's objects.  Rebuild this plugin
+       and then rebuild entservices-testframework against it (see this script's header)."
+    fi
+    log "$binary reported $count test cases in $results, including HdmiCecSink fixtures"
 }
 
 run_suite() {
     local level="$1" binary results rc=0
-    local start_epoch="${EPOCHSECONDS:-0}"
     case "$level" in
-        l1) binary='RdkServicesL1Test'; results="$WS/rdkL1TestResults.json" ;;
+        # At L1 the binary honours GTEST_OUTPUT, so the results file is written straight
+        # into the level's artifact directory.  At L2 it cannot be: L2testController.cpp:91
+        # exports GTEST_OUTPUT="json:$PWD/rdkL2TestResults.json" before spawning
+        # WPEFramework, overriding whatever this script sets, so the file always lands at
+        # "$WS/rdkL2TestResults.json" and is archived into the artifact directory afterwards.
+        l1) binary='RdkServicesL1Test'; results="$LEVEL_ARTIFACT_DIR/rdkL1TestResults.json" ;;
         l2) binary='RdkServicesL2Test'; results="$WS/rdkL2TestResults.json" ;;
         *)  die "run_suite: unknown level '$level'" ;;
     esac
 
     command -v "$binary" >/dev/null 2>&1 || die "$binary is not on PATH.
-       Expected it in $INSTALL_DIR/usr/bin -- build and install the plugin and the test
+       Expected it in $LEVEL_INSTALL_DIR/usr/bin -- build and install the plugin and the test
        framework first (see the build recipe in this script's header)."
 
-    # entservices-testframework's L2testController resolves the plugin configuration
-    # directory as the RELATIVE path "./install/etc/WPEFramework/plugins/"
-    # (Tests/L2Tests/L2testController.cpp, setAutostartToFalse), so L2 only starts when the
-    # working directory contains install/.  This script always runs from "$WS", and the
-    # default INSTALL_DIR is "$WS/install", so the default layout satisfies it; an
-    # INSTALL_DIR pointed outside "$WS" does not, and the controller then aborts with the
-    # opaque message "Error opening directory".  Warn with the real reason rather than let
-    # that be diagnosed from scratch.
+    # The test framework's L2 controller resolves the plugin configuration directory as the
+    # relative path "./install/etc/WPEFramework/plugins/", so L2 starts only when the working
+    # directory contains install/.  Its own diagnostic for that is the opaque "Error opening
+    # directory", so name the real cause here instead.
     if [ "$level" = 'l2' ] && [ ! -d "$WS/install/etc/WPEFramework/plugins" ]; then
         warn "$WS/install/etc/WPEFramework/plugins does not exist.
          RdkServicesL2Test reads that path relative to the working directory, so it will
          fail with \"Error opening directory\" before any test runs.  Either leave
          INSTALL_DIR at its default (\$WS/install) or make \$WS/install resolve to
-         $INSTALL_DIR."
+         $LEVEL_INSTALL_DIR."
     fi
 
     # Machine-readable results, matching the workflow's own GTEST_OUTPUT for L1.  The L2
     # workflow does not set this because entservices-testframework's L2testController
     # exports GTEST_OUTPUT="json:$PWD/rdkL2TestResults.json" itself before spawning
-    # WPEFramework; setting it here lands the file at the same path and keeps both levels
-    # deterministic.
+    # WPEFramework; setting it here as well keeps the intent explicit at both levels even
+    # though the controller wins at L2.
     export GTEST_OUTPUT="json:$results"
+
+    # Remove the level's results file FIRST, so that a file existing after the run can only
+    # have been written by the run.  Without this, a binary that starts, tests nothing and
+    # exits 0 leaves an earlier run's results in place and looks like a pass.
+    rm -f "$results"
+    [ ! -e "$results" ] || die "cannot remove the previous results file at $results, so a
+       fresh one could not be told apart from it.  Refusing to run rather than measure
+       against evidence that may predate this run."
 
     rule
     if valgrind_enabled; then
         log "running $binary under valgrind memcheck (options as in CI)"
-        valgrind \
+        "$VALGRIND_BIN" \
             --tool=memcheck \
-            --log-file=valgrind_log \
+            --log-file="$LEVEL_ARTIFACT_DIR/valgrind_log" \
             --leak-check=yes \
             --show-reachable=yes \
             --track-fds=yes \
@@ -555,19 +1055,62 @@ run_suite() {
     [ "$rc" -eq 0 ] || die "$binary exited with status $rc.
        The suite must pass at runtime before its coverage means anything, so this run is
        a failure.  Results (if written): $results"
-    verify_results_fresh "$binary" "$results" "$start_epoch"
+    verify_results "$binary" "$results"
+
+    # Attribution: the L2 results file is written by framework code at a fixed path shared
+    # with every other runner in this workspace, so archive it beside this level's traces.
+    # The archived copy is what the traceability report cites.
+    if [ "$results" != "$LEVEL_ARTIFACT_DIR/$(basename -- "$results")" ]; then
+        cp -f "$results" "$LEVEL_ARTIFACT_DIR/$(basename -- "$results")" \
+            || die "could not archive $results into $LEVEL_ARTIFACT_DIR"
+        log "archived $(basename -- "$results") -> $LEVEL_ARTIFACT_DIR/"
+    fi
     log "$binary passed (exit 0); results: $results"
 }
 
 # ------------------------------------------------------------------------------------
-# Capture, filter and report.  Reproduces the workflow's lcov pipeline with branch
-# collection forced on, and refuses to continue if a step produced no data.
+# This repository's OWN lcov configuration, wired in rather than left decorative.
+#
+# Tests/L1Tests/.lcovrc_l1 sets `lcov_branch_coverage = 1`, but nothing ever read it: CI copies
+# the *test framework's* branch-disabled config over ~/.lcovrc instead, and this script used to
+# pass --config-file zero times.  It is now passed whenever the level has a config file, which
+# was verified to be a real mechanism and not a formality -- with
+# `--config-file Tests/L1Tests/.lcovrc_l1` and NO --rc flag at all, lcov 2.0-1 emits
+# `branches....: 40.6% (1241 of 3053 branches)`, where the same trace with neither prints no
+# branches row whatsoever.
+#
+# `--rc branch_coverage=1` is retained on every invocation regardless, and that is deliberate
+# belt-and-braces rather than redundancy: lcov 2.x reports the config file's
+# `lcov_branch_coverage` key as deprecated and warns that "backward-compatible support will be
+# removed in the future", so the config file alone would silently stop enabling branch data on a
+# future lcov.  The --rc flag is the forward-compatible spelling and therefore stays as the
+# guarantee; the config file supplies everything else the repository has chosen (function
+# coverage, colour thresholds, field widths).
+#
+# `deprecated` joins the ignore list only when the config file is actually passed, and only
+# because passing it is itself what surfaces those warnings (the keys are the repository's, and
+# editing them is out of scope for this pass).  The CI-derived ignore strings are otherwise left
+# byte-identical.  L2 ships no config file in this repository, so the array stays empty for that
+# level and the --rc flags carry branch collection on their own.
 # ------------------------------------------------------------------------------------
+resolve_lcov_config() {
+    local level="$1"
+    local cfg="$SCRIPT_DIR/${level^^}Tests/.lcovrc_$level"
+
+    if [ -f "$cfg" ]; then
+        LCOV_CONFIG_ARGS=(--config-file "$cfg" --ignore-errors deprecated)
+        log "lcov configuration: $cfg (read instead of \$HOME/.lcovrc and /etc/lcovrc)"
+    else
+        LCOV_CONFIG_ARGS=()
+        log "no $cfg; lcov reads its usual configuration and branch collection is forced below"
+    fi
+}
+
 capture_coverage() {
     local level="$1"
-    local raw="$WS/coverage_$level.info"
-    local filtered="$WS/filtered_coverage_$level.info"
-    local html="$WS/coverage_$level"
+    local raw="$LEVEL_ARTIFACT_DIR/coverage_$level.info"
+    local filtered="$LEVEL_ARTIFACT_DIR/filtered_coverage_$level.info"
+    local html="$LEVEL_ARTIFACT_DIR/coverage_$level"
     local -a excludes
 
     case "$level" in
@@ -576,33 +1119,37 @@ capture_coverage() {
         *)  die "capture_coverage: unknown level '$level'" ;;
     esac
 
-    # The workflows plant a branch-disabled lcov configuration here; removing it is the
-    # whole point of this script.  This is the ONLY file the script deletes -- /etc/lcovrc
-    # and every other shared configuration is left strictly alone.
-    if [ -n "${HOME:-}" ] && [ -f "$HOME/.lcovrc" ]; then
-        rm -f "$HOME/.lcovrc"
-        log "removed $HOME/.lcovrc (CI plants a branch-disabled copy there)"
-    fi
+    # Take any home lcov configuration out of the way for the lcov steps below, and put it
+    # back on exit.  See stash_home_lcovrc: nothing is deleted, /etc/lcovrc and every other
+    # shared configuration is left strictly alone, and this is the only path outside "$WS"
+    # the run touches at all.
+    stash_home_lcovrc
 
-    log "capturing coverage from $BUILD_DIR"
-    lcov -c \
+    assert_safe_artifact_path "$raw" file
+    assert_safe_artifact_path "$filtered" file
+
+
+    log "capturing coverage from $LEVEL_BUILD_DIR"
+    "$LCOV_BIN" -c \
         -o "$raw" \
-        -d "$BUILD_DIR" \
+        -d "$LEVEL_BUILD_DIR" \
+        "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
         --ignore-errors "$LCOV_CAPTURE_IGNORE"
 
     if [ ! -s "$raw" ] || ! grep -q '^SF:' "$raw"; then
         die "capture produced no coverage records in $raw.
        Nothing was measured, so no figure can be reported.  Usual causes: the suite ran
-       against a different build tree than BUILD_DIR, or *.gcda were never produced
+       against a different build tree than $LEVEL_BUILD_DIR, or *.gcda were never produced
        because the binary under test does not link this plugin's instrumented objects."
     fi
     log "raw capture: $(grep -c '^SF:' "$raw") source files -> $raw"
 
     log "filtering with the ${level^^} exclusion globs (${#excludes[@]} globs, verbatim from CI)"
-    lcov -r "$raw" \
+    "$LCOV_BIN" -r "$raw" \
         "${excludes[@]}" \
         -o "$filtered" \
+        "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
         --ignore-errors "$LCOV_FILTER_IGNORE"
 
@@ -610,24 +1157,52 @@ capture_coverage() {
         die "the exclusion globs removed every source file from $filtered.
        The denominator would be empty, so no coverage claim is possible.  The globs are
        reproduced verbatim from .github/workflows/${level^^}-tests.yml and must not be
-       edited to work around this -- check that BUILD_DIR points at this plugin's build."
+       edited to work around this -- check that the build directory ($LEVEL_BUILD_DIR)
+       points at this plugin's build."
     fi
     log "filtered trace: $(grep -c '^SF:' "$filtered") source files -> $filtered"
 
+    # genhtml creates its output directory only when absent and never purges pages it did
+    # not write, so a page for a file that has since left the trace would survive and be
+    # read as current.  The report is therefore generated into a fresh staging directory and
+    # published over this level's HTML directory by rename, which replaces the whole tree
+    # atomically.  The destination is confined to this run's artifact directory, and
+    # publish_artifact additionally refuses a symlink or a non-directory standing there.
+    case "$html" in
+        "$LEVEL_ARTIFACT_DIR"/*) : ;;
+        *) die "refusing to publish an HTML directory outside the artifact directory: $html" ;;
+    esac
+
+    # Built in the private staging directory and published by rename, so a half-written
+    # report never appears under the finished name and the pages are not world-readable
+    # while genhtml is still writing them.
     log "generating HTML report"
-    genhtml \
-        -o "$html" \
+    # `|| die` on the invocation below rather than a bare call, and the reason is specific to how
+    # main() calls this: `if ! ( run_level lN )` runs the level in a SUBSHELL, and `set -e` does not
+    # abort a subshell that is the condition of an `if`.  Without it a genhtml failure could be
+    # swallowed under the `all` subcommand while the log still advertised an HTML path that was
+    # never published.
+    ensure_stage_dir
+    local staged_html="$STAGE_DIR/coverage_$level"
+    rm -rf -- "$staged_html"
+    "$GENHTML_BIN" \
+        -o "$staged_html" \
         -t "$GENHTML_TITLE" \
         "$filtered" \
+        "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
-        --ignore-errors "$LCOV_SUMMARY_IGNORE" >/dev/null
+        --ignore-errors "$LCOV_SUMMARY_IGNORE" >/dev/null \
+        || die "genhtml failed for level ${level^^}; no HTML report was produced from $filtered"
+    publish_artifact "$staged_html" "$html" dir
     log "HTML report: $html/index.html"
 
     rule
     log "lcov summary for $filtered"
-    lcov --summary "$filtered" \
+    "$LCOV_BIN" --summary "$filtered" \
+        "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
-        --ignore-errors "$LCOV_SUMMARY_IGNORE"
+        --ignore-errors "$LCOV_SUMMARY_IGNORE" \
+        || die "lcov --summary failed for level ${level^^} on $filtered; the reported figures cannot be trusted"
     rule
 }
 
@@ -637,26 +1212,14 @@ capture_coverage() {
 REPORT_BELOW_TARGETS=''
 
 # ------------------------------------------------------------------------------------
-# Per-file table, derived exclusively from the filtered trace's own records:
-#     file boundaries  SF: ... end_of_record
-#     lines            LF: (found)   LH:  (hit)
-#     functions        FNF:/FNH: (leader records) and FNA: (alias records)
-#     branches         BRF: (found)  BRH: (hit)
-# `lcov --list` is never parsed -- it emits malformed rates above 100% in lcov 2.x.
-#
-# Two awk passes with a sort between them: the first extracts one tab-separated row per
-# file, `sort` makes the row order deterministic regardless of trace order, and the second
-# formats and totals.  Two passes rather than one because /usr/bin/awk here is mawk, which
-# has no array-sorting function.
-#
-# Every accumulator is reset on each SF: record.  That matters: plugin/Module.cpp emits no
-# BRF:/BRH: at L1, and a parser that carries values over would print the previous file's
-# branch numbers for it -- a fabricated figure.  A file with no branch records is shown as
-# "n/a" rather than 0.0%.
+# Two awk passes with a sort between them rather than one pass, because /usr/bin/awk here is
+# mawk and has no array-sorting function; the sort is what makes the row order independent of
+# trace order.  Every accumulator resets on each SF: record: plugin/Module.cpp emits no
+# BRF:/BRH: at L1, so carrying values over would print another file's branch numbers for it.
 # ------------------------------------------------------------------------------------
 per_file_report() {
     local level="$1"
-    local filtered="$WS/filtered_coverage_$level.info"
+    local filtered="$LEVEL_ARTIFACT_DIR/filtered_coverage_$level.info"
     local exempt_list=' '
     local report tab
     local -a exempt
@@ -793,34 +1356,39 @@ per_file_report() {
         rule
         log "below the bar but enumerated as uncoverable at this level (gate waived, figures still reported):"
         printf '%s\n' "$exempt_below" | while read -r path pct_value; do
-            log "    $path  $pct_value% -- macro-generated module accessors, reachable only through a"
-            log "        live Thunder plugin loader; covering them would need a production change."
+            # The wording here is level-specific on purpose, and it was corrected after being
+            # measured rather than assumed. Module.cpp's two functions are generated by the
+            # module-declaration macro and are invoked only by the Thunder plugin loader, so no
+            # in-process L1 GoogleTest can reach them. That is NOT the same as uncoverable: an
+            # L2 run starts a real Thunder host, and this same file measures 100% (1/1 lines,
+            # 2/2 functions) at L2 with no production change of any kind. Saying "would need a
+            # production change" without qualification would therefore be false, so the
+            # exemption is scoped to the level that actually cannot reach it.
+            log "    $path  $pct_value% -- macro-generated module accessors, invoked only by the"
+            log "        Thunder plugin loader, so unreachable from the in-process ${level^^} model."
+            if [ "$level" = l1 ]; then
+                log "        Measured at 100% under L2, which starts a real Thunder host: no production"
+                log "        change is required, only an execution model that loads the plugin."
+            fi
         done
     fi
 }
 
 # ------------------------------------------------------------------------------------
-# The gate.  Two checks, both on line coverage only:
-#   * the level aggregate, using lcov's own --fail-under-lines;
-#   * every individual target, because the requirement is per target and a healthy
-#     aggregate can hide a below-bar file.  Exemptions are enumerated with a reason.
-#
-# NOTE ON SPELLING: the documented form `lcov --fail-under-lines N <trace>` is rejected by
-# lcov 2.0-1 ("Need one of options -z, -c, -a, -e, -r, -l, --diff, --intersect, --subtract,
-# or --summary", exit 2) because the option is only accepted alongside an operation.  The
-# gate is therefore spelled with --summary, which carries identical semantics.  lcov's own
-# verdict line ("Failed 'line' coverage criteria: 0.84 < 0.99") goes to stderr and is left
-# visible; its stdout is discarded because it merely repeats the summary printed earlier.
+# --fail-under-lines is only accepted alongside an operation, so the aggregate check is
+# spelled with --summary; the bare form exits 2.  lcov's verdict line goes to stderr and is
+# left visible, while its stdout is discarded because it repeats the summary printed above.
 # ------------------------------------------------------------------------------------
 apply_gate() {
     local level="$1"
-    local filtered="$WS/filtered_coverage_$level.info"
+    local filtered="$LEVEL_ARTIFACT_DIR/filtered_coverage_$level.info"
     local rc=0 failures=0
 
     rule
     log "applying the >= ${COVERAGE_MIN}% line-coverage gate to the ${level^^} aggregate"
-    lcov --summary "$filtered" \
+    "$LCOV_BIN" --summary "$filtered" \
         --fail-under-lines "$COVERAGE_MIN" \
+        "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
         --ignore-errors "$LCOV_SUMMARY_IGNORE" >/dev/null || rc=$?
 
@@ -848,15 +1416,87 @@ apply_gate() {
     log "level ${level^^} PASSED: suite green and coverage at or above ${COVERAGE_MIN}%"
 }
 
+# ------------------------------------------------------------------------------------
+# One level, end to end.  The order is the whole argument of this script:
+#   resolve the level's own inputs -> confirm the tree is instrumented -> ZERO the
+#   counters -> run the suite -> confirm the suite produced fresh counters and its own
+#   results -> capture -> report -> gate.
+# Zeroing before the run and verifying after it is what makes every printed figure an
+# account of THIS run rather than of everything that ever ran against this tree.
+# ------------------------------------------------------------------------------------
 run_level() {
     local level="$1"
     rule
     log "=============== level ${level^^} ==============="
+    resolve_level_inputs "$level"
+    log "${level^^} build dir   : $LEVEL_BUILD_DIR"
+    log "${level^^} install dir : $LEVEL_INSTALL_DIR"
+    log "${level^^} artifacts   : $LEVEL_ARTIFACT_DIR"
+    setup_runtime_env
     preflight "$level"
+    resolve_lcov_config "$level"
+    zero_counters "$level"
     run_suite "$level"
+    verify_fresh_counters "$level"
     capture_coverage "$level"
     per_file_report "$level"
     apply_gate "$level"
+}
+
+# ------------------------------------------------------------------------------------
+# `all` admissibility, checked BEFORE anything is run, zeroed or deleted.
+#
+# An L1 tree and an L2 tree are not interchangeable (different -I / -include / -D / -Wl
+# blocks, and a level-specific mocks library), so running both levels against one tree
+# measures one level's objects with the other level's artifacts.  `all` is therefore
+# admissible only with separate per-level trees or with a hook that switches a shared one.
+# ------------------------------------------------------------------------------------
+check_all_admissible() {
+    local l1_build l2_build l1_install l2_install
+
+    if [ -n "$LEVEL_REBUILD_CMD" ]; then
+        log "'all' will invoke the level-rebuild hook before each level: $LEVEL_REBUILD_CMD <level>"
+        return 0
+    fi
+
+    l1_build="$(norm_dir "$L1_BUILD_DIR")";     l2_build="$(norm_dir "$L2_BUILD_DIR")"
+    l1_install="$(norm_dir "$L1_INSTALL_DIR")"; l2_install="$(norm_dir "$L2_INSTALL_DIR")"
+
+    if [ "$l1_build" = "$l2_build" ] || [ "$l1_install" = "$l2_install" ]; then
+        die "'all' cannot run both levels against the same tree, and no LEVEL_REBUILD_CMD was set.
+       L1 build   : $l1_build
+       L2 build   : $l2_build
+       L1 install : $l1_install
+       L2 install : $l2_install
+       L1 and L2 are configured differently and the mocks library is rebuilt per level, so
+       one tree cannot hold both levels' artifacts; running them anyway would measure one
+       level against the other's build.  Choose one of:
+         * separate trees -- set L1_BUILD_DIR/L1_INSTALL_DIR and L2_BUILD_DIR/L2_INSTALL_DIR
+           to the two level-specific trees you built; or
+         * a rebuild hook -- set LEVEL_REBUILD_CMD to a command taking the level name, which
+           rebuilds the plugin for that level, then rm -rf's the entservices-testframework
+           build directory and rebuilds/installs it against THIS plugin, then rebuilds the
+           mocks library for that level; or
+         * run './$(basename -- "$SCRIPT_PATH") l1' and './$(basename -- "$SCRIPT_PATH") l2'
+           separately around their own builds, which is the local per-level build model.
+       Nothing has been run, zeroed or deleted."
+    fi
+    log "'all' admissible: L1 and L2 resolve to separate build and install trees"
+}
+
+# Switch a shared tree to the level about to run.  Only used by `all`, and only when the
+# caller supplied a hook; a failing hook fails that level rather than being ignored.
+run_level_rebuild_hook() {
+    local level="$1"
+    [ -n "$LEVEL_REBUILD_CMD" ] || return 0
+    rule
+    log "level-rebuild hook for ${level^^}: $LEVEL_REBUILD_CMD $level"
+    # Word-split deliberately: the hook is configured as a command line, so
+    # LEVEL_REBUILD_CMD="bash /path/switch.sh --quiet" must work.
+    # shellcheck disable=SC2086
+    $LEVEL_REBUILD_CMD "$level" || die "the level-rebuild hook failed for ${level^^}: $LEVEL_REBUILD_CMD $level
+       The tree was therefore not switched to this level, so measuring it would report the
+       other level's artifacts.  Fix the hook, or use separate per-level trees."
 }
 
 main() {
@@ -882,36 +1522,41 @@ main() {
     [ "$#" -le 1 ] || die "unexpected extra arguments after '$cmd': ${*:2}"
 
     [ -d "$WS" ] || die "WS does not exist: $WS"
-    [ -d "$INSTALL_DIR" ] || die "INSTALL_DIR does not exist: $INSTALL_DIR
-       Install the plugin and the test framework first (see this script's build recipe)."
     case "$COVERAGE_MIN" in
         ''|*[!0-9]*) die "COVERAGE_MIN must be a non-negative integer, got '$COVERAGE_MIN'" ;;
     esac
 
-    # Deterministic artifact location: everything lands in the workspace root, exactly as
-    # CI writes it to $GITHUB_WORKSPACE, and nothing depends on the caller's cwd.
+    # The working directory must be "$WS": the L2 controller reads
+    # "./install/etc/WPEFramework/plugins/" relative to it, and nothing here may depend on
+    # the caller's cwd.  Artifacts, by contrast, are addressed absolutely under
+    # $ARTIFACT_ROOT so they stay attributable to this plugin and level.
     cd "$WS" || die "cannot enter WS: $WS"
 
-    log "repository : $REPO_ROOT"
-    log "workspace  : $WS"
-    log "build dir  : $BUILD_DIR"
-    log "install dir: $INSTALL_DIR"
-    log "line bar   : ${COVERAGE_MIN}%"
-    log "valgrind   : $(valgrind_enabled && echo enabled || echo disabled)"
-
-    setup_runtime_env
+    log "repository  : $REPO_ROOT"
+    log "workspace   : $WS"
+    log "artifacts   : $ARTIFACT_ROOT/$REPO_NAME/<level>"
+    log "L1 build    : $L1_BUILD_DIR"
+    log "L1 install  : $L1_INSTALL_DIR"
+    log "L2 build    : $L2_BUILD_DIR"
+    log "L2 install  : $L2_INSTALL_DIR"
+    log "rebuild hook: ${LEVEL_REBUILD_CMD:-<none>}"
+    log "line bar    : ${COVERAGE_MIN}%"
+    log "valgrind    : $(valgrind_enabled && echo enabled || echo disabled)"
 
     case "$cmd" in
         l1|l2)
             run_level "$cmd"
             ;;
         all)
+            # Admissibility is decided before any side effect, so an inadmissible 'all'
+            # costs nothing and changes nothing.
+            check_all_admissible
             # Fail fast and say so: each level is run in a subshell so that a failure is
             # reported here rather than silently ending the script mid-sequence.
-            if ! ( run_level l1 ); then
+            if ! ( run_level_rebuild_hook l1 && run_level l1 ); then
                 die "level L1 failed, so level L2 was not run.  Fix L1 and re-run 'all'."
             fi
-            if ! ( run_level l2 ); then
+            if ! ( run_level_rebuild_hook l2 && run_level l2 ); then
                 die "level L1 passed but level L2 failed."
             fi
             ;;
@@ -927,4 +1572,3 @@ main() {
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     main "$@"
 fi
-

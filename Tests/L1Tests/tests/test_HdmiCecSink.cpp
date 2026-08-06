@@ -20,9 +20,19 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <chrono>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <type_traits>
+#include <vector>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 
 #include "HdmiCecSink.h"
@@ -44,12 +54,22 @@
 #include "HostMock.h"
 #include "HdmiInputMock.h"
 #include "TelemetryMock.h"
+// Supplies UserSettingMock, needed to make the implementation's UserSettings notification sink
+// reachable: Configure() only registers that sink when
+// service->QueryInterfaceByCallsign<Exchange::IUserSettings>("org.rdk.UserSettings") returns an
+// interface (HdmiCecSinkImplementation.cpp:826-834).
+#include "UserSettingMock.h"
 
 using namespace WPEFramework;
 using ::testing::NiceMock;
 
 namespace
 {
+	// The plugin persists its CEC settings here (HdmiCecSinkImplementation.cpp defines
+	// CEC_SETTING_ENABLED_FILE with the same value). The path is repeated rather than included
+	// because the production macro is defined in a .cpp, not in a header.
+	static const char* const CEC_SETTINGS_FILE_PATH = "/opt/persistent/ds/cecData_2.json";
+
 	static void removeFile(const char* fileName)
 	{
 		if (std::remove(fileName) != 0)
@@ -72,10 +92,426 @@ namespace
 		fileContentStream << "\n";
 		fileContentStream.close();
 	}
+
+    // Path that HdmiCecSinkImplementation compiles into CEC_SETTING_ENABLED_FILE.
+    constexpr const char* kCecSettingsFile = "/opt/persistent/ds/cecData_2.json";
+    constexpr const char* kCecSettingsDirectory = "/opt/persistent/ds";
+
+    // True only for a regular file owned by this process; a symlink, directory, device node
+    // or foreign-owned file is rejected rather than followed, because these are predictable
+    // paths on a privileged directory.
+    static bool isOwnedRegularFile(const char* path, bool& exists)
+    {
+        struct stat pathStat;
+        exists = false;
+        if (lstat(path, &pathStat) != 0) {
+            return errno == ENOENT;
+        }
+        exists = true;
+        return S_ISREG(pathStat.st_mode) && (pathStat.st_uid == geteuid());
+    }
+
+    static bool readWholeFile(const char* path, std::string& contents)
+    {
+        contents.clear();
+
+        const int fileDescriptor = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fileDescriptor < 0) {
+            return false;
+        }
+
+        char buffer[4096];
+        bool readSucceeded = true;
+        for (;;) {
+            const ssize_t chunk = read(fileDescriptor, buffer, sizeof(buffer));
+            if (chunk == 0) {
+                break;
+            }
+            if (chunk < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                readSucceeded = false;
+                break;
+            }
+            contents.append(buffer, static_cast<size_t>(chunk));
+        }
+        return (close(fileDescriptor) == 0) && readSucceeded;
+    }
+
+    static bool writeWholeFile(const char* path, const std::string& contents)
+    {
+        const int fileDescriptor = open(path,
+            O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR);
+        if (fileDescriptor < 0) {
+            return false;
+        }
+
+        bool writeSucceeded = true;
+        size_t offset = 0;
+        while (writeSucceeded && (offset < contents.size())) {
+            const ssize_t chunk = write(fileDescriptor, contents.data() + offset, contents.size() - offset);
+            if (chunk <= 0) {
+                writeSucceeded = (errno == EINTR);
+                continue;
+            }
+            offset += static_cast<size_t>(chunk);
+        }
+
+        writeSucceeded = writeSucceeded && (offset == contents.size());
+        return (close(fileDescriptor) == 0) && writeSucceeded;
+    }
+
+    // std::remove, not unlink: this suite links with -Wl,-wrap,unlink and routes that symbol
+    // into the Wraps mock, which is torn down before this guard is destroyed. std::remove
+    // reaches the kernel without going through the wrapped symbol, and - like unlink - it
+    // removes a symlink itself rather than its target, so the lstat gate above still holds.
+    static void removeOwnedRegularFile(const char* path)
+    {
+        bool exists = false;
+        if (isOwnedRegularFile(path, exists) && exists) {
+            (void)std::remove(path);
+        }
+    }
+
+    /**
+     * Captures and restores the persisted CEC settings file around a fixture's lifetime.
+     *
+     * HdmiCecSinkImplementation::loadSettings() reads CEC_SETTING_ENABLED_FILE during
+     * Initialize(), and setEnabled(false) persists {"cecEnabled":false} into it through
+     * Utils::persistJsonSettings - which also creates the containing directory when the
+     * process is allowed to. GoogleTest isolates fixture state, never filesystem state, so
+     * once any test has persisted a disabled setting every later fixture loads it: CECEnable()
+     * is then skipped, no logical address is allocated, smConnection stays null, and every
+     * send, notification, route and device-list path early-returns. That is a measured
+     * cascade of 19 failures in this suite, and because it depends on execution order it
+     * cannot be repaired inside any single test body.
+     *
+     * The guard therefore takes the file back to its pre-suite state around every fixture:
+     * it snapshots the file (and whether its directory existed at all) before the plugin is
+     * initialised, clears it so the plugin loads its documented defaults, and puts the exact
+     * original state back afterwards - including removing a directory the run created, so the
+     * next fixture sees the same filesystem the first one did. It is declared as the first
+     * fixture member so it is constructed before every mock and destroyed after all of them.
+     */
+    class ScopedCecSettingsFile {
+    public:
+        ScopedCecSettingsFile()
+        {
+            struct stat directoryStat;
+            m_directoryExisted = (lstat(kCecSettingsDirectory, &directoryStat) == 0)
+                && S_ISDIR(directoryStat.st_mode);
+
+            bool exists = false;
+            if (isOwnedRegularFile(kCecSettingsFile, exists) && exists) {
+                m_captured = readWholeFile(kCecSettingsFile, m_contents);
+            }
+
+            // Start every fixture from the same state: no persisted settings, so
+            // loadSettings() takes its documented "create with default settings" path.
+            removeOwnedRegularFile(kCecSettingsFile);
+        }
+
+        ~ScopedCecSettingsFile()
+        {
+            if (m_captured) {
+                (void)writeWholeFile(kCecSettingsFile, m_contents);
+                return;
+            }
+
+            removeOwnedRegularFile(kCecSettingsFile);
+            if (!m_directoryExisted) {
+                // rmdir only succeeds on an empty directory, so this cannot discard
+                // anything the run did not create itself.
+                (void)rmdir(kCecSettingsDirectory);
+            }
+        }
+
+        ScopedCecSettingsFile(const ScopedCecSettingsFile&) = delete;
+        ScopedCecSettingsFile& operator=(const ScopedCecSettingsFile&) = delete;
+
+    private:
+        std::string m_contents;
+        bool m_captured = false;
+        bool m_directoryExisted = false;
+    };
+    /*
+     * Restores the plugin singleton's shared state on EVERY exit path.
+     *
+     * The state below is public on the implementation and several cases in this file set it
+     * up directly, because the production paths under test - route resolution, device
+     * removal, the device-list reports - read it and there is no seam to inject it through.
+     * Doing that with cleanup statements at the end of a test body is what this guard
+     * replaces: a fatal ASSERT_* or an exception jumps straight past those statements, and
+     * whatever was left behind becomes the next test's starting state.
+     *
+     * The whole of deviceList, hdmiInputs and m_currentActiveSource is captured rather than
+     * the individual entries a case happens to write.  That is deliberate - the production
+     * call under test mutates entries the test never touched (removeDevice unhooks the port
+     * chain, onPowerModeChanged writes the TV's own entry), and restoring only what the test
+     * wrote would leave those behind.
+     *
+     * ON CONCURRENCY, measured rather than assumed: the polling thread that also writes
+     * these structures is started by CECEnable and joined when CEC is disabled, and in this
+     * suite its whole lifetime is contained in two cases that mutate nothing
+     * (RegisteredMethods and setEnabled_ValidTrue) - every "Entering ThreadRun" in a suite
+     * log is matched by a "Thread Exits" inside the same case.  No case that uses this guard
+     * overlaps a live poll thread, so the capture and the restore are the only writers.
+     * Production offers no lock over these members and keeps m_pollThreadExit and
+     * m_pollThreadState private, so a test cannot quiesce the thread and cannot synchronise
+     * against it; if a future case needs to mutate this state while the thread runs, that
+     * needs a production change - a lock over deviceList/hdmiInputs, or a test-visible
+     * quiesce - and is reported as a blocked gap rather than worked around here.
+     */
+    class ScopedSinkState {
+    public:
+        ScopedSinkState()
+            : m_instance(Plugin::HdmiCecSinkImplementation::_instance)
+            , m_hdmiInputs()
+            , m_currentActiveSource(0)
+        {
+            if (m_instance != nullptr) {
+                for (size_t entry = 0; entry < kDeviceListEntries; ++entry) {
+                    m_deviceList[entry] = m_instance->deviceList[entry];
+                }
+                m_hdmiInputs = m_instance->hdmiInputs;
+                m_currentActiveSource = m_instance->m_currentActiveSource;
+            }
+        }
+
+        ScopedSinkState(const ScopedSinkState&) = delete;
+        ScopedSinkState& operator=(const ScopedSinkState&) = delete;
+
+        ~ScopedSinkState()
+        {
+            if (m_instance != nullptr) {
+                for (size_t entry = 0; entry < kDeviceListEntries; ++entry) {
+                    m_instance->deviceList[entry] = m_deviceList[entry];
+                }
+                m_instance->hdmiInputs = m_hdmiInputs;
+                m_instance->m_currentActiveSource = m_currentActiveSource;
+            }
+        }
+
+    private:
+        // Taken from the production declaration so it cannot drift from it.
+        static constexpr size_t kDeviceListEntries =
+            std::extent<decltype(Plugin::HdmiCecSinkImplementation::deviceList)>::value;
+
+        Plugin::HdmiCecSinkImplementation* m_instance;
+        Plugin::CECDeviceParams m_deviceList[kDeviceListEntries];
+        std::vector<Plugin::HdmiPortMap> m_hdmiInputs;
+        int m_currentActiveSource;
+    };
+
+    /*
+     * Captures /etc/device.properties and puts it back on every exit path.
+     *
+     * The profile written here decides whether the plugin comes up at all, so a test that
+     * changes it and then leaves through an exception - Core::ProxyType<>::Create() and
+     * Initialize() are both able to throw - would leave a set-top-box profile on a TV host
+     * for every later case and for whatever else on this machine reads the file.
+     *
+     * The capture and the restore go through descriptors opened O_NOFOLLOW and refuse
+     * anything that is not a regular file: this path is process-global, so writing through a
+     * symlink planted at it would modify whatever it points to.
+     */
+    class ScopedDeviceProperties {
+    public:
+        explicit ScopedDeviceProperties(const char* fileName)
+            : m_fileName(fileName)
+            , m_contents()
+            , m_mode(0644)
+            , m_captured(false)
+        {
+            const int fd = ::open(m_fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (fd < 0) {
+                printf("File %s could not be captured: %s\n", m_fileName, strerror(errno));
+                return;
+            }
+
+            struct stat fileStat;
+            if ((fstat(fd, &fileStat) == 0) && S_ISREG(fileStat.st_mode)) {
+                m_mode = fileStat.st_mode & 07777;
+                char buffer[4096];
+                ssize_t bytesRead = 0;
+                while ((bytesRead = ::read(fd, buffer, sizeof(buffer))) > 0) {
+                    m_contents.append(buffer, static_cast<std::string::size_type>(bytesRead));
+                }
+                m_captured = (bytesRead == 0);
+            } else {
+                printf("File %s is not a regular file; refusing to modify it\n", m_fileName);
+            }
+            ::close(fd);
+        }
+
+        ScopedDeviceProperties(const ScopedDeviceProperties&) = delete;
+        ScopedDeviceProperties& operator=(const ScopedDeviceProperties&) = delete;
+
+        ~ScopedDeviceProperties()
+        {
+            if (m_captured) {
+                (void)write(m_contents);
+            }
+        }
+
+        bool IsCaptured() const { return m_captured; }
+        const std::string& Contents() const { return m_contents; }
+
+        bool write(const std::string& contents) const
+        {
+            struct stat existingStat;
+            if ((lstat(m_fileName, &existingStat) == 0) && !S_ISREG(existingStat.st_mode)) {
+                printf("File %s is not a regular file (mode %o); refusing to write through it\n",
+                       m_fileName, existingStat.st_mode);
+                return false;
+            }
+
+            // std::remove, not unlink: this binary is linked with -Wl,-wrap,unlink, so a direct
+            // unlink() would be redirected to the Wraps mock and remove nothing.  Like unlink it
+            // removes the entry rather than following it.
+            if ((std::remove(m_fileName) != 0) && (errno != ENOENT)) {
+                printf("File %s could not be replaced: %s\n", m_fileName, strerror(errno));
+                return false;
+            }
+
+            const int fd = ::open(m_fileName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, m_mode);
+            if (fd < 0) {
+                printf("File %s could not be created: %s\n", m_fileName, strerror(errno));
+                return false;
+            }
+
+            bool written = true;
+            std::string::size_type offset = 0;
+            while (offset < contents.size()) {
+                const ssize_t bytesWritten = ::write(fd, contents.data() + offset, contents.size() - offset);
+                if (bytesWritten <= 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    written = false;
+                    break;
+                }
+                offset += static_cast<std::string::size_type>(bytesWritten);
+            }
+
+            if (written && (fchmod(fd, m_mode) != 0)) {
+                written = false;
+            }
+
+            return (::close(fd) == 0) && written;
+        }
+
+    private:
+        const char* m_fileName;
+        std::string m_contents;
+        mode_t m_mode;
+        bool m_captured;
+    };
+	// Snapshot of one process-global file, so a fixture can hand the filesystem back exactly as it
+	// found it.  Deliberately capture-and-restore rather than unconditional deletion: the suite runs
+	// on a shared host and must not decide, on the strength of one test, that a file the rest of the
+	// system owns should cease to exist.
+	class ScopedGlobalFile {
+	public:
+		explicit ScopedGlobalFile(const char* fileName)
+			: m_fileName(fileName)
+			, m_wasPresent(false)
+			, m_contents()
+		{
+			std::ifstream input(m_fileName.c_str(), std::ios::in | std::ios::binary);
+			if (input.is_open()) {
+				m_wasPresent = true;
+				m_contents.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+				input.close();
+			}
+		}
+
+		ScopedGlobalFile(const ScopedGlobalFile&) = delete;
+		ScopedGlobalFile& operator=(const ScopedGlobalFile&) = delete;
+
+		~ScopedGlobalFile()
+		{
+			Restore();
+		}
+
+		// Take the file out of the way so the code under test starts from its documented default.
+		void Clear() const
+		{
+			std::remove(m_fileName.c_str());
+		}
+
+		void Restore() const
+		{
+			if (m_wasPresent) {
+				std::ofstream output(m_fileName.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
+				if (output.is_open()) {
+					output.write(m_contents.data(), static_cast<std::streamsize>(m_contents.size()));
+					output.close();
+				}
+			} else {
+				std::remove(m_fileName.c_str());
+			}
+		}
+
+	private:
+		std::string m_fileName;
+		bool m_wasPresent;
+		std::string m_contents;
+	};
+
+	// The plugin brings itself up asynchronously: Initialize() returns as soon as the polling thread
+	// has been started, and it is that thread which reaches POLL_THREAD_STATE_POLL, calls
+	// allocateLAforTV() and records m_logicalAddressAllocated
+	// (HdmiCecSinkImplementation.cpp:2761-2787).  Everything gated on that value - removeDevice(),
+	// pingDevices(), Send_Report_Arc_Initiated_Message() and every notification they fan out -
+	// returns early with "Logical Address NOT Allocated" until it lands.  A test body that runs
+	// before it lands therefore fails on a timing accident rather than on behaviour.
+	//
+	// m_logicalAddressAllocated is private, so it cannot be read from a test, but the same
+	// critical section marks the TV's own deviceList entry present (line 2771) and deviceList is
+	// public - so that flag is the observable edge to wait on.  This is a bounded wait on a real
+	// post-condition, not a fixed sleep: it returns the instant the thread gets there, and reports
+	// failure instead of hanging if it never does.
+	static bool waitForTvLogicalAddress(const unsigned int timeoutMs)
+	{
+		const unsigned int pollIntervalMs = 5;
+
+		for (unsigned int waited = 0; waited <= timeoutMs; waited += pollIntervalMs) {
+			if ((Plugin::HdmiCecSinkImplementation::_instance != nullptr)
+				&& Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_isDevicePresent) {
+				return true;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
+		}
+
+		return false;
+	}
+
 }
 
+// Every fixture in this file derives from HdmiCecSinkInitializeTest, and every one of them activates
+// the plugin, so the persisted CEC settings file is shared process-global state for the whole binary.
+//
+// It has to be managed here rather than in a SetUp() override, because the derived fixtures call
+// plugin->Initialize() from their CONSTRUCTORS - by the time SetUp() ran, Configure()/loadSettings()
+// would already have read the file.  A base-class constructor runs before every derived constructor
+// body and a base-class destructor after every derived destructor body, so this is the only hook that
+// brackets the whole fixture lifetime.
+//
+// Why it is needed: HdmiCecSink::Deinitialize() calls SetEnabled(false) on teardown, which persists
+// "cecEnabled": false into CEC_SETTING_ENABLED_FILE.  Without this bracket the FIRST test in the
+// process leaves CEC disabled on disk and every later test then loads a disabled configuration, so
+// loadSettings() skips CECEnable() and cecEnableStatus stays false.  Nineteen tests - including
+// pre-existing ones such as requestAudioDevicePowerStatus, getDeviceList_ConnectionClosed and
+// InjectReportPowerStatus_AudioSystem_AfterRequest - then fail on a first-in-wins ordering accident
+// while passing in isolation.  Clearing the file per test makes every test start from the production
+// default (CEC enabled), and restoring the captured content afterwards leaves the host as found.
+//
+// No test body is modified by this: it is fixture state management only.
 class HdmiCecSinkInitializeTest : public ::testing::Test {
 protected:
+    ScopedGlobalFile persistedCecSettings;
     Core::ProxyType<Plugin::HdmiCecSink> plugin;
     Core::JSONRPC::Handler& handler;
     DECL_CORE_JSONRPC_CONX connection;
@@ -90,7 +526,11 @@ protected:
     string response;
 
     HdmiCecSinkInitializeTest()
-        : plugin(Core::ProxyType<Plugin::HdmiCecSink>::Create())
+        // Captured before the plugin exists, so the snapshot is of the state this test inherited.
+        // The literal is CEC_SETTING_ENABLED_FILE from HdmiCecSinkImplementation.cpp, which is a
+        // private production macro and therefore not visible to a test translation unit.
+        : persistedCecSettings("/opt/persistent/ds/cecData_2.json")
+        , plugin(Core::ProxyType<Plugin::HdmiCecSink>::Create())
         , handler(*(plugin))
         , INIT_CONX(1, 0)
 		, dsHdmiEventHandler(nullptr)
@@ -98,6 +538,9 @@ protected:
               2, Core::Thread::DefaultStackSize(), 16))
 		, dispatcher(nullptr)
     {
+        // Start every test from the production default (loadSettings() creates the file with
+        // "cecEnabled": true when it is absent) instead of from whatever the previous test persisted.
+        persistedCecSettings.Clear();
     }
 
     virtual ~HdmiCecSinkInitializeTest() override
@@ -108,6 +551,74 @@ protected:
 
 class HdmiCecSinkDsTest : public HdmiCecSinkInitializeTest {
 protected:
+    // FIRST member on purpose: constructed before every mock and before the constructor
+    // body calls plugin->Initialize(), destroyed after the destructor body has called
+    // plugin->Deinitialize() and after every mock has been torn down. See
+    // ScopedCecSettingsFile for why the persisted settings file has to be isolated.
+    ScopedCecSettingsFile   cecSettingsFileGuard;
+
+    // Minimal RPC::IRemoteConnection double, used to drive the plugin's private
+    // remote-connection notification sink. Stack-allocated by the tests, so Release() only
+    // counts down a local reference count and never deletes, and the count starts at 1 because
+    // these instances are owned by the test's stack frame.
+    //
+    // Why a hand-written double rather than a mock: entservices-testframework does define a
+    // MockRemoteConnection, but only inside Tests/mocks/PlayerInfoMock.h, which pulls
+    // PlayerInfo.h and <interfaces/IPlayerInfo.h> into whatever includes it. That submodule is
+    // out of scope for edits on this pass, so the class cannot be relocated, and dragging an
+    // unrelated plugin's interface headers into this translation unit to borrow one type is a
+    // worse trade than eleven trivial overrides. The sibling suite reached the same conclusion:
+    // entservices-hdmicecsource/Tests/L1Tests/tests/test_HdmiCecSource.cpp carries an identical
+    // double, and this is a copy of it trimmed to what the sink needs.
+    class RemoteConnectionDouble final : public RPC::IRemoteConnection {
+    public:
+        explicit RemoteConnectionDouble(const uint32_t id = 0)
+            : m_id(id)
+            , m_referenceCount(1)
+        {
+        }
+
+        // Retargets the double after construction: the deactivation cases below build one
+        // instance and drive the matching identifier through it, and the identifier the plugin
+        // recorded is only knowable once the fixture has initialised the plugin.
+        void SetId(const uint32_t id) { m_id = id; }
+
+        uint32_t Id() const override { return m_id; }
+        uint32_t RemoteId() const override { return 0; }
+        void* Acquire(const uint32_t, const string&, const uint32_t, const uint32_t) override { return nullptr; }
+        void Terminate() override { }
+        uint32_t Launch() override { return Core::ERROR_NONE; }
+        void PostMortem() override { }
+
+        void* QueryInterface(const uint32_t interfaceNumber) override
+        {
+            void* result = nullptr;
+            if (interfaceNumber == RPC::IRemoteConnection::ID) {
+                result = static_cast<RPC::IRemoteConnection*>(this);
+            } else if (interfaceNumber == Core::IUnknown::ID) {
+                result = static_cast<Core::IUnknown*>(this);
+            }
+            if (result != nullptr) {
+                AddRef();
+            }
+            return result;
+        }
+
+        void AddRef() const override { ++m_referenceCount; }
+
+        uint32_t Release() const override
+        {
+            if (m_referenceCount > 0) {
+                --m_referenceCount;
+            }
+            return m_referenceCount;
+        }
+
+    private:
+        uint32_t m_id;
+        mutable uint32_t m_referenceCount;
+    };
+
     IarmBusImplMock         *p_iarmBusImplMock = nullptr ;
     ManagerImplMock         *p_managerImplMock = nullptr ;
     HostImplMock            *p_hostImplMock = nullptr ;
@@ -122,6 +633,114 @@ protected:
     NiceMock<WrapsImplMock> wrapsImplMock;
     string response;
     std::vector<FrameListener*> listeners;
+
+    // ---- CEC bus recorder -------------------------------------------------------------
+    // Everything the implementation hands to Connection::sendTo is recorded here, and the
+    // recording action is installed BEFORE plugin->Initialize() - that is, before CECEnable()
+    // spawns the polling thread. Two problems this solves, both raised by review:
+    //
+    //  * The polling thread lives for the whole fixture and calls sendTo() on the very same
+    //    mock. A test body that installs its own EXPECT_CALL while that thread is running
+    //    mutates gmock's expectation state concurrently with a call into it, and a plain int
+    //    counter captured by reference is written by the poll thread and read by the test
+    //    thread. Both are data races; the first one is capable of taking the process down.
+    //  * "Some broadcast happened" cannot distinguish the message under test from the poll
+    //    thread's own start-up traffic, so a count-based assertion passes for the wrong reason.
+    //
+    // Tests therefore never reconfigure the connection mock: they settle the bus, clear the
+    // recorder, act, and assert on the recorded window under the same mutex.
+    //
+    // KNOWN LIMIT (documented, needs an out-of-scope change to assert further): the opcode and
+    // operands of a message cannot be recovered here. entservices-testframework declares
+    // `class DataBlock {}` with no members and `MessageEncoder::encode(const DataBlock m)`
+    // takes it BY VALUE, so every DataBlock-derived message is sliced to an empty base before
+    // any mock sees it, and the encoder mock returns the shared CECFrame::getInstance(). The
+    // recorder therefore captures destination, transmit budget and the encode-call serial -
+    // which together do identify the send - and message identity is asserted through the
+    // implementation state each message is built from.
+    // An enumerator rather than a static constexpr member: this is C++14, so a constexpr member
+    // that gets bound to a reference (EXPECT_EQ, lambda capture) would need an out-of-line
+    // definition to satisfy ODR.
+    enum : int { kAsyncSend = -2 };         // recorded for sendToAsync, which has no budget
+
+    struct SentMessage {
+        int to;
+        int timeout;            // -1 for the two-argument sendTo overload, kAsyncSend for async
+        uint32_t encodeSerial;  // encode() calls completed when this send was made
+    };
+
+    mutable std::mutex busMutex;
+    std::vector<SentMessage> sentMessages;
+    uint32_t encodeCalls = 0;
+
+    void clearBusRecorder()
+    {
+        std::lock_guard<std::mutex> lock(busMutex);
+        sentMessages.clear();
+        encodeCalls = 0;
+    }
+
+    std::vector<SentMessage> recordedMessages() const
+    {
+        std::lock_guard<std::mutex> lock(busMutex);
+        return sentMessages;
+    }
+
+    uint32_t recordedEncodeCalls() const
+    {
+        std::lock_guard<std::mutex> lock(busMutex);
+        return encodeCalls;
+    }
+
+    size_t recordedMessageCount() const
+    {
+        std::lock_guard<std::mutex> lock(busMutex);
+        return sentMessages.size();
+    }
+
+    // Bounded wait for a recorded send to a given destination with a given transmit budget, for
+    // the paths where production hands the send to one of its own threads. Returns how many
+    // matched, so a test can assert "exactly one" rather than "at least something happened".
+    size_t waitForRecordedMessage(int to, int timeout, uint32_t timeoutMs = 3000) const
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        for (;;) {
+            size_t matches = 0;
+            {
+                std::lock_guard<std::mutex> lock(busMutex);
+                for (const SentMessage& sent : sentMessages) {
+                    if ((sent.to == to) && (sent.timeout == timeout)) {
+                        ++matches;
+                    }
+                }
+            }
+            if ((matches > 0) || (std::chrono::steady_clock::now() >= deadline)) {
+                return matches;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    // Bounded wait for the polling thread's start-up sweep to finish, observed only through
+    // the recorder so that no production member is read without synchronisation. The sweep
+    // always broadcasts <Report Physical Address> once it has claimed the TV logical address,
+    // and then parks for HDMICECSINK_PING_INTERVAL_MS (10 s), so "at least one send, and the
+    // count unchanged across two consecutive samples" marks the start of a wide quiet window.
+    // Returns false instead of blocking if the sweep never settles.
+    bool waitForBusToSettle(uint32_t timeoutMs = 5000)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        size_t previous = recordedMessageCount();
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            const size_t current = recordedMessageCount();
+            if ((current > 0) && (current == previous)) {
+                return true;
+            }
+            previous = current;
+        }
+        return false;
+    }
 
     HdmiCecSinkDsTest(): HdmiCecSinkInitializeTest()
     {
@@ -163,14 +782,55 @@ protected:
                 throw CECNoAckException();
                 }));
 
+        // NOTE on ping() - deliberately left at the NiceMock default here rather than stubbed
+        // fixture-wide. HdmiCecSinkImplementation::pingDevices() calls smConnection->ping() (not
+        // poll()), and at the default it returns without throwing, which the implementation reads
+        // as "device ACKed": the polling thread then calls addDevice() for the non-TV addresses.
+        // Stubbing it to throw here would flip that to "device gone", and the polling thread would
+        // then call removeDevice() on any entry a test had marked present - clobbering the tests
+        // that assert an entry SURVIVES. The two contracts cannot both be fixture-wide defaults, so
+        // the tests whose assertions depend on a device being ABSENT install the throwing stub
+        // themselves; see the ping() stubs in the removeDevice_* cases.
+
         EXPECT_CALL(*p_libCCECImplMock, getPhysicalAddress(::testing::_))
             .WillRepeatedly(::testing::Invoke(
                 [&](uint32_t *physAddress) {
                     *physAddress = (uint32_t)0x12345678;
                 }));
 
+        // Same return value the fixture always produced (the shared frame instance), with the
+        // call counted so a send can be tied to the encode that produced its payload.
         ON_CALL(*p_messageEncoderMock, encode(::testing::Matcher<const DataBlock&>(::testing::_)))
-            .WillByDefault(::testing::ReturnRef(CECFrame::getInstance()));
+            .WillByDefault(::testing::Invoke(
+                [this](const DataBlock&) -> CECFrame& {
+                    std::lock_guard<std::mutex> lock(busMutex);
+                    ++encodeCalls;
+                    return CECFrame::getInstance();
+                }));
+
+        // Bus recorder. Installed here, before Initialize() starts the polling thread, so no
+        // test ever has to reconfigure this mock while that thread is calling into it.
+        ON_CALL(*p_connectionImplMock, sendTo(::testing::Matcher<const LogicalAddress&>(::testing::_),
+                    ::testing::Matcher<const CECFrame&>(::testing::_),
+                    ::testing::Matcher<int>(::testing::_)))
+            .WillByDefault(::testing::Invoke(
+                [this](const LogicalAddress& to, const CECFrame&, int timeout) {
+                    std::lock_guard<std::mutex> lock(busMutex);
+                    sentMessages.push_back(SentMessage { to.toInt(), timeout, encodeCalls });
+                }));
+        ON_CALL(*p_connectionImplMock, sendTo(::testing::Matcher<const LogicalAddress&>(::testing::_),
+                    ::testing::Matcher<const CECFrame&>(::testing::_)))
+            .WillByDefault(::testing::Invoke(
+                [this](const LogicalAddress& to, const CECFrame&) {
+                    std::lock_guard<std::mutex> lock(busMutex);
+                    sentMessages.push_back(SentMessage { to.toInt(), -1, encodeCalls });
+                }));
+        ON_CALL(*p_connectionImplMock, sendToAsync(::testing::_, ::testing::_))
+            .WillByDefault(::testing::Invoke(
+                [this](const LogicalAddress& to, const CECFrame&) {
+                    std::lock_guard<std::mutex> lock(busMutex);
+                    sentMessages.push_back(SentMessage { to.toInt(), kAsyncSend, encodeCalls });
+                }));
         ON_CALL(*p_messageEncoderMock, encode(::testing::Matcher<const UserControlPressed&>(::testing::_)))
            .WillByDefault(::testing::ReturnRef(CECFrame::getInstance()));
 
@@ -220,6 +880,16 @@ protected:
         dispatcher->Activate(&service);
 
         EXPECT_EQ(string(""), plugin->Initialize(&service));
+
+        // Hand every test a settled bus. Initialize() -> CECEnable() spawns the polling thread,
+        // which claims the TV logical address, broadcasts <Report Physical Address>, pings the
+        // bus and only then parks for HDMICECSINK_PING_INTERVAL_MS. Until that sweep finishes it
+        // is concurrently writing deviceList[], m_numberOfDevices and the CEC connection that
+        // tests read and write, so waiting for it here removes that race for the whole fixture
+        // instead of leaving each test to guess with a fixed sleep. Deliberately not asserted:
+        // a few tests deactivate or never enable CEC, and for those there is simply no sweep to
+        // wait for. Tests that depend on a quiet bus call waitForBusToSettle() themselves.
+        (void)waitForBusToSettle(2000);
     }
     virtual ~HdmiCecSinkDsTest() override {
 
@@ -296,6 +966,80 @@ protected:
             delete p_telemetryApiImplMock;
             p_telemetryApiImplMock = nullptr;
         }
+    }
+
+    // Bring the plugin into the state a large family of its APIs requires before they will do
+    // anything at all: CEC enabled, and a CEC logical address allocated.
+    //
+    // Activation alone does not reach that state. The fixture activates the plugin with CEC
+    // DISABLED (loadSettings reads cecEnabled 0 from the settings file), so m_logicalAddressAllocated
+    // stays LogicalAddress::UNREGISTERED, and every one of these production entry points returns
+    // early on exactly that value: addDevice, removeDevice, getActiveRoute, setActiveSource,
+    // RequestAudioDevicePowerStatus (which also requires cecEnableStatus), reportFeatureAbortEvent,
+    // onPowerModeChanged's power-status write and the ARC entry points. A test that needs any of
+    // them must therefore establish this precondition itself.
+    //
+    // cecEnableStatus, m_logicalAddressAllocated and smConnection are all private, so the state is
+    // established the way a client would - through the published setEnabled method - and then waited
+    // for on an OBSERVABLE effect rather than on a fixed sleep: the poll thread, immediately after
+    // allocateLAforTV() succeeds, marks the TV's own device entry present and stamps its physical
+    // address (update(physical_addr), which raises m_isPAUpdated) - two fields nothing else in this
+    // fixture writes. With this fixture's poll() mock throwing CECNoAckException, allocation takes
+    // the first candidate (LogicalAddress::TV) on its first attempt, so the wait is short; the bound
+    // exists so a failure to allocate reports itself instead of hanging the suite.
+    //
+    // Nothing needs undoing afterwards: each test gets its own implementation instance (the
+    // COMLink mock instantiates one per fixture) and the fixture destructor's Deinitialize tears
+    // the enabled state and its threads down again.
+    bool EnableCecAndAwaitLogicalAddressAllocation(const int timeoutMs = 5000)
+    {
+        string enableResponse;
+        if (handler.Invoke(connection, _T("setEnabled"), _T("{\"enabled\":true}"), enableResponse) != Core::ERROR_NONE) {
+            return false;
+        }
+
+        const int pollIntervalMs = 20;
+        for (int waitedMs = 0; waitedMs <= timeoutMs; waitedMs += pollIntervalMs) {
+            Plugin::HdmiCecSinkImplementation* implementation = Plugin::HdmiCecSinkImplementation::_instance;
+            if (implementation != nullptr
+                && implementation->deviceList[LogicalAddress::TV].m_isDevicePresent
+                && implementation->deviceList[LogicalAddress::TV].m_isPAUpdated) {
+                return true;
+            }
+            usleep(pollIntervalMs * 1000);
+        }
+        return false;
+    }
+
+    // The lighter pair below is for cases that need CEC UP but do not read anything the polling
+    // thread has to have filled in first. EnableCecAndAwaitLogicalAddressAllocation() above is the
+    // one to use when the production path under test returns early until an address is allocated;
+    // these two just move the switch and, in DisableCec()'s case, put it back.
+    //
+    // Initialize() enables CEC only when the persisted setting says so, and that setting lives in a
+    // process-global file the plugin rewrites to false on every Deinitialize, so a case that needs
+    // CEC up has to ask for it rather than inherit it from whatever ran before. Leaving the ping
+    // unacknowledged keeps the polling thread from filling the device table underneath the case:
+    // with no ACK it finds nothing connected and goes back to sleep.
+    void EnableCec()
+    {
+        ON_CALL(*p_connectionImplMock, ping(::testing::_, ::testing::_, ::testing::_))
+            .WillByDefault(::testing::Invoke(
+                [](const LogicalAddress&, const LogicalAddress&, const Throw_e&) {
+                    throw CECNoAckException();
+                }));
+
+        EXPECT_EQ(Core::ERROR_NONE,
+            handler.Invoke(connection, _T("setEnabled"), _T("{\"enabled\":true}"), response));
+    }
+
+    // Take CEC back down once a case that brought it up has finished asserting. This joins the
+    // polling thread, so no asynchronous callback can still be running when the case's locals and
+    // the event dispatcher go away, and it restores the disabled state the fixture started in.
+    void DisableCec()
+    {
+        EXPECT_EQ(Core::ERROR_NONE,
+            handler.Invoke(connection, _T("setEnabled"), _T("{\"enabled\":false}"), response));
     }
 };
 
@@ -532,6 +1276,26 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, powerModeChange)
     // pwrMgrModeChangeEventHandler(IARM_BUS_PWRMGR_NAME, IARM_BUS_PWRMGR_EVENT_MODECHANGED, &eventData , 0);
 }
 
+// DEFECTIVE-TEST DISPOSITION: DOCUMENTED CANNOT-FIX. Left disabled, in place and unmodified.
+//
+// This test invokes a JSON-RPC method "getCecVersion" that the plugin does not publish, so no
+// arrangement of mocks can make it pass:
+//   * IHdmiCecSink.h declares no getCecVersion in its @text method set, and
+//     Exchange::JHdmiCecSink::Register (HdmiCecSink.cpp) is the plugin's ONLY registration path,
+//     so the dispatcher has no such method to invoke - handler.Invoke below can only fail;
+//   * the RegisteredMethods case in this same file enumerates the 24 published names and
+//     getCecVersion is not among them;
+//   * HdmiCecSinkImplementation::getCecVersion() does exist, but it is an internal RFC helper
+//     that returns void and is called only from Configure(); it was never a JSON-RPC endpoint.
+// Restoring the commented-out RFC expectation below would therefore not help: the expectation is
+// not why the test fails. Enabling it would require publishing a new JSON-RPC method in
+// entservices-apis and the plugin - a production change, which is out of scope here - so the
+// REQUIRED CHANGE is recorded rather than made, and the test stays where it is because removal is
+// prohibited on this pass.
+// The corresponding client command has been removed from the sink vDevice suite
+// (Tests/vDeviceTests/HdmiCECSink_Curl.py) so that no test asset presents this internal helper as
+// a published endpoint. The CEC version is observable instead through the <Give CEC Version>
+// exchange in that suite's vComponent response configuration.
 TEST_F(HdmiCecSinkInitializedEventDsTest, DISABLED_getCecVersion)
 {
     /*EXPECT_CALL(rfcApiImplMock, getRFCParameter(::testing::_, ::testing::_, ::testing::_))
@@ -721,19 +1485,39 @@ TEST_F(HdmiCecSinkDsTest, getAudioDeviceConnectedStatus)
 
 TEST_F(HdmiCecSinkDsTest, requestAudioDevicePowerStatus)
 {
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
     EXPECT_CALL(*p_connectionImplMock, sendTo(::testing::_, ::testing::_, ::testing::_))
         .WillRepeatedly(::testing::Return());
     
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("requestAudioDevicePowerStatus"), _T("{}"), response));
     EXPECT_EQ(response, string("{\"success\":true}"));
+
+    DisableCec();
 }
 
+// The connection is closed by DISABLING CEC - that is the one production path that calls
+// Connection::close() - so the case brings CEC up, takes it back down, and only then asks for the
+// device list. Invoking getDeviceList on its own could never satisfy the close() expectation
+// because getDeviceList does not touch the connection at all.
 TEST_F(HdmiCecSinkDsTest, getDeviceList_ConnectionClosed)
 {
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
     EXPECT_CALL(*p_connectionImplMock, close())
-        .WillOnce(::testing::Return());
-    
+        .Times(::testing::AtLeast(1))
+        .WillRepeatedly(::testing::Return());
+
+    string disableResponse;
+    EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("setEnabled"), _T("{\"enabled\":false}"), disableResponse));
+    EXPECT_EQ(disableResponse, string("{\"success\":true}"));
+
+    // The device list is still answerable with the connection gone: the plugin reports from its
+    // own cached device table rather than from the bus.
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getDeviceList"), _T("{}"), response));
+    EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 }
 
 TEST_F(HdmiCecSinkDsTest, setOSDName_MaxLength)
@@ -2609,16 +3393,25 @@ TEST_F(HdmiCecSinkFrameProcessingTest, InjectRequestCurrentLatencyFrame_Multiple
 // Test fixture description: ReportPowerStatus from Audio System when power status was explicitly requested
 TEST_F(HdmiCecSinkFrameProcessingTest, InjectReportPowerStatus_AudioSystem_AfterRequest)
 {
-    // Wait for plugin initialization to complete (FrameListener registration happens asynchronously)
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // requestAudioDevicePowerStatus refuses to do anything unless CEC is enabled AND a logical
+    // address has been allocated, and it is the poll thread's allocation that also registers the
+    // frame listener this case injects through - so establishing the precondition is what makes both
+    // halves of the case real. It replaces the previous unconditional 100 ms sleep, which waited for
+    // a registration that could never happen while CEC was disabled.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
 
     // First, simulate requesting audio device power status by calling the API
-    // This sets m_audioDevicePowerStatusRequested flag to true
+    // This sets m_audioDevicePowerStatusRequested flag to true.
+    // The expectation is AtLeast(1) rather than exactly one call because the poll thread is now
+    // running and puts its own messages on the same interface; the assertion of interest is that
+    // the request reaches the bus at all.
     EXPECT_CALL(*p_connectionImplMock, sendTo(::testing::_, ::testing::_, ::testing::_))
-        .WillOnce(::testing::Return());
+        .Times(::testing::AtLeast(1))
+        .WillRepeatedly(::testing::Return());
 
     string requestResponse;
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("requestAudioDevicePowerStatus"), _T("{}"), requestResponse));
+    EXPECT_EQ(requestResponse, string("{\"success\":true}"));
 
     // Small delay to ensure the request is processed
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2632,6 +3425,8 @@ TEST_F(HdmiCecSinkFrameProcessingTest, InjectReportPowerStatus_AudioSystem_After
     // Test different power status values to ensure the logic works for various states
     uint8_t audioSystemStandbyFrame[] = { 0x50, 0x90, 0x01 }; // Power Standby
     EXPECT_NO_THROW(InjectCECFrame(audioSystemStandbyFrame, sizeof(audioSystemStandbyFrame)));
+
+    DisableCec();
 }
 
 // Test fixture description: FeatureAbort processor coverage - broadcast message rejection
@@ -2648,24 +3443,18 @@ TEST_F(HdmiCecSinkFrameProcessingTest, InjectFeatureAbort_BroadcastMessage_Shoul
 }
 
 //=============================================================================
-// Route-map / device-parameter unit tests (L1 Level)
-//
-// COVERAGE_GAPS.md traceability: gap-plugin-sink (Sec. 6.2 rank 31, P1).
+// Route-map and device-parameter unit tests
 //
 // HdmiCecSinkFrameListener, HdmiCecSinkProcessor, CECDeviceParams, DeviceNode and
-// HdmiPortMap are all declared at namespace scope inside WPEFramework::Plugin with
-// public members, so they are constructed directly here: these cases need no plugin
-// instance, no JSON-RPC round trip and no mock configuration at all. They close the
-// zero-hit route-map operations (HdmiPortMap::addChild / removeChild / getRoute),
-// CECDeviceParams::printVariable and the HdmiCecSinkFrameListener destructor.
+// HdmiPortMap are declared at namespace scope inside WPEFramework::Plugin with public
+// members, so these cases construct them directly: no plugin instance, no JSON-RPC round
+// trip and no mock configuration is involved.
 //
-// Every case establishes its own preconditions on stack-local objects and leaves no
-// shared or process-global state altered, so each one passes both in isolation and in
-// the full suite regardless of execution order.
+// Every case builds its preconditions on stack-local objects and leaves no shared or
+// process-global state altered, so it passes in isolation and in the full suite
+// regardless of execution order.
 //=============================================================================
 
-// Test fixture description: every route-map operation is inert until the port has been
-// registered with a logical address - the natural negative case for all three operations.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_UnregisteredPort_AllOperationsAreInert)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2693,8 +3482,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_UnregisteredPort_AllOperationsAreInert)
     EXPECT_TRUE(route.empty());
 }
 
-// Test fixture description: addChild's second arm registers the port itself when the
-// incoming physical address is the port's own address.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildOwnPhysicalAddress_RegistersPort)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2703,12 +3490,9 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildOwnPhysicalAddress_RegistersPort)
     portMap.addChild(LogicalAddress(4), ownAddress);
 
     EXPECT_EQ(4, portMap.m_logicalAddr.toInt());
-    // Registering the port must not disturb any child slot.
     EXPECT_EQ(LogicalAddress::UNREGISTERED, static_cast<int>(portMap.m_deviceChain[0].m_childsLogicalAddr[0]));
 }
 
-// Test fixture description: addChild depth-one branch - only the second physical-address byte
-// is non-zero, so the child lands in the first link of the device chain.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildDepthOne_PopulatesFirstChainLink)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2723,8 +3507,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildDepthOne_PopulatesFirstChainLink)
     EXPECT_EQ(LogicalAddress::UNREGISTERED, static_cast<int>(portMap.m_deviceChain[2].m_childsLogicalAddr[0]));
 }
 
-// Test fixture description: addChild depth-two branch - the third byte is non-zero, which takes
-// precedence over the second in the mutually exclusive chain.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildDepthTwo_PopulatesSecondChainLink)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2738,8 +3520,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildDepthTwo_PopulatesSecondChainLink)
     EXPECT_EQ(LogicalAddress::UNREGISTERED, static_cast<int>(portMap.m_deviceChain[0].m_childsLogicalAddr[0]));
 }
 
-// Test fixture description: addChild depth-three branch - the fourth byte is non-zero and wins
-// the exclusive ladder outright.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildDepthThree_PopulatesThirdChainLink)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2753,8 +3533,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildDepthThree_PopulatesThirdChainLink
     EXPECT_EQ(LogicalAddress::UNREGISTERED, static_cast<int>(portMap.m_deviceChain[0].m_childsLogicalAddr[0]));
 }
 
-// Test fixture description: addChild corner case - repeating the same registration must be
-// idempotent rather than shifting the child into a different slot.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildDuplicate_IsIdempotent)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2767,8 +3545,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildDuplicate_IsIdempotent)
     EXPECT_EQ(6, static_cast<int>(portMap.m_deviceChain[0].m_childsLogicalAddr[0]));
 }
 
-// Test fixture description: addChild negative case - a physical address belonging to a different
-// HDMI port must not be recorded against this port.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildMismatchedPrefix_LeavesChainUntouched)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2782,8 +3558,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildMismatchedPrefix_LeavesChainUntouc
     EXPECT_EQ(4, portMap.m_logicalAddr.toInt());
 }
 
-// Test fixture description: addChild corner case - a zero second byte means "the port itself",
-// which cannot be a child, so no chain slot is written.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildZeroSecondByte_LeavesChainUntouched)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2798,7 +3572,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_AddChildZeroSecondByte_LeavesChainUntouche
     EXPECT_EQ(4, portMap.m_logicalAddr.toInt());
 }
 
-// Test fixture description: the connection flag is independent of logical-address registration.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_UpdateConnected_TogglesFlagOnly)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2811,9 +3584,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_UpdateConnected_TogglesFlagOnly)
     EXPECT_FALSE(portMap.m_isConnected);
 }
 
-// Test fixture description: getRoute happy path over a fully populated three-deep hierarchy.
-// Unlike addChild/removeChild, getRoute uses three SEQUENTIAL ifs and then unconditionally
-// appends the port's own logical address, so a full address yields four entries, deepest first.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_GetRouteFullDepth_ReturnsFourEntriesOwnAddressLast)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2836,8 +3606,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_GetRouteFullDepth_ReturnsFourEntriesOwnAdd
     EXPECT_EQ(4, static_cast<int>(route[3]));
 }
 
-// Test fixture description: getRoute corner case - a single deep registration leaves the
-// shallower links unregistered, and getRoute reports them verbatim rather than skipping them.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_GetRoutePartialChain_ReportsUnregisteredPlaceholders)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2856,9 +3624,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_GetRoutePartialChain_ReportsUnregisteredPl
     EXPECT_EQ(4, static_cast<int>(route[3]));
 }
 
-// Test fixture description: getRoute edge case - an address that does not share this port's
-// prefix falls into the else arm, which still reports the port itself. The route is therefore
-// one entry long, NOT empty.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_GetRouteUnknownPort_ReturnsSingleOwnAddress)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2872,9 +3637,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_GetRouteUnknownPort_ReturnsSingleOwnAddres
     EXPECT_EQ(4, static_cast<int>(route[0]));
 }
 
-// Test fixture description: add -> getRoute -> removeChild -> getRoute round trip. removeChild
-// mirrors addChild's exclusive ladder, so it clears exactly one slot per call and restores the
-// UNREGISTERED value that DeviceNode seeds every slot with.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_RemoveChildRoundTrip_RestoresUnregistered)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2913,8 +3675,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_RemoveChildRoundTrip_RestoresUnregistered)
     EXPECT_EQ(4, static_cast<int>(clearedRoute[3]));
 }
 
-// Test fixture description: removeChild negative case - removing an address that was never
-// added is harmless because the slot already holds UNREGISTERED.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_RemoveChildNeverAdded_IsHarmless)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2927,8 +3687,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_RemoveChildNeverAdded_IsHarmless)
     EXPECT_EQ(4, portMap.m_logicalAddr.toInt());
 }
 
-// Test fixture description: removeChild negative case - a foreign prefix must not clear a slot
-// that belongs to this port.
 TEST_F(HdmiCecSinkDsTest, HdmiPortMap_RemoveChildMismatchedPrefix_LeavesChainUntouched)
 {
     Plugin::HdmiPortMap portMap(1);
@@ -2943,8 +3701,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiPortMap_RemoveChildMismatchedPrefix_LeavesChainUnt
     EXPECT_EQ(6, static_cast<int>(portMap.m_deviceChain[0].m_childsLogicalAddr[0]));
 }
 
-// Test fixture description: DeviceNode seeds every one of its slots with UNREGISTERED, which is
-// what makes the removeChild round trip above verifiable.
 TEST_F(HdmiCecSinkDsTest, DeviceNode_DefaultConstruction_AllSlotsUnregistered)
 {
     Plugin::DeviceNode node;
@@ -2955,8 +3711,6 @@ TEST_F(HdmiCecSinkDsTest, DeviceNode_DefaultConstruction_AllSlotsUnregistered)
     }
 }
 
-// Test fixture description: a freshly constructed device entry advertises the invalid physical
-// address and reports that nothing has been learned about the device yet.
 TEST_F(HdmiCecSinkDsTest, CECDeviceParams_DefaultConstruction_HasInvalidAddressAndNoUpdates)
 {
     Plugin::CECDeviceParams device;
@@ -2977,9 +3731,6 @@ TEST_F(HdmiCecSinkDsTest, CECDeviceParams_DefaultConstruction_HasInvalidAddressA
     EXPECT_FALSE(device.isAllUpdated());
 }
 
-// Test fixture description: isAllUpdated is a negated OR of six independent flags, so it stays
-// false until every one of the six update() overloads has been applied - the positive/negative
-// pair for the device-information completeness predicate.
 TEST_F(HdmiCecSinkDsTest, CECDeviceParams_IsAllUpdated_FalseUntilAllSixUpdatesApplied)
 {
     Plugin::CECDeviceParams device;
@@ -3008,14 +3759,11 @@ TEST_F(HdmiCecSinkDsTest, CECDeviceParams_IsAllUpdated_FalseUntilAllSixUpdatesAp
     device.update(DeviceType(DeviceType::PLAYBACK_DEVICE));
     EXPECT_TRUE(device.m_isDeviceTypeUpdated);
 
-    // Only now, with all six sources of device information present, is the entry complete.
     EXPECT_TRUE(device.isAllUpdated());
     EXPECT_EQ(std::string("2000"), device.m_physicalAddr.toString());
     EXPECT_EQ(std::string("CECTEST"), device.m_osdName.toString());
 }
 
-// Test fixture description: clear() must return a fully populated entry to its constructed
-// state so that a re-detected device is not reported with stale information.
 TEST_F(HdmiCecSinkDsTest, CECDeviceParams_Clear_ResetsEveryField)
 {
     Plugin::CECDeviceParams device;
@@ -3048,9 +3796,6 @@ TEST_F(HdmiCecSinkDsTest, CECDeviceParams_Clear_ResetsEveryField)
     EXPECT_FALSE(device.isAllUpdated());
 }
 
-// Test fixture description: printVariable dumps all fifteen tracked device fields for
-// diagnostics. It is a pure reporter, so the observable contract is that it completes without
-// throwing and mutates nothing - including for a default entry whose fields hold edge values.
 TEST_F(HdmiCecSinkDsTest, CECDeviceParams_PrintVariable_DumpsAllFieldsWithoutMutatingState)
 {
     Plugin::CECDeviceParams device;
@@ -3083,9 +3828,6 @@ TEST_F(HdmiCecSinkDsTest, CECDeviceParams_PrintVariable_DumpsAllFieldsWithoutMut
     EXPECT_FALSE(emptyDevice.isAllUpdated());
 }
 
-// Test fixture description: a frame listener forwards every frame it is notified of to its
-// processor, and tears down cleanly when it leaves scope. The observable outcome is the
-// response the processor emits on the connection for the injected <Get CEC Version> request.
 TEST_F(HdmiCecSinkDsTest, HdmiCecSinkFrameListener_ScopedLifetime_DeliversFrameToProcessor)
 {
     int responsesSent = 0;
@@ -3097,7 +3839,6 @@ TEST_F(HdmiCecSinkDsTest, HdmiCecSinkFrameListener_ScopedLifetime_DeliversFrameT
                 EXPECT_EQ(4, to.toInt());
             }));
 
-    // Named cecBus rather than connection so it does not shadow the fixture's JSON-RPC context.
     Connection cecBus;
     Plugin::HdmiCecSinkProcessor processor(cecBus);
 
@@ -3115,17 +3856,14 @@ TEST_F(HdmiCecSinkDsTest, HdmiCecSinkFrameListener_ScopedLifetime_DeliversFrameT
 }
 
 //=============================================================================
-// BCP-47 to ISO 639-2 language mapping (L1 Level)
+// BCP-47 to ISO 639-2 language mapping
 //
-// COVERAGE_GAPS.md traceability: gap-plugin-sink (Sec. 6.2 rank 31, P1).
-//
-// mapToIso639_2 is a pure function on the implementation, so these cases need no mock
-// configuration. They walk the whole decision surface: the empty-input shortcut, the
-// BCP-47 region-suffix strip, the case normalisation, the three-letter passthrough, every
-// entry of the nineteen-entry lookup table, and the "eng" fallback for anything unknown.
+// mapToIso639_2 is a pure function, so these cases need no mock configuration. They walk
+// its whole decision surface: the empty-input shortcut, the BCP-47 region-suffix strip,
+// the case normalisation, the three-letter passthrough, every entry of the lookup table,
+// and the "eng" fallback for anything unknown.
 //=============================================================================
 
-// Test fixture description: an empty language string short-circuits to the English default.
 TEST_F(HdmiCecSinkDsTest, mapToIso639_2_EmptyString_ReturnsEng)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3133,8 +3871,6 @@ TEST_F(HdmiCecSinkDsTest, mapToIso639_2_EmptyString_ReturnsEng)
     EXPECT_EQ(std::string("eng"), Plugin::HdmiCecSinkImplementation::_instance->mapToIso639_2(""));
 }
 
-// Test fixture description: every two-letter code in the lookup table maps to its ISO 639-2
-// three-letter equivalent - the happy path across the full table.
 TEST_F(HdmiCecSinkDsTest, mapToIso639_2_AllKnownTwoLetterCodes_MapToThreeLetterCodes)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3157,8 +3893,6 @@ TEST_F(HdmiCecSinkDsTest, mapToIso639_2_AllKnownTwoLetterCodes_MapToThreeLetterC
     }
 }
 
-// Test fixture description: a BCP-47 region subtag is stripped before the lookup, so the
-// regional variants of a language resolve to the same ISO 639-2 code.
 TEST_F(HdmiCecSinkDsTest, mapToIso639_2_Bcp47RegionSuffix_IsStripped)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3169,8 +3903,6 @@ TEST_F(HdmiCecSinkDsTest, mapToIso639_2_Bcp47RegionSuffix_IsStripped)
     EXPECT_EQ(std::string("zho"), Plugin::HdmiCecSinkImplementation::_instance->mapToIso639_2("zh-Hans-CN"));
 }
 
-// Test fixture description: input is lower-cased before the lookup, so upper- and mixed-case
-// codes resolve identically.
 TEST_F(HdmiCecSinkDsTest, mapToIso639_2_UpperCaseInput_IsNormalised)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3182,8 +3914,6 @@ TEST_F(HdmiCecSinkDsTest, mapToIso639_2_UpperCaseInput_IsNormalised)
     EXPECT_EQ(std::string("eng"), Plugin::HdmiCecSinkImplementation::_instance->mapToIso639_2("ENG"));
 }
 
-// Test fixture description: a value that is already three letters long is passed through
-// untouched, including codes that are absent from the two-letter table.
 TEST_F(HdmiCecSinkDsTest, mapToIso639_2_ThreeLetterCode_PassesThrough)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3193,8 +3923,6 @@ TEST_F(HdmiCecSinkDsTest, mapToIso639_2_ThreeLetterCode_PassesThrough)
     EXPECT_EQ(std::string("fra"), Plugin::HdmiCecSinkImplementation::_instance->mapToIso639_2("fra-CA"));
 }
 
-// Test fixture description: a two-letter code that is not in the table falls back to English
-// rather than being forwarded as an invalid CEC language operand.
 TEST_F(HdmiCecSinkDsTest, mapToIso639_2_UnknownTwoLetterCode_FallsBackToEng)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3204,8 +3932,6 @@ TEST_F(HdmiCecSinkDsTest, mapToIso639_2_UnknownTwoLetterCode_FallsBackToEng)
     EXPECT_EQ(std::string("eng"), Plugin::HdmiCecSinkImplementation::_instance->mapToIso639_2("zz-ZZ"));
 }
 
-// Test fixture description: an over-long primary subtag is neither three letters nor a table
-// key, so it also falls back to English.
 TEST_F(HdmiCecSinkDsTest, mapToIso639_2_LongerThanThreeLetters_FallsBackToEng)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3214,8 +3940,6 @@ TEST_F(HdmiCecSinkDsTest, mapToIso639_2_LongerThanThreeLetters_FallsBackToEng)
     EXPECT_EQ(std::string("eng"), Plugin::HdmiCecSinkImplementation::_instance->mapToIso639_2("english"));
 }
 
-// Test fixture description: a leading separator yields an empty primary subtag, the corner case
-// between the empty-string shortcut and the table lookup.
 TEST_F(HdmiCecSinkDsTest, mapToIso639_2_HyphenOnlyInput_FallsBackToEng)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3225,28 +3949,19 @@ TEST_F(HdmiCecSinkDsTest, mapToIso639_2_HyphenOnlyInput_FallsBackToEng)
 }
 
 //=============================================================================
-// Plugin metadata and lifecycle (L1 Level)
+// Plugin metadata and lifecycle
 //
-// COVERAGE_GAPS.md traceability: gap-plugin-sink (Sec. 6.2 rank 31, P1) and
-// informational getters (Sec. 6.2 rank 40, P2).
-//
-// These close the zero-hit HdmiCecSink::Information() reporter plus the activation and
-// deactivation rejection paths that the happy-path fixture never reaches. Each case that
-// needs a non-TV device profile creates its OWN plugin instance and captures/restores
-// /etc/device.properties, so no shared state is left altered for a sibling test - and the
-// non-TV Initialize returns before any implementation object is created, which is what
-// keeps HdmiCecSinkImplementation::_instance (owned by this fixture) intact.
+// A case that needs a non-TV device profile creates its OWN plugin instance and
+// captures/restores /etc/device.properties, so no shared state is left altered for a
+// sibling test. A non-TV Initialize returns before any implementation object is created,
+// which is what keeps the HdmiCecSinkImplementation::_instance owned by this fixture
+// intact.
 //=============================================================================
 
-// Test fixture description: the plugin's human-readable description is a fixed literal. It is
-// asserted verbatim, including the upstream "PLugin" spelling, because this is a test of what
-// the plugin reports today and correcting production spelling is out of scope here.
 TEST_F(HdmiCecSinkDsTest, Information_ReturnsSinkPluginDescription)
 {
     EXPECT_EQ(string("This HdmiCecSink PLugin Facilitates the HDMI CEC Sink Control"), plugin->Information());
 
-    // Information() is a const reporter: asking twice must give the same answer and must not
-    // disturb the activated plugin.
     EXPECT_EQ(plugin->Information(), plugin->Information());
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getEnabled"), _T("{}"), response));
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
@@ -3254,6 +3969,17 @@ TEST_F(HdmiCecSinkDsTest, Information_ReturnsSinkPluginDescription)
 
 // Test fixture description: activation with a null shell is rejected with a diagnostic message
 // instead of dereferencing the pointer.
+//
+// BUILD-CONFIGURATION DEPENDENCE, recorded deliberately. HdmiCecSink::Initialize reaches its
+// null-shell guard only after `ASSERT(nullptr != service)` (HdmiCecSink.cpp:66). Thunder's ASSERT
+// aborts the process, but only when __DEBUG__ is defined (Thunder/Source/core/Trace.h); without it
+// the macro expands to nothing and control falls through to the `if (nullptr == service)` branch
+// this test asserts on. The L1 recipe defines no -D__DEBUG__ and builds MinSizeRel, so the test is
+// correct as configured - but it would abort rather than fail if this suite were ever built with
+// __DEBUG__ enabled. That is a property of the production guard, not something a test-only change
+// can remove: making the test configuration-independent would need the ASSERT dropped from
+// production code, which is out of scope. Anyone enabling __DEBUG__ for this suite should expect to
+// disable this test.
 TEST_F(HdmiCecSinkDsTest, Initialize_NullShell_ReturnsIShellObjectIsNull)
 {
     Core::ProxyType<Plugin::HdmiCecSink> sparePlugin(Core::ProxyType<Plugin::HdmiCecSink>::Create());
@@ -3267,53 +3993,41 @@ TEST_F(HdmiCecSinkDsTest, Initialize_NullShell_ReturnsIShellObjectIsNull)
     EXPECT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 }
 
-// Test fixture description: the sink plugin is TV-only. On a set-top-box profile both
-// Initialize and Deinitialize must bail out early rather than bring up CEC.
 TEST_F(HdmiCecSinkDsTest, Initialize_NonTvProfile_ReturnsNotSupported)
 {
-    // Capture the process-global device-properties file so the profile change cannot leak into
-    // any sibling test, then restore it before leaving.
-    std::string savedDeviceProperties;
-    {
-        std::ifstream capture("/etc/device.properties");
-        savedDeviceProperties.assign(std::istreambuf_iterator<char>(capture), std::istreambuf_iterator<char>());
-    }
+    // Capture the process-global device-properties file through the scope guard, so the profile
+    // change is undone however this test is left - including if Create() or Initialize() throws,
+    // which would otherwise strand a set-top-box profile on this host for every later case.
+    ScopedDeviceProperties deviceProperties("/etc/device.properties");
+    ASSERT_TRUE(deviceProperties.IsCaptured());
+    const std::string savedDeviceProperties = deviceProperties.Contents();
     ASSERT_NE(std::string::npos, savedDeviceProperties.find("RDK_PROFILE=TV"));
 
-    createFile("/etc/device.properties", "RDK_PROFILE=STB");
+    ASSERT_TRUE(deviceProperties.write("RDK_PROFILE=STB\n"));
 
     Core::ProxyType<Plugin::HdmiCecSink> stbPlugin(Core::ProxyType<Plugin::HdmiCecSink>::Create());
     NiceMock<ServiceMock> stbService;
 
     EXPECT_EQ(string("Not supported"), stbPlugin->Initialize(&stbService));
-    // Deinitialize takes the same profile gate, so it must also be a no-op rather than trying
-    // to tear down a CEC stack that was never started.
     EXPECT_NO_THROW(stbPlugin->Deinitialize(&stbService));
 
     stbPlugin.Release();
 
-    // Restore and prove the restore landed, so ordering with other tests stays irrelevant.
+    // Restore here as well as in the guard, and prove the restore landed: the guard makes
+    // restoration unconditional, and this asserts that the bytes really went back, so ordering
+    // with other tests stays irrelevant.
+    EXPECT_TRUE(deviceProperties.write(savedDeviceProperties));
     {
-        std::ofstream restore("/etc/device.properties");
-        restore << savedDeviceProperties;
+        ScopedDeviceProperties verify("/etc/device.properties");
+        EXPECT_TRUE(verify.IsCaptured());
+        EXPECT_EQ(savedDeviceProperties, verify.Contents());
     }
-    std::string restoredDeviceProperties;
-    {
-        std::ifstream verify("/etc/device.properties");
-        restoredDeviceProperties.assign(std::istreambuf_iterator<char>(verify), std::istreambuf_iterator<char>());
-    }
-    EXPECT_EQ(savedDeviceProperties, restoredDeviceProperties);
 
-    // The activated plugin owned by this fixture is unaffected by the excursion.
     EXPECT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getEnabled"), _T("{}"), response));
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 }
 
-// Test fixture description: deactivation looks up the remote connection inside a try block so
-// that a failure in the COM link cannot escape and abort the shutdown sequence. The lookup is
-// made to throw exactly once; the guarded arm must swallow it and the rest of Deinitialize must
-// still run.
 TEST_F(HdmiCecSinkDsTest, Deinitialize_RemoteConnectionLookupThrows_IsContained)
 {
     // Armed through a shared flag held BY VALUE in the action: this fixture's Deinitialize runs
@@ -3332,70 +4046,83 @@ TEST_F(HdmiCecSinkDsTest, Deinitialize_RemoteConnectionLookupThrows_IsContained)
                 return nullptr;
             }));
 
-    // The plugin is still fully functional at this point; the throwing path is exercised by the
-    // fixture teardown that follows this body.
+    // The plugin is fully functional before the excursion.
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getEnabled"), _T("{}"), response));
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
-    EXPECT_TRUE(*throwOnNextLookup);
+    ASSERT_TRUE(*throwOnNextLookup) << "the throwing action was consumed before the test drove it";
+
+    // Deinitialize is driven HERE rather than being left to the fixture destructor, so that the
+    // guarded arm is what this test observes: leaving it to teardown means the throw happens
+    // after the body has returned and nothing asserts that it happened at all.
+    EXPECT_NO_THROW(plugin->Deinitialize(&service));
+
+    // The lookup threw and Deinitialize swallowed it...
+    EXPECT_FALSE(*throwOnNextLookup) << "IShell::RemoteConnection() was never consulted";
+
+    // ...and the rest of the shutdown sequence still ran: Deinitialize releases the
+    // implementation and calls Exchange::JHdmiCecSink::Unregister(*this), which withdraws the
+    // JSON-RPC methods, so an invocation that succeeded moments ago must now fail.
+    EXPECT_NE(Core::ERROR_NONE, handler.Invoke(connection, _T("getEnabled"), _T("{}"), response))
+        << "the JSON-RPC surface was still registered, so Deinitialize did not complete";
+
+    // The fixture destructor calls Deinitialize once more. That is safe and deliberate: both
+    // guarded blocks test their pointer first, so the second call is a no-op beyond its log line.
 }
 
 //=============================================================================
-// Implementation callbacks, feature-abort reporting and topology maintenance (L1 Level)
+// Implementation callbacks, feature-abort reporting and topology maintenance
 //
-// COVERAGE_GAPS.md traceability: gap-plugin-sink-reportfeatureabort (Sec. 6.2 rank 38, P2),
-// gap-plugin-sink-ondeviceremoved (Sec. 6.2 rank 39, P2) and gap-plugin-sink
-// (Sec. 6.2 rank 31, P1).
-//
-// HdmiCecSinkImplementation exposes _instance, deviceList[] and hdmiInputs publicly, and the
-// repository already drives the implementation through _instance elsewhere in this file, so
-// these cases reuse that seam rather than inventing a new access path. Because the plugin
-// registers its own notification sink during Initialize, the notification fan-out inside each
-// of these functions really executes and delivers the corresponding JSON-RPC event.
+// HdmiCecSinkImplementation exposes _instance, deviceList[] and hdmiInputs publicly, and
+// this file already drives the implementation through _instance elsewhere, so these cases
+// reuse that seam rather than inventing an access path. The plugin registers its own
+// notification sink during Initialize, so the notification fan-out inside each of these
+// functions really executes and delivers the corresponding JSON-RPC event.
 //=============================================================================
 
-// Test fixture description: a presentation-language change is translated to ISO 639-2 and
-// broadcast as <Set Menu Language>. The observable outcome is the CEC frame put on the bus.
 TEST_F(HdmiCecSinkDsTest, onPresentationLanguageChanged_KnownLanguage_BroadcastsMenuLanguage)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    // <Set Menu Language> is a broadcast. The polling thread also broadcasts on this interface,
-    // so the destination is used to select the interesting calls rather than being asserted on
-    // every one of them.
-    int broadcasts = 0;
-    EXPECT_CALL(*p_connectionImplMock, sendTo(::testing::_, ::testing::_, ::testing::_))
-        .WillRepeatedly(::testing::Invoke(
-            [&](const LogicalAddress& to, const CECFrame& frame, int timeout) {
-                if (to.toInt() == LogicalAddress::BROADCAST && timeout > 0) {
-                    broadcasts++;
-                }
-            }));
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // Wait for the polling thread's start-up sweep to finish and then measure a clean window,
+    // so the assertions below describe this call and nothing else. See waitForBusToSettle().
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
+    clearBusRecorder();
 
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->onPresentationLanguageChanged("fr-FR"));
 
     // The BCP-47 tag is normalised to its ISO 639-2 form and recorded against the TV's own entry.
+    // That entry is the operand source: sendMenuLanguage() reads
+    // deviceList[m_logicalAddressAllocated].m_currentLanguage and encodes exactly it.
     EXPECT_EQ(Language("fra").toString(),
         Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_currentLanguage.toString());
-    EXPECT_GT(broadcasts, 0);
+
+    // Exactly one send, and it is the <Set Menu Language> broadcast: destination BROADCAST with
+    // the plugin's documented 100 ms transmit budget, carrying the payload produced by the one
+    // encode() call this operation performed.
+    const std::vector<SentMessage> sent = recordedMessages();
+    ASSERT_EQ(1u, sent.size()) << "expected exactly one CEC send for one language change";
+    EXPECT_EQ(static_cast<int>(LogicalAddress::BROADCAST), sent[0].to);
+    EXPECT_EQ(100, sent[0].timeout);
+    EXPECT_EQ(1u, recordedEncodeCalls());
+    EXPECT_EQ(1u, sent[0].encodeSerial) << "the broadcast did not carry the freshly encoded frame";
 }
 
-// Test fixture description: an unrecognised BCP-47 tag still produces a well-formed broadcast,
-// because the mapping falls back to English rather than emitting an invalid operand.
 TEST_F(HdmiCecSinkDsTest, onPresentationLanguageChanged_UnknownLanguage_StillBroadcasts)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    int broadcasts = 0;
-    EXPECT_CALL(*p_connectionImplMock, sendTo(::testing::_, ::testing::_, ::testing::_))
-        .WillRepeatedly(::testing::Invoke(
-            [&](const LogicalAddress& to, const CECFrame& frame, int timeout) {
-                if (to.toInt() == LogicalAddress::BROADCAST) {
-                    broadcasts++;
-                }
-            }));
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
+    clearBusRecorder();
 
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->onPresentationLanguageChanged("zz-ZZ"));
-    // Both the unknown two-letter code and the empty tag land on the English fallback.
     EXPECT_EQ(Language("eng").toString(),
         Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_currentLanguage.toString());
 
@@ -3403,14 +4130,29 @@ TEST_F(HdmiCecSinkDsTest, onPresentationLanguageChanged_UnknownLanguage_StillBro
     EXPECT_EQ(Language("eng").toString(),
         Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_currentLanguage.toString());
 
-    EXPECT_GT(broadcasts, 0);
+    // One <Set Menu Language> broadcast per change, each with the documented 100 ms budget and
+    // each carrying its own freshly encoded payload - an unrecognised tag must still produce a
+    // well-formed message rather than being dropped or sent twice.
+    const std::vector<SentMessage> sent = recordedMessages();
+    ASSERT_EQ(2u, sent.size()) << "expected exactly one CEC send per language change";
+    EXPECT_EQ(2u, recordedEncodeCalls());
+    for (size_t index = 0; index < sent.size(); ++index) {
+        EXPECT_EQ(static_cast<int>(LogicalAddress::BROADCAST), sent[index].to) << "send " << index;
+        EXPECT_EQ(100, sent[index].timeout) << "send " << index;
+        EXPECT_EQ(static_cast<uint32_t>(index + 1), sent[index].encodeSerial) << "send " << index;
+    }
 }
 
-// Test fixture description: a transition to the powered-on state records ON against the TV's own
-// device entry and leaves the active source alone.
 TEST_F(HdmiCecSinkDsTest, onPowerModeChanged_ToPowerStateOn_RecordsPoweredOnStatus)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
 
     Plugin::HdmiCecSinkImplementation::_instance->m_currentActiveSource = 4;
 
@@ -3418,17 +4160,24 @@ TEST_F(HdmiCecSinkDsTest, onPowerModeChanged_ToPowerStateOn_RecordsPoweredOnStat
         WPEFramework::Exchange::IPowerManager::POWER_STATE_STANDBY,
         WPEFramework::Exchange::IPowerManager::POWER_STATE_ON));
 
-    // The TV allocates logical address 0, so its own entry carries the new power status.
     EXPECT_EQ(PowerStatus::ON, Plugin::HdmiCecSinkImplementation::_instance->deviceList[0].m_powerStatus.toInt());
-    // Powering on must not clear the current active source.
     EXPECT_EQ(4, Plugin::HdmiCecSinkImplementation::_instance->m_currentActiveSource);
 }
 
-// Test fixture description: a transition away from the powered-on state records standby and
-// resets the active source, so a stale source is not reported after the TV goes to standby.
 TEST_F(HdmiCecSinkDsTest, onPowerModeChanged_ToStandby_ResetsActiveSource)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
 
     Plugin::HdmiCecSinkImplementation::_instance->m_currentActiveSource = 4;
 
@@ -3443,12 +4192,10 @@ TEST_F(HdmiCecSinkDsTest, onPowerModeChanged_ToStandby_ResetsActiveSource)
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->onPowerModeChanged(
         WPEFramework::Exchange::IPowerManager::POWER_STATE_STANDBY,
         WPEFramework::Exchange::IPowerManager::POWER_STATE_ON));
+
+    DisableCec();
 }
 
-// Test fixture description: every CEC abort reason must be reported to registered clients. The
-// plugin's own notification sink is registered during activation, so the fan-out really runs and
-// the delivered JSON-RPC event is what closes gap-plugin-sink-reportfeatureabort.
-//
 // NOTE on the AbortReason operand: the shared CEC mock declares a public `impl` delegate on
 // AbortReason and its int constructor is the only one in that header that does NOT initialise it
 // (SystemAudioStatus and AudioStatus both do). AbortReason::toInt() dereferences `impl` whenever
@@ -3459,16 +4206,47 @@ TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_EachAbortReason_IsNotified)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
+    // The notification each call produces is what this test is about, so the JSON-RPC event is
+    // captured and asserted per reason. Asserting only that the call did not throw, or that an
+    // operand still reads back its own value, would pass even if the fan-out never happened.
+    string notified;
+    ON_CALL(service, Submit(::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+                string text;
+                json->ToString(text);
+                notified += text;
+                return Core::ERROR_NONE;
+            }));
+
+    EVENT_SUBSCRIBE(0, _T("reportFeatureAbortEvent"), _T("client.events.reportFeatureAbortEvent"), message);
+
     // The five reasons defined by CEC: unrecognised opcode, not in correct mode, cannot provide
     // source, invalid operand and refused.
     for (int reason = 0; reason <= 4; reason++) {
+        notified.clear();
+
+        // The shared CEC mock's AbortReason(int) constructor is the only one in that header
+        // which leaves its public `impl` delegate uninitialised, and AbortReason::toInt()
+        // dereferences it when non-null. The mock library is out of scope for edits, so the
+        // delegate is cleared here instead.
         AbortReason abortReason(reason);
         abortReason.impl = nullptr;
         EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->reportFeatureAbortEvent(
             LogicalAddress(4), OpCode(GET_CEC_VERSION), abortReason))
             << "abort reason " << reason << " was not reported cleanly";
-        EXPECT_EQ(reason, abortReason.toInt());
+
+        EXPECT_THAT(notified, ::testing::HasSubstr("reportFeatureAbortEvent"))
+            << "abort reason " << reason << " produced no client notification";
+        EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":4"))
+            << "abort reason " << reason;
+        EXPECT_THAT(notified, ::testing::HasSubstr(
+            "\"opcode\":" + std::to_string(static_cast<int>(GET_CEC_VERSION)))) << "abort reason " << reason;
+        EXPECT_THAT(notified, ::testing::HasSubstr(
+            "\"FeatureAbortReason\":" + std::to_string(reason))) << "abort reason " << reason;
     }
+
+    EVENT_UNSUBSCRIBE(0, _T("reportFeatureAbortEvent"), _T("client.events.reportFeatureAbortEvent"), message);
 
     // Reporting is a pure notification: the device table must be untouched by it.
     EXPECT_FALSE(Plugin::HdmiCecSinkImplementation::_instance->deviceList[4].m_isDeviceDisconnected);
@@ -3476,64 +4254,89 @@ TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_EachAbortReason_IsNotified)
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 }
 
-// Test fixture description: feature-abort reporting at the logical-address and opcode boundaries
-// - the TV's own address, the unregistered/broadcast address, and the lowest and highest opcode
-// values in play.
 TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_BoundaryOperands_AreNotified)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    AbortReason unrecognisedOpcode(AbortReason::UNRECOGNIZED_OPCODE);
-    unrecognisedOpcode.impl = nullptr;
-    EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->reportFeatureAbortEvent(
-        LogicalAddress(LogicalAddress::TV), OpCode(FEATURE_ABORT), unrecognisedOpcode));
+    string notified;
+    ON_CALL(service, Submit(::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+                string text;
+                json->ToString(text);
+                notified += text;
+                return Core::ERROR_NONE;
+            }));
 
-    AbortReason refused(4);
-    refused.impl = nullptr;
-    EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->reportFeatureAbortEvent(
-        LogicalAddress(LogicalAddress::UNREGISTERED), OpCode(ABORT), refused));
+    EVENT_SUBSCRIBE(0, _T("reportFeatureAbortEvent"), _T("client.events.reportFeatureAbortEvent"), message);
 
-    AbortReason notInCorrectMode(1);
-    notInCorrectMode.impl = nullptr;
-    EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->reportFeatureAbortEvent(
-        LogicalAddress(LogicalAddress::AUDIO_SYSTEM), OpCode(INITIATE_ARC), notInCorrectMode));
+    // Each boundary is asserted on the delivered payload, address by address and opcode by
+    // opcode, so a report that silently addressed the wrong device or lost its reason fails.
+    struct Boundary {
+        int logicalAddress;
+        int opcode;
+        int reason;
+        const char* description;
+    };
+    const Boundary boundaries[] = {
+        { LogicalAddress::TV,           FEATURE_ABORT, AbortReason::UNRECOGNIZED_OPCODE, "the TV's own address" },
+        { LogicalAddress::UNREGISTERED, ABORT,         4,                                "the unregistered address" },
+        { LogicalAddress::AUDIO_SYSTEM, INITIATE_ARC,  1,                                "the audio system" },
+    };
 
-    EXPECT_EQ(0, unrecognisedOpcode.toInt());
-    EXPECT_EQ(4, refused.toInt());
-    EXPECT_EQ(1, notInCorrectMode.toInt());
+    for (const Boundary& boundary : boundaries) {
+        notified.clear();
+
+        AbortReason abortReason(boundary.reason);
+        abortReason.impl = nullptr;
+        EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->reportFeatureAbortEvent(
+            LogicalAddress(boundary.logicalAddress), OpCode(boundary.opcode), abortReason))
+            << boundary.description;
+
+        EXPECT_THAT(notified, ::testing::HasSubstr("reportFeatureAbortEvent")) << boundary.description;
+        EXPECT_THAT(notified, ::testing::HasSubstr(
+            "\"logicalAddress\":" + std::to_string(boundary.logicalAddress))) << boundary.description;
+        EXPECT_THAT(notified, ::testing::HasSubstr(
+            "\"opcode\":" + std::to_string(boundary.opcode))) << boundary.description;
+        EXPECT_THAT(notified, ::testing::HasSubstr(
+            "\"FeatureAbortReason\":" + std::to_string(boundary.reason))) << boundary.description;
+    }
+
+    EVENT_UNSUBSCRIBE(0, _T("reportFeatureAbortEvent"), _T("client.events.reportFeatureAbortEvent"), message);
+
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getEnabled"), _T("{}"), response));
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 }
 
-// Test fixture description: the sink also has to be able to SEND a feature abort on the bus, not
-// just report one to clients. The observable outcome is the directed CEC frame handed to the
-// connection for the aborting device.
 TEST_F(HdmiCecSinkDsTest, sendFeatureAbort_DirectedToInitiator_IsPutOnTheBus)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    // The plugin's polling thread broadcasts its own physical address on the same interface, so
-    // the capture has to discriminate: a feature abort is the directed send to the aborting
-    // device carrying the plugin's 500 ms transmit budget.
-    int abortsSent = 0;
-    EXPECT_CALL(*p_connectionImplMock, sendTo(::testing::_, ::testing::_, ::testing::_))
-        .WillRepeatedly(::testing::Invoke(
-            [&](const LogicalAddress& to, const CECFrame& frame, int timeout) {
-                if (to.toInt() == 4 && timeout == 500) {
-                    abortsSent++;
-                }
-            }));
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // Measured on a settled bus through the fixture recorder, so the assertion describes this
+    // send alone and no expectation is installed while the polling thread is running.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
+    clearBusRecorder();
 
     AbortReason unrecognisedOpcode(AbortReason::UNRECOGNIZED_OPCODE);
     unrecognisedOpcode.impl = nullptr;
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->sendFeatureAbort(
         LogicalAddress(4), OpCode(GET_CEC_VERSION), unrecognisedOpcode));
 
-    EXPECT_EQ(1, abortsSent);
+    // A feature abort is directed at the aborting device - never broadcast - and carries the
+    // plugin's 500 ms transmit budget, which distinguishes it from every other send this
+    // implementation makes.
+    const std::vector<SentMessage> sent = recordedMessages();
+    ASSERT_EQ(1u, sent.size()) << "expected exactly one CEC send for one feature abort";
+    EXPECT_EQ(4, sent[0].to);
+    EXPECT_EQ(500, sent[0].timeout);
+    EXPECT_EQ(1u, recordedEncodeCalls());
+    EXPECT_EQ(1u, sent[0].encodeSerial) << "the abort did not carry the freshly encoded frame";
 }
 
-// Test fixture description: route resolution refuses an unregistered logical address rather than
-// returning a route for a device that cannot exist.
 TEST_F(HdmiCecSinkDsTest, getActiveRoute_UnregisteredLogicalAddress_LeavesRouteEmpty)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -3545,11 +4348,16 @@ TEST_F(HdmiCecSinkDsTest, getActiveRoute_UnregisteredLogicalAddress_LeavesRouteE
     EXPECT_TRUE(route.empty());
 }
 
-// Test fixture description: route resolution for a device that is not present, or that is
-// present but is not the active source, leaves the route untouched.
 TEST_F(HdmiCecSinkDsTest, getActiveRoute_DeviceNotActiveSource_LeavesRouteEmpty)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
 
     Plugin::HdmiCecSinkImplementation::_instance->deviceList[6].clear();
 
@@ -3557,7 +4365,6 @@ TEST_F(HdmiCecSinkDsTest, getActiveRoute_DeviceNotActiveSource_LeavesRouteEmpty)
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->getActiveRoute(LogicalAddress(6), route));
     EXPECT_TRUE(route.empty());
 
-    // Present, but not flagged as the active source: still no route.
     Plugin::HdmiCecSinkImplementation::_instance->deviceList[6].m_isDevicePresent = true;
     Plugin::HdmiCecSinkImplementation::_instance->deviceList[6].m_isActiveSource = false;
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->getActiveRoute(LogicalAddress(6), route));
@@ -3566,13 +4373,21 @@ TEST_F(HdmiCecSinkDsTest, getActiveRoute_DeviceNotActiveSource_LeavesRouteEmpty)
     Plugin::HdmiCecSinkImplementation::_instance->deviceList[6].clear();
 }
 
-// Test fixture description: route resolution happy path. A present active source whose physical
-// address maps onto a known HDMI port yields the chain of logical addresses leading to it,
-// ending with the port's own address.
 TEST_F(HdmiCecSinkDsTest, getActiveRoute_ActiveSourceOnKnownPort_ResolvesRoute)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
     ASSERT_GE(Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs.size(), 2u);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     // Port index 1 owns physical address 2.0.0.0, so a device at 2.1.0.0 hangs off it.
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].update(LogicalAddress(4));
@@ -3594,14 +4409,25 @@ TEST_F(HdmiCecSinkDsTest, getActiveRoute_ActiveSourceOnKnownPort_ResolvesRoute)
     Plugin::HdmiCecSinkImplementation::_instance->deviceList[6].clear();
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].removeChild(sourceAddress);
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].update(LogicalAddress(LogicalAddress::UNREGISTERED));
+
+    DisableCec();
 }
 
-// Test fixture description: the getActiveRoute JSON-RPC method reports the resolved HDMI route
-// for the current active source, formatted as the chain of devices and the terminating port.
 TEST_F(HdmiCecSinkDsTest, getActiveRoute_ActiveSourceOnKnownPort_ReportedOverJsonRpc)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
     ASSERT_GE(Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs.size(), 2u);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].update(LogicalAddress(4));
     PhysicalAddress sourceAddress(2, 1, 0, 0);
@@ -3626,13 +4452,24 @@ TEST_F(HdmiCecSinkDsTest, getActiveRoute_ActiveSourceOnKnownPort_ReportedOverJso
     Plugin::HdmiCecSinkImplementation::_instance->deviceList[4].clear();
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].removeChild(sourceAddress);
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].update(LogicalAddress(LogicalAddress::UNREGISTERED));
+
+    DisableCec();
 }
 
-// Test fixture description: when the TV itself is the active source the route degenerates to
-// "TV" - the boundary case where the active source equals the locally allocated address.
 TEST_F(HdmiCecSinkDsTest, getActiveRoute_TvIsActiveSource_ReportsTvOverJsonRpc)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
 
     // Logical address 0 is what the TV allocates for itself.
     Plugin::HdmiCecSinkImplementation::_instance->m_currentActiveSource = LogicalAddress::TV;
@@ -3643,13 +4480,20 @@ TEST_F(HdmiCecSinkDsTest, getActiveRoute_TvIsActiveSource_ReportsTvOverJsonRpc)
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 
     Plugin::HdmiCecSinkImplementation::_instance->m_currentActiveSource = -1;
+
+    DisableCec();
 }
 
-// Test fixture description: with no active source at all the method reports unavailability
-// rather than an empty or malformed route.
 TEST_F(HdmiCecSinkDsTest, getActiveRoute_NoActiveSource_ReportsUnavailableOverJsonRpc)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
 
     Plugin::HdmiCecSinkImplementation::_instance->m_currentActiveSource = -1;
 
@@ -3658,12 +4502,13 @@ TEST_F(HdmiCecSinkDsTest, getActiveRoute_NoActiveSource_ReportsUnavailableOverJs
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 }
 
-// Test fixture description: the device list reports each present peer with its learned
-// attributes, and marks the HDMI port a connected peer was found on.
 TEST_F(HdmiCecSinkDsTest, getDeviceList_WithPresentDevices_ReportsLearnedAttributes)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
     ASSERT_GE(Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs.size(), 2u);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].update(true);
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].update(LogicalAddress(6));
@@ -3687,11 +4532,12 @@ TEST_F(HdmiCecSinkDsTest, getDeviceList_WithPresentDevices_ReportsLearnedAttribu
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].update(LogicalAddress(LogicalAddress::UNREGISTERED));
 }
 
-// Test fixture description: the active-source getter reports the peer's attributes and derives
-// the HDMI port label from the first byte of its physical address.
 TEST_F(HdmiCecSinkDsTest, getActiveSource_PresentActiveDevice_ReportsAttributesAndPort)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     Plugin::CECDeviceParams& peer = Plugin::HdmiCecSinkImplementation::_instance->deviceList[6];
     peer.m_isDevicePresent = true;
@@ -3724,11 +4570,12 @@ TEST_F(HdmiCecSinkDsTest, getActiveSource_PresentActiveDevice_ReportsAttributesA
     ownEntry.clear();
 }
 
-// Test fixture description: the diagnostic device dump walks every present entry, which is what
-// drives CECDeviceParams::printVariable through the live device table.
 TEST_F(HdmiCecSinkDsTest, printDeviceList_WithPresentDevices_DumpsEachEntry)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     Plugin::CECDeviceParams& first = Plugin::HdmiCecSinkImplementation::_instance->deviceList[4];
     Plugin::CECDeviceParams& second = Plugin::HdmiCecSinkImplementation::_instance->deviceList[5];
@@ -3745,7 +4592,6 @@ TEST_F(HdmiCecSinkDsTest, printDeviceList_WithPresentDevices_DumpsEachEntry)
     EXPECT_THAT(response, ::testing::ContainsRegex("\"printed\":true"));
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 
-    // Dumping is read-only: the entries survive it unchanged.
     EXPECT_TRUE(first.m_isDevicePresent);
     EXPECT_EQ(std::string("DUMPFOUR"), first.m_osdName.toString());
     EXPECT_TRUE(second.m_isDevicePresent);
@@ -3754,13 +4600,35 @@ TEST_F(HdmiCecSinkDsTest, printDeviceList_WithPresentDevices_DumpsEachEntry)
     second.clear();
 }
 
-// Test fixture description: removing a present device clears its entry, unhooks it from the HDMI
-// port's device chain and notifies clients - the path that closes
-// gap-plugin-sink-ondeviceremoved on the production side.
 TEST_F(HdmiCecSinkDsTest, removeDevice_PresentDevice_ClearsEntryAndNotifies)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
     ASSERT_GE(Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs.size(), 2u);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // Take the peer off the bus for this test. pingDevices() calls Connection::ping(), which the
+    // fixture leaves at the NiceMock default - it returns without throwing, the implementation
+    // reads that as an ACK, and the polling thread calls addDevice() and sets m_isDevicePresent on
+    // every non-TV address over a ~700 ms sweep. The assertion below is that the entry is NOT
+    // present, so without this stub it is a race against that sweep that merely usually wins.
+    // Throwing CECNoAckException makes "absent" the only state the polling thread can produce.
+    ON_CALL(*p_connectionImplMock, ping(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [](const LogicalAddress&, const LogicalAddress&, const Throw_e&) {
+                throw CECNoAckException();
+            }));
+
+    EnableCec();
 
     PhysicalAddress peerAddress(2, 1, 0, 0);
     Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].update(LogicalAddress(4));
@@ -3786,18 +4654,39 @@ TEST_F(HdmiCecSinkDsTest, removeDevice_PresentDevice_ClearsEntryAndNotifies)
     EXPECT_EQ(0, peer.m_isRequestRetry);
     EXPECT_FALSE(peer.m_isActiveSource);
     EXPECT_FALSE(peer.isAllUpdated());
-    // The HDMI port it hung off is unhooked and de-registered.
     EXPECT_EQ(LogicalAddress::UNREGISTERED,
         static_cast<int>(Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].m_deviceChain[0].m_childsLogicalAddr[0]));
     EXPECT_EQ(LogicalAddress::UNREGISTERED,
         Plugin::HdmiCecSinkImplementation::_instance->hdmiInputs[1].m_logicalAddr.toInt());
+
+    DisableCec();
 }
 
-// Test fixture description: removing the audio system additionally tears down the audio-status
-// tracking state and reports the audio device as disconnected.
 TEST_F(HdmiCecSinkDsTest, removeDevice_AudioSystemAddress_ResetsAudioState)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
+
+    // Same ping() stub and the same reason as removeDevice_PresentDevice_ClearsEntryAndNotifies:
+    // the assertions below are that the entry is absent, so the polling thread must not be able to
+    // mark it present behind them.
+    ON_CALL(*p_connectionImplMock, ping(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [](const LogicalAddress&, const LogicalAddress&, const Throw_e&) {
+                throw CECNoAckException();
+            }));
+
+    EnableCec();
 
     Plugin::CECDeviceParams& audioSystem = Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::AUDIO_SYSTEM];
     audioSystem.m_isDevicePresent = true;
@@ -3813,17 +4702,32 @@ TEST_F(HdmiCecSinkDsTest, removeDevice_AudioSystemAddress_ResetsAudioState)
     EXPECT_EQ(std::string("ffff"), audioSystem.m_physicalAddr.toString());
     EXPECT_EQ(std::string(""), audioSystem.m_osdName.toString());
 
-    // The audio-device connection state is reported as disconnected once the peer is gone.
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getAudioDeviceConnectedStatus"), _T("{}"), response));
     EXPECT_THAT(response, ::testing::ContainsRegex("\"connected\":false"));
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
+
+    DisableCec();
 }
 
-// Test fixture description: removal short-circuits for a device that was never present, so the
-// entry is left exactly as it was rather than being cleared a second time.
 TEST_F(HdmiCecSinkDsTest, removeDevice_DeviceNotPresent_IsNoOp)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
+
+    // Same ping() stub and the same reason as removeDevice_PresentDevice_ClearsEntryAndNotifies:
+    // the assertions below are that the entry is absent, so the polling thread must not be able to
+    // mark it present behind them.
+    ON_CALL(*p_connectionImplMock, ping(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [](const LogicalAddress&, const LogicalAddress&, const Throw_e&) {
+                throw CECNoAckException();
+            }));
 
     Plugin::CECDeviceParams& absent = Plugin::HdmiCecSinkImplementation::_instance->deviceList[6];
     absent.clear();
@@ -3839,11 +4743,31 @@ TEST_F(HdmiCecSinkDsTest, removeDevice_DeviceNotPresent_IsNoOp)
     EXPECT_TRUE(absent.m_isOSDNameUpdated);
 }
 
-// Test fixture description: removal at both ends of the logical-address range must be handled
-// without indexing outside the sixteen-entry device table.
 TEST_F(HdmiCecSinkDsTest, removeDevice_BoundaryLogicalAddresses_AreHandled)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // The polling thread writes deviceList[], hdmiInputs[] and m_numberOfDevices too, so its
+    // start-up sweep has to be finished before this test manipulates that state.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
+
+    // Same ping() stub and the same reason as removeDevice_PresentDevice_ClearsEntryAndNotifies:
+    // the assertions below are that the entry is absent, so the polling thread must not be able to
+    // mark it present behind them.
+    ON_CALL(*p_connectionImplMock, ping(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [](const LogicalAddress&, const LogicalAddress&, const Throw_e&) {
+                throw CECNoAckException();
+            }));
+
+    EnableCec();
 
     // Minimum address: the TV's own entry. Its presence flag and identity fields are owned by the
     // plugin's polling thread, so the removal is observed through m_isActiveSource, which nothing
@@ -3863,45 +4787,67 @@ TEST_F(HdmiCecSinkDsTest, removeDevice_BoundaryLogicalAddresses_AreHandled)
     EXPECT_FALSE(phantom.m_isDevicePresent);
     EXPECT_EQ(std::string(""), phantom.m_osdName.toString());
     EXPECT_FALSE(phantom.m_isOSDNameUpdated);
+
+    DisableCec();
 }
 
 //=============================================================================
-// Inbound CEC frame injection (L1 Level)
+// Inbound CEC frame injection
 //
-// Frame byte convention, verified against MessageDecoder: byte0's HIGH nibble is the initiator
-// and its LOW nibble the destination, so 0x40 is "from Playback Device 1 (LA=4) to the TV (LA=0)"
-// and 0x4F is "from Playback Device 1 (LA=4) to broadcast (LA=15)". byte1 is the opcode, and the
-// decoder returns early for any frame shorter than two bytes.
+// Frame byte convention: byte0's HIGH nibble is the initiator and its LOW nibble the
+// destination, so 0x40 is "from Playback Device 1 (LA=4) to the TV (LA=0)" and 0x4F is
+// "from Playback Device 1 (LA=4) to broadcast (LA=15)". byte1 is the opcode.
 //
-// These cases build their own HdmiCecSinkFrameListener over a HdmiCecSinkProcessor instead of
-// waiting for the one the plugin registers. That is deliberate and was established by measurement:
-// HdmiCecSinkImplementation calls Connection::addFrameListener from exactly one place - the poll
-// thread's POLL state - so the fixture's `listeners` vector is genuinely empty for a short while
-// after construction, which is why every pre-existing frame test opens with a 100 ms sleep.
-// HdmiCecSinkFrameListener::notify() runs MessageDecoder(processor).decode(in) inline, so driving
-// it directly reaches exactly the same handlers with no wall-clock wait and no new test construct -
-// the listener and the processor are both public production classes.
+// The decoder these cases drive is the test framework's CEC mock
+// (entservices-testframework/Tests/mocks/HdmiCec.cpp, MessageDecoder::decode), NOT the
+// hdmicec middleware decoder, because the plugin build force-includes the mock CEC header
+// and the ccec headers on the include path are empty stubs. Two of its rules matter here:
+// it returns early for any frame shorter than two bytes, and it maps opcode byte 0x13 to
+// <Polling>. 0x13 is not a real CEC opcode - the mock uses it as the polling stand-in
+// because a real polling message carries no opcode byte at all.
+//
+// These cases build their own HdmiCecSinkFrameListener over a HdmiCecSinkProcessor rather
+// than waiting for the one the plugin registers. HdmiCecSinkImplementation calls
+// Connection::addFrameListener from exactly one place - the poll thread's POLL state - so
+// the fixture's `listeners` vector is genuinely empty for a short while after
+// construction, which is why every pre-existing frame test opens with a 100 ms sleep.
+// HdmiCecSinkFrameListener::notify() runs MessageDecoder(processor).decode(in) inline, so
+// driving it directly reaches the same handlers with no wall-clock wait and no new test
+// construct: the listener and the processor are both public production classes.
 //=============================================================================
 
-// Test fixture description: <Polling> is the CEC presence probe and the only opcode the sink
-// dispatches with no operand at all. Directed delivery must be accepted without disturbing the
-// device table the poll thread maintains.
+// Test fixture description: <Polling> is the CEC presence probe and it is the ONE message with no
+// opcode byte at all - a poll is a bare header. MessageDecoder::decode dispatches Polling() on
+// exactly the condition `in_.length() == 1` and returns immediately, before it ever reads an
+// opcode; the POLLING value in OpCode.hpp is the synthetic 0x200 and never appears on the wire.
+// A directed poll is therefore the single byte 0x40 - initiator 4 in the high nibble, destination
+// 0 in the low one. Directed delivery must be accepted without disturbing the device table the
+// poll thread maintains.
 // Covers HdmiCecSinkProcessor::process(const Polling&, const Header&).
 TEST_F(HdmiCecSinkFrameProcessingTest, InjectPollingFrame_Directed_IsProcessed)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     Plugin::CECDeviceParams& initiator = Plugin::HdmiCecSinkImplementation::_instance->deviceList[4];
     initiator.update(OSDName("PLAYBACK1"));
 
     Connection cecBus;
     Plugin::HdmiCecSinkProcessor processor(cecBus);
-    Plugin::HdmiCecSinkFrameListener listener(processor);
 
-    // From Playback Device 1 (LA=4) to the TV (LA=0); 0x13 is <Polling>.
-    const uint8_t pollingDirected[] = { 0x40, 0x13 };
-    CECFrame frame(pollingDirected, sizeof(pollingDirected));
-    EXPECT_NO_THROW(listener.notify(frame));
+    // The Polling overload is invoked directly rather than through a frame carrying opcode 0x13.
+    // 0x13 is not the CEC <Polling> encoding: a real polling message is a header with no data
+    // block at all, and it is only the shared test decoder (entservices-testframework
+    // Tests/mocks/HdmiCec.cpp, "not a real opcode, but for completeness") that maps 0x13 onto
+    // Polling. The middleware decoder instead dispatches a length-1 frame as Polling and has no
+    // 0x13 case, so asserting through 0x13 would assert a property of the mock rather than of
+    // the sink. Both classes here are public production types, so no new construct is needed.
+    Header directedFromPlaybackDevice;
+    directedFromPlaybackDevice.from = LogicalAddress(4);
+    directedFromPlaybackDevice.to = LogicalAddress(LogicalAddress::TV);
+    EXPECT_NO_THROW(processor.process(Polling(), directedFromPlaybackDevice));
 
     // <Polling> carries no operand, so the initiator's learned attributes must be untouched and
     // the plugin must remain able to answer for its device table.
@@ -3910,32 +4856,80 @@ TEST_F(HdmiCecSinkFrameProcessingTest, InjectPollingFrame_Directed_IsProcessed)
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 }
 
-// Test fixture description: a broadcast <Polling> reaches the same handler - the sink must not
-// mistake the broadcast destination for a malformed frame.
+// Test fixture description: a broadcast <Polling> reaches the same handler - the length test in
+// the decoder is the only gate, so the broadcast destination in the header's low nibble must not
+// be mistaken for a malformed frame.
 TEST_F(HdmiCecSinkFrameProcessingTest, InjectPollingFrame_Broadcast_IsProcessed)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     Plugin::CECDeviceParams& initiator = Plugin::HdmiCecSinkImplementation::_instance->deviceList[4];
     initiator.update(OSDName("BROADCASTER"));
 
     Connection cecBus;
     Plugin::HdmiCecSinkProcessor processor(cecBus);
-    Plugin::HdmiCecSinkFrameListener listener(processor);
 
-    // From Playback Device 1 (LA=4) to broadcast (LA=15); 0x13 is <Polling>.
-    const uint8_t pollingBroadcast[] = { 0x4F, 0x13 };
-    CECFrame frame(pollingBroadcast, sizeof(pollingBroadcast));
-    EXPECT_NO_THROW(listener.notify(frame));
+    // Broadcast <Polling>, driven through the same production overload and for the same reason
+    // as the directed case above.
+    Header broadcastFromPlaybackDevice;
+    broadcastFromPlaybackDevice.from = LogicalAddress(4);
+    broadcastFromPlaybackDevice.to = LogicalAddress(LogicalAddress::BROADCAST);
+    EXPECT_NO_THROW(processor.process(Polling(), broadcastFromPlaybackDevice));
 
     EXPECT_EQ(std::string("BROADCASTER"), initiator.m_osdName.toString());
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getDeviceList"), _T("{}"), response));
     EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
 }
 
-// Test fixture description: corner case - a header with no opcode byte is below the decoder's
-// minimum frame length and must be dropped rather than dispatched as opcode zero.
-TEST_F(HdmiCecSinkFrameProcessingTest, InjectHeaderOnlyFrame_IsDroppedByDecoder)
+// Test fixture description: corner case - a frame carrying only a header and no opcode byte must
+// never have an operand applied to the initiator's entry.
+//
+// The two decoders in play disagree about what such a frame IS, and this test deliberately
+// asserts only what both of them guarantee. The shared test decoder
+// (entservices-testframework Tests/mocks/HdmiCec.cpp) returns early below two bytes and drops
+// it; the middleware decoder (hdmicec/ccec/src/MessageDecoder.cpp) dispatches a length-1 frame
+// as <Polling>, whose handler only logs. Either way no operand is decoded, which is the property
+// asserted below - so this case stays true whichever decoder the suite is linked against.
+TEST_F(HdmiCecSinkFrameProcessingTest, InjectHeaderOnlyFrame_AppliesNoOperand)
+{
+    ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    Plugin::CECDeviceParams& initiator = Plugin::HdmiCecSinkImplementation::_instance->deviceList[4];
+    initiator.update(OSDName("UNTOUCHED"));
+    initiator.update(PhysicalAddress(2, 0, 0, 0));
+
+    Connection cecBus;
+    Plugin::HdmiCecSinkProcessor processor(cecBus);
+    Plugin::HdmiCecSinkFrameListener listener(processor);
+
+    // From Playback Device 1 (LA=4) to the TV (LA=0), header only - no opcode byte at all.
+    const uint8_t headerOnly[] = { 0x40 };
+    CECFrame frame(headerOnly, sizeof(headerOnly));
+    EXPECT_NO_THROW(listener.notify(frame));
+
+    // Whether the frame was dropped or dispatched as operand-less <Polling>, the initiator's
+    // learned attributes must be exactly as they were.
+    EXPECT_EQ(std::string("UNTOUCHED"), initiator.m_osdName.toString());
+    EXPECT_EQ(PhysicalAddress(2, 0, 0, 0).toString(), initiator.m_physicalAddr.toString());
+}
+
+// Test fixture description: corner case - a two-byte frame whose opcode this stack does not
+// decode must leave every learned attribute of the initiator exactly as it was.
+//
+// 0x13 is that value, and the two decoders in play treat it differently: the shared test decoder
+// (entservices-testframework Tests/mocks/HdmiCec.cpp) carries a "not a real opcode, but for
+// completeness" case that dispatches it as operand-less <Polling>, while the middleware decoder
+// (hdmicec/ccec/src/MessageDecoder.cpp) has no 0x13 case and falls into its default arm, which
+// only logs. Neither route decodes an operand, which is the property asserted below, so this case
+// holds whichever decoder the suite is linked against. Together with the header-only case above
+// it pins both sides of the decoder's length contract.
+TEST_F(HdmiCecSinkFrameProcessingTest, InjectUnhandledOpcodeFrame_AppliesNoOperand)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
@@ -3947,20 +4941,21 @@ TEST_F(HdmiCecSinkFrameProcessingTest, InjectHeaderOnlyFrame_IsDroppedByDecoder)
     Plugin::HdmiCecSinkProcessor processor(cecBus);
     Plugin::HdmiCecSinkFrameListener listener(processor);
 
-    const uint8_t headerOnly[] = { 0x40 };
-    CECFrame frame(headerOnly, sizeof(headerOnly));
+    // From Playback Device 1 (LA=4) to the TV (LA=0); 0x13 is not an opcode this stack decodes.
+    const uint8_t unhandledOpcode[] = { 0x40, 0x13 };
+    CECFrame frame(unhandledOpcode, sizeof(unhandledOpcode));
     EXPECT_NO_THROW(listener.notify(frame));
 
-    // Nothing was dispatched, so no operand was applied to the initiator's entry.
     EXPECT_EQ(std::string("UNTOUCHED"), initiator.m_osdName.toString());
     EXPECT_EQ(PhysicalAddress(2, 0, 0, 0).toString(), initiator.m_physicalAddr.toString());
 }
 
-// Test fixture description: an empty buffer is the extreme of the same corner case and must also
-// be dropped without reaching any handler.
 TEST_F(HdmiCecSinkFrameProcessingTest, InjectEmptyFrame_IsDroppedByDecoder)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     Plugin::CECDeviceParams& initiator = Plugin::HdmiCecSinkImplementation::_instance->deviceList[4];
     initiator.update(OSDName("STILLHERE"));
@@ -3969,6 +4964,9 @@ TEST_F(HdmiCecSinkFrameProcessingTest, InjectEmptyFrame_IsDroppedByDecoder)
     Plugin::HdmiCecSinkProcessor processor(cecBus);
     Plugin::HdmiCecSinkFrameListener listener(processor);
 
+    // A zero-length frame is the extreme of the same length guard: the mock CECFrame keeps
+    // its length at zero for a null buffer, so notify() formats nothing and the decoder
+    // returns immediately.
     CECFrame frame(nullptr, 0);
     EXPECT_NO_THROW(listener.notify(frame));
 
@@ -3978,23 +4976,19 @@ TEST_F(HdmiCecSinkFrameProcessingTest, InjectEmptyFrame_IsDroppedByDecoder)
 }
 
 //=============================================================================
-// Notification events delivered to a subscribed JSON-RPC client (L1 Level)
+// Notification events delivered to a subscribed JSON-RPC client
 //
-// Every method on Exchange::IHdmiCecSink::INotification is declared `virtual void X(...) {};` -
-// a virtual with an EMPTY INLINE BODY, never pure virtual - so a handler that simply omits an
-// override compiles cleanly and silently swallows the event. That single declaration style is the
-// root cause of the sink's historically unasserted event surface. The remedy here is to observe
-// the events where they actually become observable: the plugin's own Core::Sink<Notification>
-// forwards each one to Exchange::JHdmiCecSink::Event::<Name>, which notifies every subscribed
-// designator through PluginHost::IShell::Submit. Capturing that call asserts the event name AND
-// its payload without touching entservices-apis, and without adding a notification handler class
-// (that surface belongs to the L2 suite).
+// Every method on Exchange::IHdmiCecSink::INotification is declared `virtual void X(...)
+// {};` - a virtual with an EMPTY INLINE BODY, never pure virtual - so a handler that omits
+// an override compiles cleanly and silently swallows the event. These cases therefore
+// observe the events where they do become observable: the plugin's own
+// Core::Sink<Notification> forwards each one to Exchange::JHdmiCecSink::Event::<Name>,
+// which notifies every subscribed designator through PluginHost::IShell::Submit.
+// Capturing that call asserts the event name and its payload without touching
+// entservices-apis and without adding a notification handler class (that surface belongs
+// to the L2 suite).
 //=============================================================================
 
-// Test fixture description: an inbound <User Control Pressed> ultimately reaches clients as
-// onKeyPressEvent carrying both the initiator's logical address and the raw CEC UI command.
-// COVERAGE_GAPS.md gap-plugin-sink-onkeypress (rank 27, P1); symbol
-// HdmiCecSinkImplementation::SendKeyPressMsgEvent.
 TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_SubscribedClient_ReceivesAddressAndKeyCode)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4018,9 +5012,6 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_SubscribedClient_Recei
     EXPECT_THAT(notified, ::testing::HasSubstr("\"keyCode\":65"));
 }
 
-// Test fixture description: boundary and out-of-range operands must reach clients verbatim - the
-// sink is a transport for the remote key code, not its validator.
-// COVERAGE_GAPS.md gap-plugin-sink-onkeypress (rank 27, P1).
 TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_BoundaryOperands_AreForwardedVerbatim)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4053,9 +5044,6 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_BoundaryOperands_AreFo
     EXPECT_THAT(notified, ::testing::HasSubstr("\"keyCode\":256"));
 }
 
-// Test fixture description: with nothing subscribed to onKeyPressEvent the fan-out still runs to
-// completion but no client notification is produced - the negative control for the event path.
-// COVERAGE_GAPS.md gap-plugin-sink-onkeypress (rank 27, P1).
 TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_NoSubscriber_ProducesNoClientNotification)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4075,10 +5063,6 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_NoSubscriber_ProducesN
     EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onKeyPressEvent")));
 }
 
-// Test fixture description: an inbound <User Control Released> reaches clients as onKeyReleaseEvent
-// carrying only the initiator's logical address - the release message has no key-code operand.
-// COVERAGE_GAPS.md gap-plugin-sink-onkeyrelease (rank 28, P1); symbol
-// HdmiCecSinkImplementation::SendKeyReleaseMsgEvent.
 TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyReleaseEvent_SubscribedClient_ReceivesLogicalAddress)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4108,10 +5092,6 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyReleaseEvent_SubscribedClient_Rec
     EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("keyCode")));
 }
 
-// Test fixture description: a directed <Image View On> registers the initiator and reaches clients
-// as onImageViewOnMsg carrying that initiator's logical address.
-// COVERAGE_GAPS.md gap-plugin-sink-onimageviewon (rank 29, P1).
-//
 // Deliberately makes no claim about the wake-from-standby companion event: the TV's own power
 // status lives in deviceList[m_logicalAddressAllocated].m_powerStatus, which the plugin's poll
 // thread writes from the file-static powerState in its POLL state, so it is not a field a test can
@@ -4120,13 +5100,19 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_DirectedFrame_Notifie
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // Held by value in the action: with CEC up the polling thread can deliver a notification
+    // after this body has returned, so the action must own what it writes to.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -4143,14 +5129,13 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_DirectedFrame_Notifie
 
     EVENT_UNSUBSCRIBE(0, _T("onImageViewOnMsg"), _T("client.events.onImageViewOnMsg"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("onImageViewOnMsg"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":4"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("onImageViewOnMsg"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":4"));
     EXPECT_TRUE(Plugin::HdmiCecSinkImplementation::_instance->deviceList[4].m_isDevicePresent);
+
+    DisableCec();
 }
 
-// Test fixture description: updateImageViewOn() refuses the unregistered logical address outright,
-// so a frame whose initiator is LA 15 registers nothing and notifies nobody.
-// COVERAGE_GAPS.md gap-plugin-sink-onimageviewon (rank 29, P1) - guard arm.
 TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_UnregisteredInitiator_ProducesNoNotification)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4181,12 +5166,16 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_UnregisteredInitiator
     EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onImageViewOnMsg")));
 }
 
-// Test fixture description: the same frame arriving while the TV reports standby additionally
-// raises onWakeupFromStandby - the second arm of updateImageViewOn().
-// COVERAGE_GAPS.md gap-plugin-sink-onimageviewon (rank 29, P1).
 TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_DirectedFrameWhileInStandby_AlsoNotifiesWakeup)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
 
     // Register the initiator up front so the standby arm's device-present precondition holds, and
     // put the TV into standby through the production power hook rather than by poking the field, so
@@ -4198,13 +5187,15 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_DirectedFrameWhileInS
     ASSERT_EQ(PowerStatus::STANDBY,
         Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_powerStatus.toInt());
 
-    string notified;
+    // Held by value in the action: with CEC up the polling thread can deliver a notification
+    // after this body has returned, so the action must own what it writes to.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -4222,13 +5213,12 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_DirectedFrameWhileInS
     EVENT_UNSUBSCRIBE(0, _T("onWakeupFromStandby"), _T("client.events.onWakeupFromStandby"), message);
     EVENT_UNSUBSCRIBE(0, _T("onImageViewOnMsg"), _T("client.events.onImageViewOnMsg"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("onWakeupFromStandby"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("onImageViewOnMsg"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("onWakeupFromStandby"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("onImageViewOnMsg"));
+
+    DisableCec();
 }
 
-// Test fixture description: a broadcast <Image View On> is rejected by the handler's addressing
-// guard, so no client notification is produced at all.
-// COVERAGE_GAPS.md gap-plugin-sink-onimageviewon (rank 29, P1) - negative case.
 TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_BroadcastFrame_ProducesNoNotification)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4259,19 +5249,23 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_BroadcastFrame_Produc
     EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onImageViewOnMsg")));
 }
 
-// Test fixture description: <Text View On> is the sibling of <Image View On> and must reach clients
-// as its own distinctly named event rather than being folded into the image-view path.
 TEST_F(HdmiCecSinkInitializedEventDsTest, onTextViewOnMsg_DirectedFrame_NotifiesSubscribedClient)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
+    // Held by value in the action: with CEC up the polling thread can deliver a notification
+    // after this body has returned, so the action must own what it writes to.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -4288,15 +5282,13 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onTextViewOnMsg_DirectedFrame_Notifies
 
     EVENT_UNSUBSCRIBE(0, _T("onTextViewOnMsg"), _T("client.events.onTextViewOnMsg"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("onTextViewOnMsg"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":4"));
-    EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onImageViewOnMsg")));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("onTextViewOnMsg"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":4"));
+    EXPECT_THAT(*notified, ::testing::Not(::testing::HasSubstr("onImageViewOnMsg")));
+
+    DisableCec();
 }
 
-// Test fixture description: a feature abort reported by a peer reaches clients as
-// reportFeatureAbortEvent carrying the reporting address, the aborted opcode and the reason.
-// COVERAGE_GAPS.md gap-plugin-sink-reportfeatureabort (rank 38, P2); symbols
-// HdmiCecSinkImplementation::reportFeatureAbortEvent and HdmiCecSink::Notification::ReportFeatureAbortEvent.
 TEST_F(HdmiCecSinkInitializedEventDsTest, reportFeatureAbortEvent_SubscribedClient_ReceivesAllThreeOperands)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4330,26 +5322,31 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, reportFeatureAbortEvent_SubscribedClie
     EXPECT_THAT(notified, ::testing::HasSubstr("\"FeatureAbortReason\":" + std::to_string(static_cast<int>(AbortReason::UNRECOGNIZED_OPCODE))));
 }
 
-// Test fixture description: removing a peer reaches clients as onDeviceRemoved carrying the
-// departed logical address.
-// COVERAGE_GAPS.md gap-plugin-sink-ondeviceremoved (rank 39, P2); symbols
-// HdmiCecSinkImplementation::removeDevice and HdmiCecSink::Notification::OnDeviceRemoved.
 TEST_F(HdmiCecSinkInitializedEventDsTest, onDeviceRemoved_SubscribedClient_ReceivesLogicalAddress)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
 
     Plugin::CECDeviceParams& peer = Plugin::HdmiCecSinkImplementation::_instance->deviceList[6];
     peer.m_isDevicePresent = true;
     peer.m_logicalAddress = LogicalAddress(6);
     peer.update(OSDName("DEPARTING"));
 
-    string notified;
+    // Held by value in the action: with CEC up the polling thread can deliver a notification
+    // after this body has returned, so the action must own what it writes to.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -4357,17 +5354,19 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onDeviceRemoved_SubscribedClient_Recei
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->removeDevice(6));
     EVENT_UNSUBSCRIBE(0, _T("onDeviceRemoved"), _T("client.events.onDeviceRemoved"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("onDeviceRemoved"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":6"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("onDeviceRemoved"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":6"));
     EXPECT_EQ(std::string(""), peer.m_osdName.toString());
+
+    DisableCec();
 }
 
-// Test fixture description: removal of a peer that is not present must not raise the event at all -
-// the negative control that proves the notification is gated on the presence flag.
-// COVERAGE_GAPS.md gap-plugin-sink-ondeviceremoved (rank 39, P2) - negative case.
 TEST_F(HdmiCecSinkInitializedEventDsTest, onDeviceRemoved_AbsentDevice_ProducesNoNotification)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    // Restores deviceList / hdmiInputs / m_currentActiveSource on every exit path, including a
+    // fatal assertion, so nothing this case sets up can become the next case's starting state.
+    ScopedSinkState sinkState;
 
     Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::UNREGISTERED].clear();
 
@@ -4389,13 +5388,13 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onDeviceRemoved_AbsentDevice_ProducesN
     EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onDeviceRemoved")));
 }
 
-// Test fixture description: an <Initiate ARC> from the audio system, with the panel powered on,
-// drives the ARC state machine and reaches clients as arcInitiationEvent with a success status.
-// Covers HdmiCecSinkProcessor::process(const InitiateArc&, const Header&),
-// HdmiCecSinkImplementation::Process_InitiateArc and HdmiCecSink::Notification::ArcInitiationEvent.
 TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcFromAudioSystemWhilePoweredOn_NotifiesSuccess)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
 
     // Process_InitiateArc only notifies while the panel is on, and the handler only accepts the
     // frame when the audio system's physical address is either unknown or the ARC port's. A fresh
@@ -4406,13 +5405,15 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcFromAudi
     ASSERT_EQ(PowerStatus::ON,
         Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_powerStatus.toInt());
 
-    string notified;
+    // Held by value in the action: with CEC up the polling thread can deliver a notification
+    // after this body has returned, so the action must own what it writes to.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -4429,8 +5430,58 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcFromAudi
 
     EVENT_UNSUBSCRIBE(0, _T("arcInitiationEvent"), _T("client.events.arcInitiationEvent"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("arcInitiationEvent"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"success\""));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("arcInitiationEvent"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"success\""));
+
+    DisableCec();
+}
+
+// Test fixture description: notifying clients is only half of ARC initiation - the sink also owes
+// the audio system a <Report ARC Initiated> on the bus. Process_InitiateArc() moves the routing
+// state to ARC_STATE_ARC_INITIATED and releases m_semSignaltoArcRoutingThread; threadArcRouting
+// then calls Send_Report_Arc_Initiated_Message(), which is the only producer of that frame and
+// is private, so the state machine is the only way to reach it.
+// Covers HdmiCecSinkImplementation::Send_Report_Arc_Initiated_Message (COVERAGE_GAPS.md
+// gap-plugin-sink-sendreportarcinitiated) alongside Process_InitiateArc's success arm.
+TEST_F(HdmiCecSinkInitializedEventDsTest, initiateArc_WhilePoweredOn_SendsReportArcInitiatedToAudioSystem)
+{
+    ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    // Same preconditions as the notification case: powered on, and deviceList[5] left cleared so
+    // the audio system's physical address is the invalid one the handler accepts.
+    Plugin::HdmiCecSinkImplementation::_instance->onPowerModeChanged(
+        WPEFramework::Exchange::IPowerManager::POWER_STATE_STANDBY,
+        WPEFramework::Exchange::IPowerManager::POWER_STATE_ON);
+    ASSERT_EQ(PowerStatus::ON,
+        Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_powerStatus.toInt());
+
+    // Measure a clean window: the polling thread has its own traffic, and the send under test is
+    // produced asynchronously by the ARC routing thread.
+    ASSERT_TRUE(waitForBusToSettle()) << "the polling thread never settled";
+    clearBusRecorder();
+
+    Connection cecBus;
+    Plugin::HdmiCecSinkProcessor processor(cecBus);
+    Plugin::HdmiCecSinkFrameListener listener(processor);
+
+    // From the audio system (LA=5) to the TV (LA=0); 0xC0 is <Initiate ARC>.
+    const uint8_t initiateArc[] = { 0x50, 0xC0 };
+    CECFrame frame(initiateArc, sizeof(initiateArc));
+    EXPECT_NO_THROW(listener.notify(frame));
+
+    // <Report ARC Initiated> is directed at the audio system with the plugin's 1000 ms ARC
+    // transmit budget - no other send in this implementation uses that pair.
+    EXPECT_EQ(1u, waitForRecordedMessage(LogicalAddress::AUDIO_SYSTEM, 1000))
+        << "threadArcRouting did not put <Report ARC Initiated> on the bus";
+
+    // The frame was the freshly encoded one, and nothing was broadcast for this operation.
+    const std::vector<SentMessage> sent = recordedMessages();
+    ASSERT_FALSE(sent.empty());
+    EXPECT_GT(sent.back().encodeSerial, 0u);
+    for (const SentMessage& message : sent) {
+        EXPECT_NE(static_cast<int>(LogicalAddress::BROADCAST), message.to)
+            << "ARC initiation must not be broadcast";
+    }
 }
 
 // Test fixture description: the same <Initiate ARC> arriving while the panel is in standby must NOT
@@ -4439,19 +5490,25 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcWhileInS
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
+    // Precondition: the production path this case drives returns early while no CEC logical
+    // address is allocated, so the fixture helper establishes that state first.
+    ASSERT_TRUE(EnableCecAndAwaitLogicalAddressAllocation());
+
     Plugin::HdmiCecSinkImplementation::_instance->onPowerModeChanged(
         WPEFramework::Exchange::IPowerManager::POWER_STATE_ON,
         WPEFramework::Exchange::IPowerManager::POWER_STATE_STANDBY);
     ASSERT_EQ(PowerStatus::STANDBY,
         Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_powerStatus.toInt());
 
-    string notified;
+    // Held by value in the action: with CEC up the polling thread can deliver a notification
+    // after this body has returned, so the action must own what it writes to.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -4467,11 +5524,11 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcWhileInS
 
     EVENT_UNSUBSCRIBE(0, _T("arcInitiationEvent"), _T("client.events.arcInitiationEvent"), message);
 
-    EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("arcInitiationEvent")));
+    EXPECT_THAT(*notified, ::testing::Not(::testing::HasSubstr("arcInitiationEvent")));
+
+    DisableCec();
 }
 
-// Test fixture description: <Initiate ARC> is only honoured from the audio system, and never as a
-// broadcast. Both rejections are the handler's addressing guard.
 TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcWithWrongAddressing_IsIgnored)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4511,10 +5568,6 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcWithWron
     EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("arcInitiationEvent")));
 }
 
-// Test fixture description: a <Terminate ARC> from the audio system reaches clients as
-// arcTerminationEvent. Covers HdmiCecSinkProcessor::process(const TerminateArc&, const Header&)
-// and HdmiCecSinkImplementation::Process_TerminateArc, which - unlike initiation - has no
-// power-state precondition.
 TEST_F(HdmiCecSinkInitializedEventDsTest, arcTerminationEvent_TerminateArcFromAudioSystem_NotifiesSuccess)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4546,8 +5599,6 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcTerminationEvent_TerminateArcFromAu
     EXPECT_THAT(notified, ::testing::HasSubstr("\"success\""));
 }
 
-// Test fixture description: an inbound <Standby> reaches clients as standbyMessageReceived. Unlike
-// the view-on opcodes this handler has no addressing guard, so the broadcast form is accepted too.
 TEST_F(HdmiCecSinkInitializedEventDsTest, standbyMessageReceived_InboundStandby_NotifiesSubscribedClient)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
@@ -4580,21 +5631,18 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, standbyMessageReceived_InboundStandby_
 }
 
 //=============================================================================
-// The plugin's own notification sink (L1 Level)
+// The plugin's own notification sink
 //
 // HdmiCecSink::Notification is a PRIVATE nested class held by value as
-// Core::Sink<Notification> _notification, so a test cannot name it, construct it, or reach it
-// through the plugin's public surface. It becomes reachable exactly once: IShell's
-// Register/Unregister overloads for RPC::IRemoteConnection::INotification are non-virtual inlines
-// that forward to COMLink(), and ServiceMock::COMLink() returns nullptr by default - which is why
-// the sink has never been observable and why the plugin logs "Failed to get IRemoteConnection" on
-// every teardown. Pointing COMLink() at the fixture's existing COMLinkMock hands the sink to the
-// test, using only fixture members that are already there.
+// Core::Sink<Notification> _notification, so a test cannot name it, construct it, or reach
+// it through the plugin's public surface. It becomes reachable exactly once: IShell's
+// Register/Unregister overloads for RPC::IRemoteConnection::INotification are non-virtual
+// inlines that forward to COMLink(), and ServiceMock::COMLink() returns nullptr by default
+// - which is why the sink has never been observable and why the plugin logs "Failed to get
+// IRemoteConnection" on every teardown. Pointing COMLink() at the fixture's existing
+// COMLinkMock hands the sink to the test using only fixture members that already exist.
 //=============================================================================
 
-// Test fixture description: the notification sink accepts the remote-connection activation callback
-// and publishes exactly the two interfaces its interface map declares.
-// Covers HdmiCecSink::Notification::Activated and HdmiCecSink::Notification::QueryInterface.
 TEST_F(HdmiCecSinkDsTest, PluginNotificationSink_ActivationHookAndInterfaceMap_AreExercised)
 {
     ON_CALL(service, COMLink())
@@ -4619,22 +5667,299 @@ TEST_F(HdmiCecSinkDsTest, PluginNotificationSink_ActivationHookAndInterfaceMap_A
 
     // The interface map publishes the CEC-sink notification and the remote-connection notification,
     // and nothing else - an unrelated interface identifier must be refused.
-    EXPECT_NE(nullptr, sink->QueryInterface(Exchange::IHdmiCecSink::INotification::ID));
-    EXPECT_NE(nullptr, sink->QueryInterface(RPC::IRemoteConnection::INotification::ID));
+    //
+    // Every SUCCESSFUL QueryInterface hands back a counted reference: Thunder's INTERFACE_ENTRY
+    // calls AddRef() on each entry it matches (Services.h), and this sink is a Core::Sink<> whose
+    // destructor reports any reference still outstanding. So each returned interface is held in a
+    // typed pointer and released exactly once. The refused identifier returns nullptr and holds
+    // nothing, so there is nothing to release for it.
+    Exchange::IHdmiCecSink::INotification* cecNotification
+        = sink->QueryInterface<Exchange::IHdmiCecSink::INotification>();
+    EXPECT_NE(nullptr, cecNotification);
+    if (cecNotification != nullptr) {
+        cecNotification->Release();
+    }
+
+    RPC::IRemoteConnection::INotification* connectionNotification
+        = sink->QueryInterface<RPC::IRemoteConnection::INotification>();
+    EXPECT_NE(nullptr, connectionNotification);
+    if (connectionNotification != nullptr) {
+        connectionNotification->Release();
+    }
+
+    // A refused query must not have taken a reference in the first place, so there is nothing
+    // to release here.
     EXPECT_EQ(nullptr, sink->QueryInterface(Exchange::IHdmiCecSink::ID));
+}
+
+// Test fixture description: HdmiCecSinkImplementation::getCecVersion() reads the CEC version from
+// RFC during Configure() and stores it in a translation-unit-static that changes what the sink
+// answers on the bus. This is the RFC read path DISABLED_getCecVersion was reaching for; unlike
+// that test, it uses a seam that exists today.
+//
+// The observable is <Give Features>: its handler broadcasts <Report Features> only when the version
+// read from RFC is 2.0, and sends nothing at all otherwise. Both arms are driven here, which also
+// restores the static to the 1.4 the rest of the suite expects - it outlives this fixture, so
+// leaving it at 2.0 would change how every later test's sink answers.
+// Covers HdmiCecSinkImplementation::getCecVersion and both arms of
+// HdmiCecSinkProcessor::process(const GiveFeatures&, const Header&).
+TEST_F(HdmiCecSinkDsTest, cecVersionFromRfc_ReportedTwoPointZero_ChangesTheGiveFeaturesResponse)
+{
+    ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    // The RFC answer is what this test controls. Asserting the caller ID and the parameter name
+    // here is the point: production passes "thunderapi", not the plugin callsign, and the TR181
+    // name must be exactly the one the RFC schema defines.
+    std::string rfcAnswer = "2.0";
+    uint32_t rfcReads = 0;
+    ON_CALL(*p_rfcApiImplMock, getRFCParameter(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [&](char* callerId, const char* parameterName, RFC_ParamData_t* parameterData) {
+                EXPECT_STREQ("thunderapi", callerId);
+                EXPECT_STREQ("Device.DeviceInfo.X_RDKCENTRAL-COM_RFC.Feature.HdmiCecSink.CECVersion",
+                    parameterName);
+                parameterData->type = WDMP_STRING;
+                strncpy(parameterData->value, rfcAnswer.c_str(), sizeof(parameterData->value) - 1);
+                parameterData->value[sizeof(parameterData->value) - 1] = '\0';
+                ++rfcReads;
+                return WDMP_SUCCESS;
+            }));
+
+    // getCecVersion() runs from Configure(), which only happens on activation, so the version is
+    // re-read by taking the plugin down and back up. Deinitialize is idempotent, so the fixture
+    // destructor's own call stays safe.
+    plugin->Deinitialize(&service);
+    ASSERT_EQ(string(""), plugin->Initialize(&service));
+    EXPECT_GT(rfcReads, 0u) << "Configure() never consulted RFC for the CEC version";
+    ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    (void)waitForBusToSettle();
+    clearBusRecorder();
+
+    Connection cecBus;
+    Plugin::HdmiCecSinkProcessor processor(cecBus);
+    Plugin::HdmiCecSinkFrameListener listener(processor);
+
+    // From Playback Device 1 (LA=4) to the TV (LA=0); 0xA5 is <Give Features>.
+    const uint8_t giveFeatures[] = { 0x40, 0xA5 };
+    CECFrame giveFeaturesFrame(giveFeatures, sizeof(giveFeatures));
+    EXPECT_NO_THROW(listener.notify(giveFeaturesFrame));
+
+    // Version 2.0 answers with a broadcast <Report Features>, sent asynchronously.
+    EXPECT_EQ(1u, waitForRecordedMessage(LogicalAddress::BROADCAST, kAsyncSend))
+        << "a 2.0 sink must answer <Give Features> with a broadcast <Report Features>";
+
+    // Now the other arm, which also puts the process-wide version back to 1.4.
+    rfcAnswer = "1.4";
+    plugin->Deinitialize(&service);
+    ASSERT_EQ(string(""), plugin->Initialize(&service));
+    ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    (void)waitForBusToSettle();
+    clearBusRecorder();
+
+    Connection restoredBus;
+    Plugin::HdmiCecSinkProcessor restoredProcessor(restoredBus);
+    Plugin::HdmiCecSinkFrameListener restoredListener(restoredProcessor);
+    EXPECT_NO_THROW(restoredListener.notify(giveFeaturesFrame));
+
+    // A 1.4 sink stays silent, so nothing at all should have been recorded for this frame.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    for (const SentMessage& message : recordedMessages()) {
+        EXPECT_NE(kAsyncSend, message.timeout)
+            << "a 1.4 sink must not answer <Give Features> at all";
+    }
+}
+
+// Test fixture description: the deactivation hook is the sink's only behavioural method.
+// HdmiCecSink::Deactivated() compares the reporting connection's id against the id the plugin
+// recorded when it instantiated its implementation, and asks the shell to deactivate itself with
+// FAILURE only for its OWN connection - a report about someone else's connection must be ignored.
+// Both arms are driven here, from inside the Unregister capture: that is the window in which the
+// plugin has handed the sink over but has not yet cleared _service, which Deactivated() asserts on.
+// Covers HdmiCecSink::Notification::Deactivated and HdmiCecSink::Deactivated.
+TEST_F(HdmiCecSinkDsTest, PluginNotificationSink_DeactivationHook_ActsOnlyOnItsOwnConnection)
+{
+    ON_CALL(service, COMLink())
+        .WillByDefault(::testing::Return(&comLinkMock));
+
+    // The fixture's COMLink Instantiate action never assigns connectionId, so the plugin recorded
+    // 0. Matching and mismatching reports are therefore ids 0 and 4321.
+    RemoteConnectionDouble ownConnection(0);
+    RemoteConnectionDouble foreignConnection(4321);
+
+    uint32_t deactivationsRequested = 0;
+    ON_CALL(service, Deactivate(::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [&](const PluginHost::IShell::reason) {
+                ++deactivationsRequested;
+                return Core::ERROR_NONE;
+            }));
+
+    bool sinkWasCaptured = false;
+    ON_CALL(comLinkMock, Unregister(::testing::Matcher<const RPC::IRemoteConnection::INotification*>(::testing::_)))
+        .WillByDefault(::testing::Invoke(
+            [&](const RPC::IRemoteConnection::INotification* captured) {
+                if (captured == nullptr) {
+                    return;
+                }
+                sinkWasCaptured = true;
+                RPC::IRemoteConnection::INotification* sink
+                    = const_cast<RPC::IRemoteConnection::INotification*>(captured);
+
+                // A report about a connection the plugin does not own is ignored outright.
+                EXPECT_NO_THROW(sink->Deactivated(&foreignConnection));
+
+                // Its own connection going down is escalated to the shell.
+                EXPECT_NO_THROW(sink->Deactivated(&ownConnection));
+            }));
+
+    plugin->Deinitialize(&service);
+    ASSERT_TRUE(sinkWasCaptured) << "the plugin never handed its notification sink to the COM link";
+
+    // Deactivated() submits a job rather than calling the shell inline, so the request arrives on
+    // the fixture's worker pool. Bounded wait - never an unbounded one - so a lost job fails this
+    // test instead of hanging the suite.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+    while ((deactivationsRequested == 0) && (std::chrono::steady_clock::now() < deadline)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+
+    EXPECT_EQ(1u, deactivationsRequested)
+        << "exactly the plugin's own connection should have triggered a shell deactivation";
+}
+
+// Test fixture description: when the out-of-process implementation dies, the COM link reports it
+// through the notification sink, and the plugin must react by asking its own shell to deactivate
+// with reason FAILURE - otherwise a crashed HdmiCecSinkImplementation would leave an activated but
+// non-functional plugin behind.
+//
+// The callback is driven from INSIDE the Unregister capture, and that placement is the whole point.
+// HdmiCecSink::Deactivated dereferences _service, and HdmiCecSink::Deinitialize clears the plugin's
+// state in a specific order (HdmiCecSink.cpp:156-160): `_connectionId = 0`, THEN
+// `_service->Unregister(&_notification)`, and only after that `_service->Release(); _service =
+// nullptr`. So at the instant the sink is handed to the COM link, _connectionId is 0 and _service is
+// still valid - exactly the state this test needs. Driving the callback after Deinitialize has
+// returned would pass a null shell to PluginHost::IShell::Job::Create, whose constructor
+// dereferences it (IShell.h:95-103).
+//
+// Covers HdmiCecSink::Notification::Deactivated (HdmiCecSink.h:87-90) and
+// HdmiCecSink::Deactivated (HdmiCecSink.cpp:171-178), matching-id arm.
+TEST_F(HdmiCecSinkDsTest, Deactivated_MatchingConnectionId_RequestsPluginDeactivation)
+{
+    ON_CALL(service, COMLink())
+        .WillByDefault(::testing::Return(&comLinkMock));
+
+    RemoteConnectionDouble matchingConnection;
+    matchingConnection.SetId(0);
+
+    Core::Event deactivationDispatched(false, true);
+    bool sinkObserved = false;
+
+    EXPECT_CALL(service, Deactivate(PluginHost::IShell::FAILURE))
+        .WillOnce(::testing::Invoke(
+            [&deactivationDispatched](const PluginHost::IShell::reason) -> Core::hresult {
+                deactivationDispatched.SetEvent();
+                return Core::ERROR_NONE;
+            }));
+
+    ON_CALL(comLinkMock, Unregister(::testing::Matcher<const RPC::IRemoteConnection::INotification*>(::testing::_)))
+        .WillByDefault(::testing::Invoke(
+            [&](const RPC::IRemoteConnection::INotification* capturedSink) {
+                if (capturedSink != nullptr) {
+                    sinkObserved = true;
+                    const_cast<RPC::IRemoteConnection::INotification*>(capturedSink)
+                        ->Deactivated(&matchingConnection);
+                }
+            }));
+
+    // Deinitialize is idempotent, so the fixture destructor's own call becomes a no-op.
+    plugin->Deinitialize(&service);
+
+    ASSERT_TRUE(sinkObserved);
+    // The plugin submits the deactivation to the worker pool the fixture is already running, so
+    // this is a bounded wait on delivery rather than a wall-clock delay.
+    EXPECT_EQ(Core::ERROR_NONE, deactivationDispatched.Lock(5000));
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(&service));
+}
+
+// Test fixture description: the negative arm of the same guard. A remote connection whose identifier
+// is not the one this plugin owns belongs to some other plugin's implementation process, and the
+// sink must ignore it rather than tearing this plugin down.
+//
+// Covers HdmiCecSink::Deactivated (HdmiCecSink.cpp:171-178), non-matching-id arm.
+TEST_F(HdmiCecSinkDsTest, Deactivated_MismatchedConnectionId_IsIgnored)
+{
+    ON_CALL(service, COMLink())
+        .WillByDefault(::testing::Return(&comLinkMock));
+
+    // _connectionId is 0 by the time Deinitialize hands the sink over, so any non-zero identifier
+    // is a foreign connection.
+    RemoteConnectionDouble foreignConnection;
+    foreignConnection.SetId(0xC0FFEEu);
+
+    bool sinkObserved = false;
+
+    EXPECT_CALL(service, Deactivate(::testing::_)).Times(0);
+
+    ON_CALL(comLinkMock, Unregister(::testing::Matcher<const RPC::IRemoteConnection::INotification*>(::testing::_)))
+        .WillByDefault(::testing::Invoke(
+            [&](const RPC::IRemoteConnection::INotification* capturedSink) {
+                if (capturedSink != nullptr) {
+                    sinkObserved = true;
+                    EXPECT_NO_THROW(const_cast<RPC::IRemoteConnection::INotification*>(capturedSink)
+                            ->Deactivated(&foreignConnection));
+                }
+            }));
+
+    plugin->Deinitialize(&service);
+
+    ASSERT_TRUE(sinkObserved);
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(&service));
 }
 
 // Test fixture description: the implementation's power-manager notification wrapper is a PRIVATE
 // nested class held by value, so it can only be observed at the one moment the implementation hands
-// it back to the power manager - the Unregister call that opens its destructor. Exercising it from
-// inside that capture is safe and deliberate: Unregister is the destructor's first statement, so the
-// wrapper, its parent and the singleton instance pointer are all still valid, and the callback is
-// driven with POWER_STATE_ON so it takes the no-side-effect arm.
+// it back to the power manager - the Unregister call that opens its destructor
+// (HdmiCecSinkImplementation.cpp:652-655). Exercising it from inside that capture is safe and
+// deliberate: Unregister is the destructor's first statement, so the wrapper, its parent and the
+// singleton instance pointer are all still valid.
+//
+// What POWER_STATE_ON actually does, measured rather than assumed. It is NOT a "no-side-effect"
+// arm: with CEC enabled, onPowerModeChanged writes
+// deviceList[m_logicalAddressAllocated].m_powerStatus, resets m_currentActiveSource on the way
+// down, and re-arms plus wakes the polling thread (HdmiCecSinkImplementation.cpp:959-973). Those
+// effects are asserted directly, with CEC enabled, by
+// onPowerModeChanged_ToPowerStateOn_RecordsPoweredOnStatus and
+// onPowerModeChanged_ToStandby_ResetsActiveSource earlier in this file.
+//
+// At THIS seam the whole block is skipped, and for a reason that has nothing to do with which power
+// state is passed: HdmiCecSink::Deinitialize calls SetEnabled(false) before it releases the
+// implementation (HdmiCecSink.cpp:113-123), so by the time the destructor runs cecEnableStatus is
+// already false and onPowerModeChanged takes the else branch at
+// HdmiCecSinkImplementation.cpp:975-978. Confirmed by running this test in isolation: the log shows
+// "onPowerModeChanged: Event ... State Changed 2 --> 3" immediately followed by
+// "onPowerModeChanged: CEC not Enabled". So the destructor is NOT racing its own CECDisable()/join
+// here, and no poll-thread wake-up is issued.
+//
+// The recorded power status is therefore read immediately before and immediately after the callback,
+// both from inside the capture, and asserted equal. Bracketing it that tightly is deliberate: the
+// value is not stable across teardown as a whole, because CECDeviceParams::clear()
+// (HdmiCecSinkImplementation.h:165-184) resets m_powerStatus to 0 while devices are being torn down,
+// so a before/after pair taken around the whole of Deinitialize would measure that clear() instead
+// of this callback. Measured: 1 before Deinitialize, 0 by the time the destructor runs. Scoped to
+// the callback itself the assertion is a live regression guard - if the write at cpp:959-973 ever
+// moved outside the cecEnableStatus gate, this would fail rather than the suite silently acquiring a
+// destructor-time poll-thread wake-up.
+//
 // Covers HdmiCecSinkImplementation::PowerManagerNotification::OnPowerModeChanged and its
 // interface map.
 TEST_F(HdmiCecSinkDsTest, PowerManagerNotificationWrapper_ForwardsModeChangeAndPublishesItsInterface)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+
+    int powerStatusBeforeCallback = -1;
+    int powerStatusAfterCallback = -2;
 
     bool forwarded = false;
     bool publishesOwnInterface = false;
@@ -4647,13 +5972,36 @@ TEST_F(HdmiCecSinkDsTest, PowerManagerNotificationWrapper_ForwardsModeChangeAndP
                     Exchange::IPowerManager::IModeChangedNotification* sink
                         = const_cast<Exchange::IPowerManager::IModeChangedNotification*>(notification);
 
+                    // Bracket the callback as tightly as possible, through the parent, while the
+                    // instance pointer is still valid.
+                    if (Plugin::HdmiCecSinkImplementation::_instance != nullptr) {
+                        powerStatusBeforeCallback = Plugin::HdmiCecSinkImplementation::_instance
+                                                        ->deviceList[LogicalAddress::TV]
+                                                        .m_powerStatus.toInt();
+                    }
+
                     sink->OnPowerModeChanged(
                         WPEFramework::Exchange::IPowerManager::POWER_STATE_STANDBY,
                         WPEFramework::Exchange::IPowerManager::POWER_STATE_ON);
                     forwarded = true;
 
-                    publishesOwnInterface
-                        = (sink->QueryInterface(Exchange::IPowerManager::IModeChangedNotification::ID) != nullptr);
+                    if (Plugin::HdmiCecSinkImplementation::_instance != nullptr) {
+                        powerStatusAfterCallback = Plugin::HdmiCecSinkImplementation::_instance
+                                                       ->deviceList[LogicalAddress::TV]
+                                                       .m_powerStatus.toInt();
+                    }
+                    // A successful QueryInterface AddRef()s the wrapper (Thunder's
+                    // INTERFACE_ENTRY), so the reference is released here - inside the Unregister
+                    // callback, while the wrapper, its parent and the singleton instance pointer
+                    // are all still valid, because Unregister is the first statement of the
+                    // wrapper's destructor. Releasing later would touch a destroyed object.
+                    Exchange::IPowerManager::IModeChangedNotification* published
+                        = sink->QueryInterface<Exchange::IPowerManager::IModeChangedNotification>();
+                    publishesOwnInterface = (published != nullptr);
+                    if (published != nullptr) {
+                        published->Release();
+                    }
+                    // The refused identifier returns nullptr, so it holds no reference.
                     refusesUnrelatedInterface
                         = (sink->QueryInterface(Exchange::IHdmiCecSink::ID) == nullptr);
                 }
@@ -4665,4 +6013,124 @@ TEST_F(HdmiCecSinkDsTest, PowerManagerNotificationWrapper_ForwardsModeChangeAndP
     EXPECT_TRUE(forwarded);
     EXPECT_TRUE(publishesOwnInterface);
     EXPECT_TRUE(refusesUnrelatedInterface);
+    // CEC is already disabled at this point, so the callback must not have touched the recorded
+    // status. Both reads must also have happened, which the sentinel initialisers make visible.
+    EXPECT_GE(powerStatusBeforeCallback, 0);
+    EXPECT_EQ(powerStatusBeforeCallback, powerStatusAfterCallback);
+}
+
+// Test fixture description: the implementation's UserSettings notification wrapper is the sibling of
+// the power-manager wrapper above - another private nested class held by value as
+// Core::Sink<UserSettingsNotification> (HdmiCecSinkImplementation.h:624-648) - but it has never been
+// reachable at all, and for a different reason. Configure() only registers it when
+//     service->QueryInterfaceByCallsign<Exchange::IUserSettings>("org.rdk.UserSettings")
+// returns an interface (HdmiCecSinkImplementation.cpp:826-834). ServiceMock leaves that virtual at
+// its NiceMock default, so it returns nullptr, the plugin logs "Failed to get UserSettings
+// interface" on every single test in this file, and neither the register nor the unregister side of
+// the sink is ever taken. That rules out the Unregister-capture seam the power-manager wrapper uses:
+// the destructor's UserSettings branch (cpp:659-664) is guarded by the same null pointer.
+//
+// The seam that does exist is the Register call itself, so the plugin is restarted here with the
+// interface available. Restarting rather than reaching into the fixture constructor is deliberate:
+// arming QueryInterfaceByCallsign in the base constructor would hand a UserSettings interface to all
+// ~240 other tests in this binary, change what Configure() does for every one of them, and put a
+// GetPresentationLanguage-driven <Set Menu Language> broadcast into their startup. Deinitialize
+// followed by Initialize confines the change to this test, and the sequence is safe because
+// _instance is assigned in Configure() (cpp:724) and cleared in the implementation destructor
+// (cpp:706) - the outgoing instance is destroyed inside COMLink::Instantiate, before the incoming
+// Configure() runs, so _instance ends up pointing at the new object rather than at nullptr.
+//
+// Unlike the power-manager wrapper, this one is driven while the plugin is fully up and CEC is
+// enabled, so the forwarding has a real, asserted consequence: a BCP-47 tag is normalised to ISO
+// 639-2, recorded against the TV's own entry, and broadcast as <Set Menu Language>.
+//
+// Covers HdmiCecSinkImplementation::UserSettingsNotification::OnPresentationLanguageChanged
+// (HdmiCecSinkImplementation.h:637-640) and its interface map (:642-644).
+TEST_F(HdmiCecSinkDsTest, UserSettingsNotificationWrapper_ForwardsLanguageChangeAndPublishesItsInterface)
+{
+    NiceMock<UserSettingMock> userSettings;
+    Exchange::IUserSettings::INotification* capturedSink = nullptr;
+
+    ON_CALL(userSettings, Register(::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [&](Exchange::IUserSettings::INotification* notification) -> uint32_t {
+                capturedSink = notification;
+                return Core::ERROR_NONE;
+            }));
+    ON_CALL(userSettings, Unregister(::testing::_))
+        .WillByDefault(::testing::Return(Core::ERROR_NONE));
+    // Configure() reads the current presentation language straight after registering. Answering with
+    // a tag that is NOT the one asserted on below keeps the two paths distinguishable.
+    ON_CALL(userSettings, GetPresentationLanguage(::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [](string& presentationLanguage) -> uint32_t {
+                presentationLanguage = "en-US";
+                return Core::ERROR_NONE;
+            }));
+
+    ON_CALL(service, QueryInterfaceByCallsign(::testing::_, ::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [&](const uint32_t interfaceId, const string& callsign) -> void* {
+                if ((interfaceId == Exchange::IUserSettings::ID) && (callsign == "org.rdk.UserSettings")) {
+                    return static_cast<Exchange::IUserSettings*>(&userSettings);
+                }
+                // The power manager is supplied through a createInterface<IPowerManager>
+                // specialisation in the test framework, not through this call, so refusing
+                // everything else changes nothing else about start-up.
+                return nullptr;
+            }));
+
+    // Restart so Configure() runs with the interface available.
+    //
+    // Clearing the persisted settings between the two halves is not optional. Deinitialize calls
+    // SetEnabled(false), which writes "cecEnabled": false into CEC_SETTING_ENABLED_FILE, so a
+    // restart that skipped this would come back up with CEC disabled: measured, the second
+    // Initialize then logged "getEnabled :0" and "setCurrentLanguage: Logical Address NOT
+    // Allocated", and no logical address was ever allocated. Clear() restores the production
+    // default that loadSettings() applies when the file is absent, and the fixture's
+    // ScopedGlobalFile still puts the host's original contents back at teardown.
+    plugin->Deinitialize(&service);
+    persistedCecSettings.Clear();
+    ASSERT_EQ(string(""), plugin->Initialize(&service));
+    ASSERT_TRUE(waitForTvLogicalAddress(5000));
+    ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
+    ASSERT_NE(nullptr, capturedSink);
+
+    // <Set Menu Language> is a broadcast, and the polling thread broadcasts on the same interface,
+    // so the destination selects the interesting calls rather than being asserted on all of them.
+    int broadcasts = 0;
+    EXPECT_CALL(*p_connectionImplMock, sendTo(::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Invoke(
+            [&](const LogicalAddress& to, const CECFrame& frame, int timeout) {
+                if ((to.toInt() == LogicalAddress::BROADCAST) && (timeout > 0)) {
+                    broadcasts++;
+                }
+            }));
+
+    EXPECT_NO_THROW(capturedSink->OnPresentationLanguageChanged("fr-FR"));
+
+    // Forwarded into the parent, normalised, recorded and broadcast.
+    EXPECT_EQ(Language("fra").toString(),
+        Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::TV].m_currentLanguage.toString());
+    EXPECT_GT(broadcasts, 0);
+
+    // The interface map publishes the UserSettings notification and refuses anything else.
+    EXPECT_NE(nullptr, capturedSink->QueryInterface(Exchange::IUserSettings::INotification::ID));
+    EXPECT_EQ(nullptr, capturedSink->QueryInterface(Exchange::IHdmiCecSink::ID));
+
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(p_connectionImplMock));
+
+    // Restart out again, so the plugin stops holding a pointer to a mock that lives on this body's
+    // stack. Without this the implementation survives the body - it is only destroyed by the fixture
+    // destructor - and its destructor's UserSettings branch (HdmiCecSinkImplementation.cpp:659-664)
+    // would call Unregister() and Release() through a dangling pointer. Measured before this was
+    // added: "pure virtual method called / terminate called without an active exception" at process
+    // shutdown. The symmetric restart also hands the fixture destructor exactly the state it
+    // expects.
+    ON_CALL(service, QueryInterfaceByCallsign(::testing::_, ::testing::_))
+        .WillByDefault(::testing::Return(nullptr));
+    plugin->Deinitialize(&service);
+    persistedCecSettings.Clear();
+    ASSERT_EQ(string(""), plugin->Initialize(&service));
+    EXPECT_TRUE(waitForTvLogicalAddress(5000));
 }
