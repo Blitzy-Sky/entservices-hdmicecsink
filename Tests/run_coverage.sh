@@ -465,7 +465,13 @@ VALGRIND_BIN="$(resolve_tool valgrind)"
 GCOV_BIN="$(resolve_tool gcov)"
 ID_BIN="$(resolve_tool id)"
 TIMEOUT_BIN="$(resolve_tool timeout)"
-readonly LCOV_BIN GENHTML_BIN FIND_BIN MKTEMP_BIN VALGRIND_BIN GCOV_BIN ID_BIN TIMEOUT_BIN
+# stat is how the ancestry of every artifact path is checked (owner, mode, type) before a byte
+# is written to it -- see assert_safe_ancestry.  It is resolved HERE, with the other primitives,
+# because it was previously referenced there and nowhere assigned: `stat` was on PATH throughout
+# and the run still died with "stat was not found on PATH", because the guard was testing an
+# empty variable rather than the tool.
+STAT_BIN="$(resolve_tool stat)"
+readonly LCOV_BIN GENHTML_BIN FIND_BIN MKTEMP_BIN VALGRIND_BIN GCOV_BIN ID_BIN TIMEOUT_BIN STAT_BIN
 
 # --kill-after is desirable (a shard that ignores SIGTERM still dies) but is NOT universally
 # safe: this workspace's `timeout` is uutils coreutils 0.2.2, and with -k it reports a timeout as
@@ -1049,7 +1055,7 @@ cleanup_lcov_home() {
     return 0
 }
 
-make_private_lcov_home() {
+prepare_lcov_home() {
     [ -n "$LCOV_HOME" ] && return 0
     [ -n "$MKTEMP_BIN" ] || die "mktemp is not available; it is required to create a private HOME for lcov"
     local parent="${TMPDIR:-/tmp}"
@@ -1085,10 +1091,16 @@ genhtml_run() {
     HOME="$LCOV_HOME" "$GENHTML_BIN" "$@"
 }
 
-# Every lcov and genhtml invocation in this script goes through these two wrappers.  Calling
-# either binary directly would read the real $HOME/.lcovrc and is a defect.
-run_lcov()    { HOME="$LCOV_HOME_DIR" "$LCOV_BIN" "$@"; }
-run_genhtml() { HOME="$LCOV_HOME_DIR" "$GENHTML_BIN" "$@"; }
+# Every lcov and genhtml invocation in this script goes through a wrapper.  Calling either
+# binary directly would read the real $HOME/.lcovrc and is a defect.
+#
+# Both spellings exist because both are in use across this file, and these two DELEGATE rather
+# than reimplement so there is exactly ONE place where HOME is chosen and exactly one guard
+# against being called before the private HOME exists.  They previously named a variable,
+# LCOV_HOME_DIR, that is set nowhere: with `set -euo pipefail` in force every one of the seven
+# call sites below would have aborted on an unbound variable the moment it ran.
+run_lcov()    { lcov_run "$@"; }
+run_genhtml() { genhtml_run "$@"; }
 
 # ------------------------------------------------------------------------------------
 # Tooling pre-flight.  Two checks, in this order, and the order is the point.
@@ -2499,6 +2511,34 @@ gate_exempt_reason() {
             log "        file is tested -- it is this level that cannot reach those lines.  No exclusion"
             log "        glob was added and COVERAGE_MIN was not lowered; reaching them at L2 would need"
             log "        an out-of-process host or a production change, both out of scope."
+            ;;
+        l2/plugin/HdmiCecSinkImplementation.h)
+            # The analysis lives in the L2_GATE_EXEMPT header block above; it is restated here
+            # because a reason a run does not PRINT is a reason a reader cannot check, and the
+            # run was emitting "no documented reason is recorded" for this entry.
+            log "        Reason: the port-map operations cannot be reached through the L2 frame path"
+            log "        while the shared CEC mock (entservices-testframework/Tests/mocks/HdmiCec.h,"
+            log "        an out-of-scope dependency) carries two incompatible PhysicalAddress"
+            log "        representations:"
+            log "          - that mock's PhysicalAddress::getByteValue(index) returns the RAW WIRE"
+            log "            BYTE str[index], where ccec's real PhysicalAddress returns a NIBBLE, so"
+            log "            addChild and getRoute -- which both require getByteValue(0) to equal"
+            log "            m_portID + 1, a value in 1..3 -- see 17 for an announced 1.1.0.0 and 32"
+            log "            for a 2.0.0.0, and never match;"
+            log "          - a port can therefore never be CLAIMED: the only write to"
+            log "            HdmiPortMap::m_logicalAddr is reached solely from addChild's"
+            log "            'physical_addr == m_physicalAddr' arm, and the mock's four-argument"
+            log "            constructor stores FOUR bytes where a frame-derived address stores TWO,"
+            log "            against an exact vector compare."
+            log "        Measured confirmation: across a full L2 run, addChild logged ZERO invocations."
+            log "        This repository's own L1 suite measures the SAME file at 100.0% (172/172),"
+            log "        covering addChild, removeChild and getRoute in full, by constructing"
+            log "        HdmiPortMap directly instead of decoding frames.  Raising the L2 figure needs"
+            log "        two changes to that out-of-scope mock -- initialise AbortReason::impl to"
+            log "        nullptr, and pack PhysicalAddress as two nibble-packed bytes -- so the gap is"
+            log "        REPORTED WITH THE CHANGE IT WOULD REQUIRE, not worked around.  No exclusion"
+            log "        glob was added and COVERAGE_MIN was not lowered: the file keeps its real"
+            log "        70.8% and stays in the denominator."
             ;;
         *)
             warn "no documented reason is recorded for the exemption '$path' at ${level^^}."
