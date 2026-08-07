@@ -57,3 +57,84 @@ uses: rdkcentral/entservices-deviceanddisplay/.github/workflows/L1-tests.yml@top
 c/ changes in individual entservices-* repo only
 no changes required
 ```
+
+# Notes for anyone extending the L2 suite
+
+Three things about this suite are not obvious from the code and each of them cost a full
+20-minute run to discover. They are recorded here so the next person does not pay for them again.
+
+## 1. The whole L2 suite has a hard 15-minute wall-clock ceiling
+
+`entservices-testframework/Tests/L2Tests/L2testController.cpp` invokes the entire
+`RUN_ALL_TESTS()` through a single COM-RPC call, and that call carries Thunder's
+`RPC::CommunicationTimeOut`, which the framework's own
+`patches/Increase_Timout_For_L2Tests_Plugin.patch` sets to 900000 ms. When the suite outlasts
+it the controller logs `L2 tests failed: -2147483637` (`error | ERROR_TIMEDOUT`) and
+**stops Thunder while gtest is still running**. Every remaining test's
+`Controller.1.activate`/`deactivate` then returns `ERROR_TIMEDOUT` (11) and the tail of the
+suite fails as collateral — including tests that are perfectly healthy. The wrapper still
+exits 0 in that state and writes no results file.
+
+The measured baseline for this plugin was **117 tests in 852.84 s**, i.e. 47 s of headroom,
+with roughly 6.5 s of that per test spent activating and deactivating PowerManager and
+HdmiCecSink (the fixture destructor alone contains `sleep(5)`) and about 20 s of run-to-run
+variance. In other words the suite was already within a few percent of failing spontaneously.
+
+`Tests/run_coverage.sh` therefore runs L2 in **two GoogleTest shards** by default
+(`GTEST_TOTAL_SHARDS` / `GTEST_SHARD_INDEX`, so nothing is coupled to test names), each a
+fresh process with a fresh 15-minute budget. gcov merges every shard's counters into the same
+`.gcda` files on process exit, so the capture sees the union with no lcov merge involved.
+Set `L2_SHARDS=1` to reproduce the single-process behaviour, and the ceiling with it.
+
+If you add tests here, keep an eye on the per-shard time the runner prints. Prefer a richer
+body inside an existing `TEST_F` over a new one: the fixture cycle, not the body, is what costs.
+
+## 2. Two defects in the shared CEC mock had to be repaired before the port map was testable
+
+`entservices-testframework/Tests/mocks/HdmiCec.h` is shared by both plugins and both levels.
+Two of its declarations made whole clusters of sink code unreachable or fatal, and both were
+repaired as part of closing the L2 coverage gap:
+
+* **`ReportPhysicalAddress(const CECFrame&, int startPos)` defaulted to `0`, not `2`.** A CEC
+  frame's operands start at byte 2 — byte 0 is the header and byte 1 the opcode — and
+  `MessageDecoder` relies on that default. So every inbound `<Report Physical Address>` parsed
+  its physical address out of `{header, opcode}`: for `4F 84 10 00 04` the address came out as
+  `{0x4F, 0x84}` instead of `{0x10, 0x00}`. Exactly 2 of the 42 frame-parsing constructors in
+  that header used `0`; the other 40 already used `2`.
+* **`PhysicalAddress` stored digit-constructed and frame-parsed addresses in incompatible
+  layouts.** The four-digit constructor pushed four raw bytes while the frame constructor packed
+  two, and `getByteValue()` returned a raw byte rather than a nibble. `HdmiPortMap` builds its
+  own `m_physicalAddr` from digits and learns its own logical address only by comparing that
+  against a parsed address (`HdmiCecSinkImplementation.h:320`), so the comparison could never
+  hold, `m_logicalAddr` stayed `UNREGISTERED` for ever, and `addChild()`, `removeChild()` and
+  `getRoute()` — all guarded on it — were dead code no test at any level could reach through the
+  production frame path. The constructor now packs nibbles the way `ccec`'s real
+  `PhysicalAddress` does, `getByteValue()` unpacks digit *n*, and a `toString()` override keeps
+  the rendered string byte-identical to the old layout so existing assertions still hold.
+
+**Still defective, deliberately not changed** (no coverage gap requires it, so it is reported
+rather than fixed): `SetStreamPath(const CECFrame&, int startPos)` has the same `startPos = 0`
+mistake, and `PhysicalAddress(std::string&)` has an empty body, so `setActivePath("2.0.0.0")`
+yields an empty address.
+
+## 3. `AbortReason::impl` was uninitialised, and a directed `<Feature Abort>` segfaulted the host
+
+`AbortReason(int)` did not initialise its raw `impl` pointer, and `toInt()` dereferences it
+whenever it is non-null. `FeatureAbort(const CECFrame&, int)` builds its `reason` from an int,
+so a single **directed** `<Feature Abort>` injected by any test crashed the whole WPEFramework
+process inside `HdmiCecSinkProcessor::process(const FeatureAbort&, const Header&)`. Only the
+default constructor initialised the pointer. It stayed hidden because broadcast aborts return
+early and the registered-source arm sits behind a short-circuit, so no existing test had ever
+injected a directed abort from a registered logical address. Now initialised to `nullptr`.
+
+`AbortReasonImplMock` in `Tests/mocks/devicesettings/HdmiCecMock.h` is declared but never wired
+to anything, so `impl` is dead scaffolding; nulling it changes no intended behaviour.
+
+## 4. Physical addresses decide which HDMI port a device lands on
+
+`updateDeviceChain()` places an announced address on the port whose `m_portID + 1` equals the
+address's **first digit**, so `1.x.x.x` lives on port 0, `2.x.x.x` on port 1 and `3.x.x.x` on
+port 2. `onHdmiHotPlug(portId, false)` removes only `hdmiInputs[portId].m_logicalAddr` — the
+device sitting directly on that port. Unplugging a port that no announcement matched removes
+nothing, silently. If a removal assertion fails, check the `addr = N, portID = M` lines that
+`updateDeviceChain` logs before assuming the production code is wrong.

@@ -33,6 +33,9 @@
 #   INSTALL_DIR   install tree providing the test binaries and the plugin libraries.
 #   COVERAGE_MIN  line-coverage bar, default 80.
 #   RUN_VALGRIND  run the suite under valgrind memcheck when set to a truthy value.
+#   L2_SHARDS     processes the L2 case list is split across, default 2.  Not a speed knob:
+#                 the framework stops Thunder mid-suite once RUN_ALL_TESTS() outlives its
+#                 900 s COM-RPC timeout, and this suite's baseline is 852.84 s.
 #
 #  GOVERNING CONTRACT
 #  ------------------
@@ -143,6 +146,9 @@
 # OUTPUTS (fixed names, written under $ARTIFACT_ROOT/<repo>/<level>/)
 #   coverage_<level>.info, filtered_coverage_<level>.info, coverage_<level>/index.html,
 #   the archived rdk<LEVEL>TestResults.json, and valgrind_log when RUN_VALGRIND is enabled.
+#   When the level is sharded (L2 with L2_SHARDS > 1) each shard's report is archived as
+#   rdk<LEVEL>TestResults.shard<N>.json alongside a rdk<LEVEL>TestResults.summary.json roll-up
+#   carrying the shard count and the summed test count.
 #   CI writes the same names into $GITHUB_WORKSPACE; here they are grouped per repository and
 #   per level so an `all` run cannot have one level overwrite the other's evidence.
 #
@@ -308,11 +314,14 @@
 #      coverage, AND every non-exempt file left in the filtered trace meets it too.  The
 #      per-file half of the gate is applied to whatever the trace contains, not to a
 #      hand-picked list, so a file added to the plugin later is gated automatically.  The
-#      only exemption is plugin/Module.cpp at L1 (L1_GATE_EXEMPT): its single instrumented
-#      line comes from the module-declaration macro and is reachable only through a real
-#      Thunder plugin load, which the in-process L1 model never performs.  L2 exempts
-#      nothing (L2_GATE_EXEMPT is empty) because L2 does run a real Thunder host and that
-#      same line is hit there -- measured at 1/1 below.
+#      exemptions are enumerated per level, each with its own measured reason printed at the
+#      point of measurement: plugin/Module.cpp at L1 (L1_GATE_EXEMPT), whose single
+#      instrumented line comes from the module-declaration macro and is reachable only
+#      through a real Thunder plugin load that the in-process L1 model never performs -- and
+#      which is hit at L2, measured at 1/1, so the waiver is scoped to L1 alone; and
+#      plugin/HdmiCecSink.cpp at L2 (L2_GATE_EXEMPT), whose thirteen remaining lines are
+#      unreachable from the L2 execution model and are all covered by this repository's own
+#      L1 suite.  Both keep their real figures and stay in the denominator.
 #  A red suite under a green coverage number is worthless, so a non-zero exit from a test
 #  binary fails this script immediately -- the test invocation is never `|| true`'d.  Nor is
 #  a zero exit taken on trust.  The observed false pass that motivated this: in a tree built
@@ -328,18 +337,28 @@
 #        capture is refused unless the run produced new ones, so no percentage can rest on
 #        an earlier run's execution data.
 #
-#  What that condition looked like when this script was written, measured with it rather
-#  than assumed: at L1 both the aggregate and all three named targets cleared the bar and
-#  `l1` exited 0.  At L2 the suite was green but the aggregate and those same three targets
-#  sat BELOW the bar, so `l2` -- and therefore `all` -- exited non-zero.  Those two
-#  sentences are a dated observation, not a promise about the tree you are looking at: the
-#  figures move whenever the suites or the plugin move, and re-measuring them is precisely
-#  this script's job.  The L2 shortfall in particular is a true measurement rather than a
-#  defect in this script: L2 is a functional suite that exercises a narrower slice of each
-#  file, and the sink's per-target >=80% line target is met by the L1 suite.  Do not "fix" it by adding an exclusion glob, by lowering COVERAGE_MIN in a
-#  committed caller, or by merging the two levels into one trace; the first two are
-#  dishonest and merging is deliberately out of scope (this script has exactly three
-#  subcommands and adds no lcov -a step).  Close it by adding L2 cases.
+#  What that condition looked like when last measured with this script, rather than assumed.
+#  These are dated observations, not promises about the tree you are looking at: the figures
+#  move whenever the suites or the plugin move, and re-measuring them is precisely this
+#  script's job.
+#      L1: 324 tests green, aggregate 86.2% (1837/2131).  HdmiCecSink.cpp 94.9%,
+#          HdmiCecSink.h 99.2%, HdmiCecSinkImplementation.cpp 83.7%,
+#          HdmiCecSinkImplementation.h 100.0%; plugin/Module.cpp exempt at 0/1.  `l1` exits 0.
+#      L2: 125 tests green across two shards, aggregate 84.4% (1797/2130).
+#          HdmiCecSink.h 97.7%, HdmiCecSinkImplementation.cpp 82.8%,
+#          HdmiCecSinkImplementation.h 92.4%, Module.cpp 100.0%; plugin/HdmiCecSink.cpp
+#          exempt at its 78.0% ceiling.  `l2` exits 0.
+#  L2 did NOT always clear the bar.  It was measured at aggregate 78.17% with
+#  HdmiCecSinkImplementation.cpp at 77.98% and HdmiCecSinkImplementation.h at 70.76%, and it
+#  was closed the only honest way -- by adding L2 cases that reach the port-map and route
+#  resolution, inbound <Feature Abort> and ARC-teardown paths, and by enumerating the plugin
+#  shell's genuine L2 ceiling in L2_GATE_EXEMPT with a per-line reason.  Two defects in the
+#  shared CEC mock had to be repaired before any of that was reachable at all; they are
+#  written up in Tests/README.md.  If the figure regresses, close it the same way.  Do NOT
+#  "fix" it by adding an exclusion glob, by lowering COVERAGE_MIN in a committed caller, or by
+#  merging the two levels into one trace; the first two are dishonest and merging is
+#  deliberately out of scope (this script has exactly three subcommands and adds no lcov -a
+#  step).
 #
 #  ----------------------------------------------------------------------------------
 #  lcov 2.x BEHAVIOURS RESPECTED HERE (the first four are known; the last two were
@@ -377,7 +396,10 @@
 #          rdk<LEVEL>TestResults.json       GoogleTest machine-readable results
 #          valgrind_log                     only when RUN_VALGRIND is enabled
 #
-#  ARTIFACT_ROOT defaults to "$WS/coverage-artifacts".
+#  ARTIFACT_ROOT defaults to "${TMPDIR:-/tmp}/entservices-hdmicecsink-coverage/<workspace
+#  basename>" -- deliberately OUTSIDE the git checkout, because nothing here ignores the
+#  artifact names and a default-path run would otherwise leave committable output in the
+#  working tree.  See the comment on ARTIFACT_ROOT below for the full reasoning.
 #
 #  WHY THIS DIVERGES FROM CI'S FLAT LAYOUT, deliberately: CI writes coverage.info,
 #  filtered_coverage.info, coverage/ and rdkL1TestResults.json straight into
@@ -394,8 +416,12 @@
 #  the results file is written by out-of-scope framework code.
 #  entservices-testframework/Tests/L2Tests/L2testController.cpp:91-93 spawns WPEFramework
 #  with `export GTEST_OUTPUT="json:$PWD/rdkL2TestResults.json"`, overriding whatever this
-#  script exports, so the L2 file always appears at "$WS/rdkL2TestResults.json".  The script
-#  therefore deletes that fixed path before launching L2, requires the run to recreate it,
+#  script exports, so the L2 file always appears in the directory the suite RUNS in.  That
+#  directory is the install tree's parent (see run_suite: the framework also resolves
+#  "./install/etc/WPEFramework/plugins/" relatively), so the path is
+#  "$(dirname INSTALL_DIR)/rdkL2TestResults.json" -- which is "$WS/rdkL2TestResults.json" for the
+#  default layout, exactly as in CI.  The script deletes that path before launching L2,
+#  requires the run to recreate it,
 #  and then archives it into the level's artifact directory, which is the copy the report
 #  consumes.  At L1 the binary honours GTEST_OUTPUT, so the file is written into the
 #  artifact directory directly.
@@ -448,6 +474,34 @@ INSTALL_DIR="${INSTALL_DIR:-$WS/install}"
 COVERAGE_MIN="${COVERAGE_MIN:-80}"                            # the line-coverage bar
 RUN_VALGRIND="${RUN_VALGRIND:-0}"
 
+# How many GoogleTest shards the L2 suite is run in.  This is NOT a performance knob; it is
+# what keeps the L2 suite inside a hard framework timeout.
+#
+# entservices-testframework/Tests/L2Tests/L2testController.cpp:428 invokes the whole of
+# RUN_ALL_TESTS() through a single COM-RPC call, and that call carries
+# Thunder/Source/com/Administrator.h's RPC::CommunicationTimeOut -- which the framework's own
+# patch (patches/Increase_Timout_For_L2Tests_Plugin.patch) sets to 900000 ms, 15 minutes.  When
+# the suite outlasts it the controller logs "L2 tests failed: -2147483637" (error|ERROR_TIMEDOUT)
+# and immediately STOPS THUNDER while gtest is still running, so every remaining test's
+# Controller.1.activate/deactivate returns ERROR_TIMEDOUT and the tail of the suite fails as
+# collateral -- including tests that are perfectly healthy.  The wrapper still exits 0 in that
+# state, which is why verify_results() insists on a results file.
+#
+# The measured baseline for this plugin is 117 tests in 852.84 s, i.e. 47 s of headroom against
+# the 900 s ceiling, with ~6.5 s of that per test spent activating and deactivating PowerManager
+# and HdmiCecSink and ~20 s of run-to-run variance.  The suite was therefore already within a
+# few percent of failing spontaneously, and no coverage-closing test could be added at all.
+#
+# GoogleTest's own GTEST_TOTAL_SHARDS / GTEST_SHARD_INDEX variables split the case list without
+# naming a single test, so nothing here is coupled to test names, and each shard is a fresh
+# process with a fresh 15-minute budget.  gcov merges its counters into the same .gcda files on
+# every process exit, so the union of the shards is what the capture step sees -- no lcov merge
+# and no coverage arithmetic is involved.  Every shard must exit 0 and write its own results
+# file; the reported test count is the sum.
+#
+# Set L2_SHARDS=1 to reproduce the single-process behaviour (and the ceiling with it).
+L2_SHARDS="${L2_SHARDS:-2}"
+
 # Per-level overrides.  L1 and L2 need differently configured trees (different -I /
 # -include / -D / -Wl blocks and a level-specific mocks library), so each level resolves
 # its own build and install directory.  Both default to the single-tree values above, which
@@ -467,7 +521,20 @@ LEVEL_REBUILD_CMD="${LEVEL_REBUILD_CMD:-}"
 # Artifact root.  Every artifact is written under $ARTIFACT_ROOT/<repository>/<level>/ so
 # that this runner's evidence cannot be overwritten by, or confused with, the sibling
 # source-plugin and middleware runners that share the same workspace.
-ARTIFACT_ROOT="${ARTIFACT_ROOT:-$WS/coverage-artifacts}"
+#
+# THE DEFAULT IS OUTSIDE THE CHECKOUT, and it did not used to be: it was
+# "$WS/coverage-artifacts", mirroring CI writing into $GITHUB_WORKSPACE.  That is safe in CI,
+# where the workspace is thrown away after every job, and unsafe here, where $WS is a
+# long-lived git checkout: neither this repository nor the superproject has a .gitignore
+# covering coverage_<level>.info, filtered_coverage_<level>.info or coverage_<level>/, so a
+# default-path run left committable build output inside the working tree and `git add -A`
+# would have staged it.  Editing a .gitignore is out of scope here, so the fix is placement,
+# and it matches what the middleware runner already does.  The workspace-root basename keeps
+# parallel checkouts of this superproject from overwriting each other's evidence without
+# needing any environment variable.  Point ARTIFACT_ROOT back into the tree if you want CI's
+# literal layout; warn_artifact_root_in_tree() will say so, and keeping it out of a commit
+# then becomes yours to manage.
+ARTIFACT_ROOT="${ARTIFACT_ROOT:-${TMPDIR:-/tmp}/$REPO_NAME-coverage/$(basename -- "$WS")}"
 
 # Resolved per level by run_level() before anything else happens.
 LEVEL_BUILD_DIR=''
@@ -534,11 +601,70 @@ readonly L2_EXCLUDES=(
 #   either a live-host test (outside the L1 execution model) or a change to the module
 #   declaration (production source).  The list is level-aware because the L2 suite does
 #   drive an in-process host and therefore can reach it.
+#
+#   plugin/HdmiCecSink.cpp at L2 -- the plugin SHELL has a hard L2 ceiling of 46/59 = 78.0%,
+#   below the bar and not raisable by any test.  All thirteen remaining lines are covered by
+#   this repository's own L1 suite (which measures this file at 56/59 = 94.9%), so the file is
+#   not under-tested: it is the L2 execution model that cannot reach them.  Enumerated:
+#     * Information() -- 2 lines.  PluginHost::IPlugin::Information() is declared pure virtual
+#       at Thunder/Source/plugins/IPlugin.h:97 and is called NOWHERE in Thunder R4.4.1; a grep
+#       of Thunder/Source finds only the Controller's own override.
+#     * the Root<> failure arm -- 3 lines.  A live Thunder host resolves
+#       _service->Root<Exchange::IHdmiCecSink>() against an installed, loadable implementation
+#       library; there is no L2 seam that makes it return null, and manufacturing one would be
+#       a production change.
+#     * the out-of-process teardown block -- 7 lines (RemoteConnection / Terminate / its catch /
+#       Release).  At L2 the implementation runs IN-PROCESS, so _connectionId is 0 and
+#       _service->RemoteConnection(0) is null; the block is dead by construction.
+#     * Deactivated()'s id-match Submit -- 1 line.  Thunder allocates connection ids from 1 and
+#       _connectionId is 0 in-process, so connection->Id() == _connectionId never holds.
+#   Reaching any of these at L2 would need an out-of-process plugin host or a change to Thunder
+#   or to the plugin -- production code, out of scope.  No exclusion glob is used and
+#   COVERAGE_MIN is not lowered; the file keeps its real 78.0% and stays in the denominator.
 # ------------------------------------------------------------------------------------
 readonly L1_GATE_EXEMPT=(
     'plugin/Module.cpp'
 )
-readonly L2_GATE_EXEMPT=()
+readonly L2_GATE_EXEMPT=(
+    'plugin/HdmiCecSink.cpp'
+)
+
+# ------------------------------------------------------------------------------------
+# Must-not-regress floors, recorded from measured baselines for this submodule.  A floor is
+# not a target to descend to: the specification's section 0.9.4 records the figures that
+# already existed precisely so a file cannot quietly give them back while still clearing the
+# 80% bar.  A breach does not fail the gate on its own -- the gate is the bar -- but it is
+# reported prominently and repeated in the closing summary.
+#
+# Format: <path relative to the repository>=<recorded baseline line coverage percentage>
+#
+# LEVEL-SCOPED, and for a measured reason: the two levels reach genuinely different code, so
+# the SAME sources give HdmiCecSinkImplementation.h 100% under L1 and 92.4% under L2, and
+# HdmiCecSink.h 99.2% under L1 and 97.7% under L2.  Applying an L1 baseline to an L2 trace
+# would report a "regression" that never happened, so each level's floors come from a trace
+# measured at that level and are never carried across.
+#
+# The L2 floors were MEASURED, not chosen: they are what this script reported once the L2
+# cases that closed the gap were in place (aggregate 84.4%, 1797/2130, 125 tests green across
+# two shards).  Before them this level had no floor at all, so nothing protected the move from
+# 78.17% to 84.4% -- a later change could have handed most of it back and still passed the
+# bar.  Each figure is the measured value recorded exactly, with no margin added.
+#   The file each level EXEMPTS is deliberately given no floor for that level:
+#   plugin/Module.cpp has none at L1 and plugin/HdmiCecSink.cpp none at L2, because a floor on
+#   a waived verdict would be a second, contradictory judgement on the same file.
+# ------------------------------------------------------------------------------------
+readonly L1_COVERAGE_FLOORS=(
+    'plugin/HdmiCecSink.cpp=94.9'
+    'plugin/HdmiCecSink.h=99.2'
+    'plugin/HdmiCecSinkImplementation.cpp=83.6'
+    'plugin/HdmiCecSinkImplementation.h=100.0'
+)
+readonly L2_COVERAGE_FLOORS=(
+    'plugin/HdmiCecSink.h=97.7'
+    'plugin/HdmiCecSinkImplementation.cpp=82.8'
+    'plugin/HdmiCecSinkImplementation.h=92.4'
+    'plugin/Module.cpp=100.0'
+)
 
 log()  { printf '[run_coverage] %s\n' "$*"; }
 warn() { printf '[run_coverage] WARNING: %s\n' "$*" >&2; }
@@ -748,19 +874,37 @@ Environment variables (all optional; shown with their defaults):
                                  as '<cmd> <level>' before each level under 'all'; it owns
                                  the documented plugin -> testframework -> mocks rebuild
                                  sequence.  Currently: ${LEVEL_REBUILD_CMD:-<unset>}
-  ARTIFACT_ROOT=\$WS/coverage-artifacts
+  ARTIFACT_ROOT=\${TMPDIR:-/tmp}/$REPO_NAME-coverage/<workspace basename>
                                  Root of the artifact tree; this run writes to
-                                 \$ARTIFACT_ROOT/$REPO_NAME/<level>/.
+                                 \$ARTIFACT_ROOT/$REPO_NAME/<level>/.  Defaults OUTSIDE the
+                                 checkout so a run leaves no committable output in the
+                                 working tree.  Created only after the level's prerequisites
+                                 have been validated.
                                  Currently: $ARTIFACT_ROOT
   COVERAGE_MIN=80                Line-coverage bar, applied to the level aggregate and to
-                                 each target.  Currently: $COVERAGE_MIN
+                                 each target.  Spelled as digits or digits.digits (80, 0,
+                                 100, 80.5) and between 0 and 100; anything else is refused
+                                 rather than coerced.  Any value other than 80 marks the run
+                                 as a diagnostic.  Currently: $COVERAGE_MIN
   RUN_VALGRIND=0                 Set to 1/true/yes/on to run the suite under valgrind
                                  memcheck with the options CI uses.  Currently: $RUN_VALGRIND
+  L2_SHARDS=2                    How many processes the L2 case list is split across, via
+                                 GoogleTest's GTEST_TOTAL_SHARDS / GTEST_SHARD_INDEX.  1 to 8.
+                                 This exists because the framework invokes the whole of
+                                 RUN_ALL_TESTS() through one COM-RPC call bounded at 900 s and
+                                 then stops Thunder mid-suite when it overruns, failing healthy
+                                 tests as collateral; this suite's baseline is already 852.84 s.
+                                 gcov merges each shard's counters into the same .gcda files, so
+                                 the capture measures the union with no lcov merge involved.
+                                 L1 is never sharded.  Currently: $L2_SHARDS
 
 Artifacts (fixed names, no timestamps) in \$ARTIFACT_ROOT/$REPO_NAME/<level>/:
   coverage_<level>.info, filtered_coverage_<level>.info, coverage_<level>/index.html,
-  rdk<LEVEL>TestResults.json, and valgrind_log when RUN_VALGRIND is enabled.
-  At L2 the framework itself writes \$WS/rdkL2TestResults.json (it exports GTEST_OUTPUT
+  rdk<LEVEL>TestResults.json, and valgrind_log when RUN_VALGRIND is enabled.  A sharded level
+  archives rdk<LEVEL>TestResults.shard<N>.json per shard plus a
+  rdk<LEVEL>TestResults.summary.json roll-up instead of a single results file.
+  At L2 the framework itself writes rdkL2TestResults.json into the directory the suite runs in
+  -- the install tree's parent, which is \$WS for the default layout (it exports GTEST_OUTPUT
   before spawning WPEFramework); that file is deleted before the run and archived into the
   artifact directory afterwards.
 
@@ -1006,8 +1150,14 @@ resolve_level_inputs() {
         l2) LEVEL_BUILD_DIR="$L2_BUILD_DIR"; LEVEL_INSTALL_DIR="$L2_INSTALL_DIR" ;;
         *)  die "resolve_level_inputs: unknown level '$level'" ;;
     esac
+    # RESOLVED here, CREATED later.  This function only decides where the artifacts will go;
+    # create_level_artifact_dir() below actually makes the directory, and it is called after
+    # this level's prerequisites have been validated.  The split exists because a run that
+    # dies at preflight -- an unbuilt tree, an install directory belonging to the other
+    # plugin, a missing test binary -- used to leave an empty
+    # $ARTIFACT_ROOT/<repo>/<level>/ behind it, so a failed run mutated the filesystem
+    # before it had established it could measure anything at all.
     LEVEL_ARTIFACT_DIR="$ARTIFACT_ROOT/$REPO_NAME/$level"
-    mkdir -p "$LEVEL_ARTIFACT_DIR" || die "cannot create the artifact directory: $LEVEL_ARTIFACT_DIR"
     # The install directory is caller-supplied and becomes a library search path for the test
     # binary, so it is required to be ABSOLUTE before anything else happens to it.  Canonicalising
     # a relative value (validate_install_dir below would happily do so) would resolve it against
@@ -1030,6 +1180,22 @@ resolve_level_inputs() {
     log "${level^^} install dir (canonical): $LEVEL_INSTALL_DIR"
 
     assert_safe_artifact_path "$LEVEL_ARTIFACT_DIR" dir
+}
+
+# ------------------------------------------------------------------------------------
+# Create the level's artifact directory.  Deliberately NOT part of resolve_level_inputs():
+# it is the first thing this script writes anywhere, so it happens only once the level's
+# prerequisites have been checked and this run is known to be capable of producing evidence.
+# Called immediately before the counters are zeroed -- i.e. after preflight, and before the
+# first side effect on the build tree.
+# ------------------------------------------------------------------------------------
+create_level_artifact_dir() {
+    local level="$1"
+    # Re-checked here as well as in resolve_level_inputs: preflight takes time, and a symlink
+    # or a file could have appeared at the path in between.
+    assert_safe_artifact_path "$LEVEL_ARTIFACT_DIR" dir
+    mkdir -p "$LEVEL_ARTIFACT_DIR" || die "cannot create the artifact directory: $LEVEL_ARTIFACT_DIR"
+    log "${level^^} artifact directory ready: $LEVEL_ARTIFACT_DIR"
 }
 
 # ------------------------------------------------------------------------------------
@@ -1134,6 +1300,10 @@ verify_fresh_counters() {
 #     plugin's fixtures from the other plugin's and from the framework's own test_JSON.cpp
 #     cases.  This is the post-run counterpart to preflight's library check: preflight can
 #     only warn, whereas this refuses the evidence.
+# Set by verify_results() to the test count it read out of the results file, so a sharded run
+# can sum the shards without having to parse verify_results' log output.
+VERIFIED_TEST_COUNT=0
+
 verify_results() {
     local binary="$1" results="$2" count
 
@@ -1156,6 +1326,7 @@ verify_results() {
        cases -- while the capture would credit this plugin's objects.  Rebuild this plugin
        and then rebuild entservices-testframework against it (see this script's header)."
     fi
+    VERIFIED_TEST_COUNT="$count"
     log "$binary reported $count test cases in $results, including HdmiCecSink fixtures"
 }
 
@@ -1165,27 +1336,57 @@ run_suite() {
         # At L1 the binary honours GTEST_OUTPUT, so the results file is written straight
         # into the level's artifact directory.  At L2 it cannot be: L2testController.cpp:91
         # exports GTEST_OUTPUT="json:$PWD/rdkL2TestResults.json" before spawning
-        # WPEFramework, overriding whatever this script sets, so the file always lands at
-        # "$WS/rdkL2TestResults.json" and is archived into the artifact directory afterwards.
+        # WPEFramework, overriding whatever this script sets, so the file always lands in the
+        # directory the suite runs in -- the install tree's parent, per run_dir below -- and is
+        # archived into the artifact directory afterwards.
         l1) binary='RdkServicesL1Test'; results="$LEVEL_ARTIFACT_DIR/rdkL1TestResults.json" ;;
-        l2) binary='RdkServicesL2Test'; results="$WS/rdkL2TestResults.json" ;;
+        l2) binary='RdkServicesL2Test'; results="$(dirname -- "$LEVEL_INSTALL_DIR")/rdkL2TestResults.json" ;;
         *)  die "run_suite: unknown level '$level'" ;;
     esac
+
+    # WHERE the suite runs, and why it is not simply "here".
+    #
+    # At L2 the out-of-scope framework controller resolves the plugin configuration directory as
+    # the RELATIVE path "./install/etc/WPEFramework/plugins/"
+    # (entservices-testframework/Tests/L2Tests/L2testController.cpp:344) and returns
+    # EXIT_AUTOSTART_FAILURE with the opaque message "Error opening directory" when it is not
+    # reachable from the working directory.  Anchoring on the install tree's PARENT is what makes
+    # that relative path resolve for any INSTALL_DIR, which is also what the sibling
+    # entservices-hdmicecsource runner does -- and in CI the two are the same directory, because
+    # the install prefix is $GITHUB_WORKSPACE/install and the workflow's working directory is
+    # $GITHUB_WORKSPACE, so this reproduces CI exactly for the default layout.
+    #
+    # Before this, the suite ran in whatever directory the caller happened to be in, so pointing
+    # INSTALL_DIR at a tree outside $WS made every L2 run fail before a single test started while
+    # the same override worked fine on the source plugin.  The two runners are now consistent.
+    local run_dir
+    if [ "$level" = 'l2' ]; then
+        run_dir="$(dirname -- "$LEVEL_INSTALL_DIR")"
+    else
+        run_dir="$PWD"
+    fi
 
     command -v "$binary" >/dev/null 2>&1 || die "$binary is not on PATH.
        Expected it in $LEVEL_INSTALL_DIR/usr/bin -- build and install the plugin and the test
        framework first (see the build recipe in this script's header)."
 
-    # The test framework's L2 controller resolves the plugin configuration directory as the
-    # relative path "./install/etc/WPEFramework/plugins/", so L2 starts only when the working
-    # directory contains install/.  Its own diagnostic for that is the opaque "Error opening
-    # directory", so name the real cause here instead.
-    if [ "$level" = 'l2' ] && [ ! -d "$WS/install/etc/WPEFramework/plugins" ]; then
-        warn "$WS/install/etc/WPEFramework/plugins does not exist.
-         RdkServicesL2Test reads that path relative to the working directory, so it will
-         fail with \"Error opening directory\" before any test runs.  Either leave
-         INSTALL_DIR at its default (\$WS/install) or make \$WS/install resolve to
-         $LEVEL_INSTALL_DIR."
+    # The relative path the controller opens is literally "./install/...", so the install tree has
+    # to BE called "install" even once the working directory is anchored on its parent.  That is
+    # the framework's assumption, not this script's, and it cannot be fixed from here -- so it is
+    # surfaced as a named warning rather than allowed to look like a test failure.
+    if [ "$level" = 'l2' ] && [ "$(basename -- "$LEVEL_INSTALL_DIR")" != 'install' ]; then
+        warn "the L2 install tree is named '$(basename -- "$LEVEL_INSTALL_DIR")', not 'install'.
+         L2testController.cpp:344 opens the hard-coded relative path
+         './install/etc/WPEFramework/plugins/', so it will not find the plugin configs and the
+         suite will fail with \"Error opening directory\" before any test runs.  Point
+         L2_INSTALL_DIR/INSTALL_DIR at a directory named 'install'.  (Framework code is out of
+         scope for this change.)"
+    fi
+    if [ "$level" = 'l2' ] && [ ! -d "$LEVEL_INSTALL_DIR/etc/WPEFramework/plugins" ]; then
+        warn "$LEVEL_INSTALL_DIR/etc/WPEFramework/plugins does not exist.
+         RdkServicesL2Test reads that path relative to its working directory (this script runs it
+         in $run_dir so './install/...' resolves), so it will fail with \"Error opening
+         directory\" before any test runs.  Install the plugin and the test framework first."
     fi
 
     # Machine-readable results, matching the workflow's own GTEST_OUTPUT for L1.  The L2
@@ -1195,45 +1396,126 @@ run_suite() {
     # though the controller wins at L2.
     export GTEST_OUTPUT="json:$results"
 
-    # Remove the level's results file FIRST, so that a file existing after the run can only
-    # have been written by the run.  Without this, a binary that starts, tests nothing and
-    # exits 0 leaves an earlier run's results in place and looks like a pass.
-    rm -f "$results"
-    [ ! -e "$results" ] || die "cannot remove the previous results file at $results, so a
+    # How many processes the case list is split across.  Only L2 is sharded, and only because of
+    # the 15-minute COM-RPC ceiling documented on L2_SHARDS above; L1 runs in one process because
+    # it has no such ceiling and its whole suite finishes in seconds.
+    local shards=1
+    [ "$level" = 'l2' ] && shards="$L2_SHARDS"
+
+    local results_base total=0 idx=0 archived shard_files=()
+    results_base="$(basename -- "$results")"
+
+    while [ "$idx" -lt "$shards" ]; do
+        if [ "$shards" -gt 1 ]; then
+            # GoogleTest's own sharding contract: with both variables set it runs only the cases
+            # whose index is congruent to GTEST_SHARD_INDEX modulo GTEST_TOTAL_SHARDS.  No test
+            # name appears anywhere, so adding, removing or renaming a case cannot desynchronise
+            # this loop from the suite.
+            export GTEST_TOTAL_SHARDS="$shards"
+            export GTEST_SHARD_INDEX="$idx"
+            archived="${results_base%.json}.shard${idx}.json"
+        else
+            unset GTEST_TOTAL_SHARDS GTEST_SHARD_INDEX
+            archived="$results_base"
+        fi
+
+        # Remove the level's results file FIRST, so that a file existing after the run can only
+        # have been written by the run.  Without this, a binary that starts, tests nothing and
+        # exits 0 leaves an earlier run's results in place and looks like a pass.  With sharding
+        # this matters twice over, because every shard writes the same framework-chosen path.
+        rm -f "$results"
+        [ ! -e "$results" ] || die "cannot remove the previous results file at $results, so a
        fresh one could not be told apart from it.  Refusing to run rather than measure
        against evidence that may predate this run."
 
-    rule
-    if valgrind_enabled; then
-        log "running $binary under valgrind memcheck (options as in CI)"
-        "$VALGRIND_BIN" \
-            --tool=memcheck \
-            --log-file="$LEVEL_ARTIFACT_DIR/valgrind_log" \
-            --leak-check=yes \
-            --show-reachable=yes \
-            --track-fds=yes \
-            --fair-sched=try \
-            "$binary" || rc=$?
-    else
-        log "running $binary"
-        "$binary" || rc=$?
-    fi
-    rule
+        rule
+        if [ "$shards" -gt 1 ]; then
+            log "shard $((idx + 1)) of $shards  (GTEST_TOTAL_SHARDS=$shards GTEST_SHARD_INDEX=$idx)"
+        fi
+        log "working dir     = $run_dir  (so the framework's './install/...' paths resolve)"
+        rc=0
+        if valgrind_enabled; then
+            log "running $binary under valgrind memcheck (options as in CI)"
+            (
+                cd -- "$run_dir" || exit 1
+                "$VALGRIND_BIN" \
+                    --tool=memcheck \
+                    --log-file="$LEVEL_ARTIFACT_DIR/valgrind_log" \
+                    --leak-check=yes \
+                    --show-reachable=yes \
+                    --track-fds=yes \
+                    --fair-sched=try \
+                    "$binary"
+            ) || rc=$?
+        else
+            log "running $binary"
+            (
+                cd -- "$run_dir" || exit 1
+                "$binary"
+            ) || rc=$?
+        fi
+        rule
 
-    [ "$rc" -eq 0 ] || die "$binary exited with status $rc.
+        if [ "$rc" -ne 0 ]; then
+            if [ "$shards" -gt 1 ]; then
+                die "$binary exited with status $rc on shard $((idx + 1)) of $shards.
        The suite must pass at runtime before its coverage means anything, so this run is
        a failure.  Results (if written): $results"
-    verify_results "$binary" "$results"
+            fi
+            die "$binary exited with status $rc.
+       The suite must pass at runtime before its coverage means anything, so this run is
+       a failure.  Results (if written): $results"
+        fi
+        verify_results "$binary" "$results"
+        total=$((total + VERIFIED_TEST_COUNT))
 
-    # Attribution: the L2 results file is written by framework code at a fixed path shared
-    # with every other runner in this workspace, so archive it beside this level's traces.
-    # The archived copy is what the traceability report cites.
-    if [ "$results" != "$LEVEL_ARTIFACT_DIR/$(basename -- "$results")" ]; then
-        cp -f "$results" "$LEVEL_ARTIFACT_DIR/$(basename -- "$results")" \
-            || die "could not archive $results into $LEVEL_ARTIFACT_DIR"
-        log "archived $(basename -- "$results") -> $LEVEL_ARTIFACT_DIR/"
+        # Attribution: the L2 results file is written by framework code at a fixed path shared
+        # with every other runner in this workspace, so archive it beside this level's traces.
+        # The archived copy is what the traceability report cites.  At L1 the binary honours
+        # GTEST_OUTPUT, so the file is already AT its archive path and copying it onto itself is
+        # an error rather than a no-op -- hence the guard.
+        if [ "$results" != "$LEVEL_ARTIFACT_DIR/$archived" ]; then
+            cp -f "$results" "$LEVEL_ARTIFACT_DIR/$archived" \
+                || die "could not archive $results into $LEVEL_ARTIFACT_DIR"
+            log "archived $archived -> $LEVEL_ARTIFACT_DIR/"
+        fi
+        shard_files+=("$archived")
+
+        idx=$((idx + 1))
+    done
+
+    unset GTEST_TOTAL_SHARDS GTEST_SHARD_INDEX
+
+    [ "$total" -gt 0 ] || die "$binary exited 0 for every shard but reported no tests in total.
+       An empty suite cannot substantiate a coverage figure."
+
+    if [ "$shards" -gt 1 ]; then
+        # A single machine-readable roll-up so the artifact set stays predictable when the run is
+        # sharded.  It is deliberately NOT written to $results_base: that name means "GoogleTest's
+        # own JSON report" everywhere else, and this is a summary of several of them.
+        {
+            printf '{\n'
+            printf '  "shards": %d,\n' "$shards"
+            printf '  "tests": %d,\n' "$total"
+            printf '  "failures": 0,\n'
+            printf '  "shard_results": ['
+            local first=1 f
+            for f in "${shard_files[@]}"; do
+                [ "$first" -eq 1 ] || printf ','
+                printf '\n    "%s"' "$f"
+                first=0
+            done
+            printf '\n  ]\n'
+            printf '}\n'
+        } > "$LEVEL_ARTIFACT_DIR/${results_base%.json}.summary.json" \
+            || die "could not write the shard summary into $LEVEL_ARTIFACT_DIR"
+        log "wrote ${results_base%.json}.summary.json -> $LEVEL_ARTIFACT_DIR/"
+        log "$binary passed (exit 0) in $shards shards; $total test cases in total.
+       gcov merged every shard's counters into the same .gcda files, so the capture below
+       measures the union of the shards."
+    else
+        log "$binary passed (exit 0); results: $results"
     fi
-    log "$binary passed (exit 0); results: $results"
 }
 
 # ------------------------------------------------------------------------------------
@@ -1379,6 +1661,10 @@ capture_coverage() {
 # COVERAGE_MIN and are not exempt, one "path pct" pair per line.
 REPORT_BELOW_TARGETS=''
 
+# Set by per_file_report() to the floored targets that measured BELOW their recorded baseline,
+# one "path now floor" triple per line, so the closing summary can repeat them.
+REPORT_FLOOR_BREACHES=''
+
 # ------------------------------------------------------------------------------------
 # Two awk passes with a sort between them rather than one pass, because /usr/bin/awk here is
 # mawk and has no array-sorting function; the sort is what makes the row order independent of
@@ -1389,17 +1675,27 @@ per_file_report() {
     local level="$1"
     local filtered="$LEVEL_ARTIFACT_DIR/filtered_coverage_$level.info"
     local exempt_list=' '
+    local floor_list=''
     local report tab
-    local -a exempt
+    local -a exempt floors
 
     case "$level" in
-        l1) exempt=("${L1_GATE_EXEMPT[@]}") ;;
-        l2) exempt=("${L2_GATE_EXEMPT[@]}") ;;
+        l1) exempt=("${L1_GATE_EXEMPT[@]}")
+            floors=("${L1_COVERAGE_FLOORS[@]+"${L1_COVERAGE_FLOORS[@]}"}") ;;
+        l2) exempt=("${L2_GATE_EXEMPT[@]}")
+            floors=("${L2_COVERAGE_FLOORS[@]+"${L2_COVERAGE_FLOORS[@]}"}") ;;
         *)  die "per_file_report: unknown level '$level'" ;;
     esac
     local e
     for e in "${exempt[@]}"; do
         exempt_list="$exempt_list$e "
+    done
+    # Space-separated "path=pct" pairs; the awk pass below splits on space then on '='.  No
+    # path in this repository contains either character, and a path that did would show up as a
+    # floor that never matches rather than as a silently wrong comparison.
+    local f
+    for f in ${floors[@]+"${floors[@]}"}; do
+        floor_list="$floor_list $f"
     done
 
     tab="$(printf '\t')"
@@ -1431,7 +1727,7 @@ per_file_report() {
         ' "$filtered" \
         | LC_ALL=C sort -t "$tab" -k1,1 \
         | awk -F'\t' -v min="$COVERAGE_MIN" -v repo="$REPO_NAME" -v exempt="$exempt_list" \
-              -v level="$level" '
+              -v floors="$floor_list" -v level="$level" '
             function pct(hit, found) { return found > 0 ? 100 * hit / found : 0 }
             function relpath(p,   marker, at) {
                 marker = "/" repo "/"
@@ -1446,6 +1742,13 @@ per_file_report() {
                 return sprintf("%6.1f%% %5d/%-5d", pct(hit, found), hit, found)
             }
             BEGIN {
+                n = split(floors, parts, " ")
+                for (i = 1; i <= n; i++) {
+                    if (parts[i] == "") continue
+                    eq = index(parts[i], "=")
+                    if (eq > 0)
+                        floor_of[substr(parts[i], 1, eq - 1)] = substr(parts[i], eq + 1) + 0
+                }
                 printf "Per-file coverage (%s), derived from the filtered trace records\n", toupper(level)
                 printf "%-44s %19s %19s %19s  %s\n", \
                        "FILE", "LINES", "FUNCTIONS", "BRANCHES", "LINE GATE"
@@ -1467,6 +1770,17 @@ per_file_report() {
                                           printf "##EXEMPTBELOW %s %.1f\n", rel, lpct }
                 else                    { verdict = "BELOW"
                                           printf "##BELOW %s %.1f\n", rel, lpct }
+
+                # Floors are compared with a 0.05 percentage-point tolerance, which absorbs the
+                # rounding in the recorded baselines (a file recorded at 82.8 measuring 82.79 is
+                # the same measurement, not a regression).
+                if (rel in floor_of) {
+                    fl = floor_of[rel]
+                    if (lpct + 0.05 < fl)
+                        printf "##FLOORBREACH %s %.1f %.1f\n", rel, lpct, fl
+                    else
+                        printf "##FLOOROK %s %.1f %.1f\n", rel, lpct, fl
+                }
 
                 printf "%-44s %19s %19s %19s  %s\n", rel, \
                        cell(lh, lf, lf > 0), \
@@ -1517,6 +1831,9 @@ per_file_report() {
 
     printf '%s\n' "$report" | grep -v '^##' || true
     REPORT_BELOW_TARGETS="$(printf '%s\n' "$report" | sed -n 's/^##BELOW //p')"
+    REPORT_FLOOR_BREACHES="$(printf '%s\n' "$report" | sed -n 's/^##FLOORBREACH //p')"
+
+    report_floors "$level" "$report"
 
     local exempt_below
     exempt_below="$(printf '%s\n' "$report" | sed -n 's/^##EXEMPTBELOW //p')"
@@ -1524,22 +1841,88 @@ per_file_report() {
         rule
         log "below the bar but enumerated as uncoverable at this level (gate waived, figures still reported):"
         printf '%s\n' "$exempt_below" | while read -r path pct_value; do
-            # The wording here is level-specific on purpose, and it was corrected after being
-            # measured rather than assumed. Module.cpp's two functions are generated by the
-            # module-declaration macro and are invoked only by the Thunder plugin loader, so no
-            # in-process L1 GoogleTest can reach them. That is NOT the same as uncoverable: an
-            # L2 run starts a real Thunder host, and this same file measures 100% (1/1 lines,
-            # 2/2 functions) at L2 with no production change of any kind. Saying "would need a
-            # production change" without qualification would therefore be false, so the
-            # exemption is scoped to the level that actually cannot reach it.
-            log "    $path  $pct_value% -- macro-generated module accessors, invoked only by the"
-            log "        Thunder plugin loader, so unreachable from the in-process ${level^^} model."
-            if [ "$level" = l1 ]; then
-                log "        Measured at 100% under L2, which starts a real Thunder host: no production"
-                log "        change is required, only an execution model that loads the plugin."
-            fi
+            log "    $path  $pct_value%"
+            gate_exempt_reason "$level" "$path"
         done
     fi
+}
+
+# ------------------------------------------------------------------------------------
+# Must-not-regress floors.  A breach does not fail the gate on its own -- the gate is the >=
+# bar -- but it is surfaced prominently and repeated in the closing summary, because a file
+# sliding from 100% to 85% while still "passing" is exactly the regression the specification's
+# floor language exists to catch.
+# ------------------------------------------------------------------------------------
+report_floors() {
+    local level="$1" report="$2" ok breaches
+    ok="$(printf '%s\n' "$report" | sed -n 's/^##FLOOROK //p')"
+    breaches="$(printf '%s\n' "$report" | sed -n 's/^##FLOORBREACH //p')"
+    rule
+    if [ -z "$ok" ] && [ -z "$breaches" ]; then
+        log "must-not-regress floors: none of the floored files appear in this ${level^^} trace."
+        return 0
+    fi
+    log "must-not-regress floors (recorded ${level^^} baseline percentages, not live measurements):"
+    if [ "$level" = l2 ]; then
+        log "    Recorded per level and never carried across: the two levels reach different code, so"
+        log "    HdmiCecSinkImplementation.h measures 100% under L1 and 92.4% under L2 from the same"
+        log "    sources.  These L2 figures were measured by this script once the L2 cases that closed"
+        log "    the gap were in place; before them the level had no floor at all and nothing"
+        log "    protected the move from 78.17% to 84.4%."
+    fi
+    if [ -n "$ok" ]; then
+        printf '%s\n' "$ok" | while read -r path now floor; do
+            log "    OK       $path  now ${now}%  >= floor ${floor}%"
+        done
+    fi
+    if [ -n "$breaches" ]; then
+        printf '%s\n' "$breaches" | while read -r path now floor; do
+            warn "    BREACH   $path  now ${now}%  <  floor ${floor}%"
+        done
+        warn "    A floor is a floor, not a target to descend to: coverage that existed must not be"
+        warn "    lost as tests are added elsewhere.  Investigate before accepting this run."
+    fi
+}
+
+# The reason for one waiver, printed at the point of measurement so a number and its
+# justification can never drift apart.  Keyed on level AND path, because the same file can be
+# reachable at one level and not at the other -- which is the measured truth for both entries
+# below, and stating it unqualified would be false.  A path with no recorded reason is a bug in
+# the exemption list, so it says so loudly rather than printing nothing.
+gate_exempt_reason() {
+    local level="$1" path="$2"
+    case "$level/$path" in
+        l1/plugin/Module.cpp)
+            log "        Reason: macro-generated module accessors, invoked only by the Thunder plugin"
+            log "        loader, so unreachable from the in-process L1 model."
+            log "        Measured at 100% under L2, which starts a real Thunder host: no production"
+            log "        change is required, only an execution model that loads the plugin.  Saying"
+            log "        'uncoverable' without naming the level would therefore be false."
+            ;;
+        l2/plugin/HdmiCecSink.cpp)
+            log "        Reason: the plugin shell has a hard L2 ceiling of 46/59 = 78.0%.  Thirteen"
+            log "        lines are unreachable from the L2 execution model, each for a checked reason:"
+            log "          - Information() (2 lines): IPlugin::Information() is pure virtual at"
+            log "            Thunder/Source/plugins/IPlugin.h:97 and is called nowhere in Thunder"
+            log "            R4.4.1 -- only the Controller's own override exists."
+            log "          - the Root<> failure arm (3 lines): a live Thunder host resolves Root<>"
+            log "            against an installed, loadable implementation library, so there is no"
+            log "            L2 seam that makes it return null."
+            log "          - the out-of-process teardown block (7 lines): the implementation runs"
+            log "            IN-PROCESS at L2, so _connectionId is 0 and RemoteConnection(0) is null."
+            log "          - Deactivated()'s id-match Submit (1 line): connection ids start at 1 and"
+            log "            _connectionId is 0 in-process, so the comparison never holds."
+            log "        This repository's own L1 suite measures the SAME file at 94.9% (56/59), so the"
+            log "        file is tested -- it is this level that cannot reach those lines.  No exclusion"
+            log "        glob was added and COVERAGE_MIN was not lowered; reaching them at L2 would need"
+            log "        an out-of-process host or a production change, both out of scope."
+            ;;
+        *)
+            warn "no documented reason is recorded for the exemption '$path' at ${level^^}."
+            warn "    An exemption without a reason is not an exemption -- add one to"
+            warn "    gate_exempt_reason() or remove the entry from ${level^^}_GATE_EXEMPT."
+            ;;
+    esac
 }
 
 # ------------------------------------------------------------------------------------
@@ -1577,6 +1960,18 @@ apply_gate() {
         log "every ${level^^} target meets the ${COVERAGE_MIN}% bar (exemptions enumerated above)"
     fi
 
+    # Repeated here as well as at the point of measurement, because a breach is easy to scroll
+    # past in the per-file table and it does not fail the gate on its own -- the gate is the >=
+    # bar, and a file can sit well above the bar while having lost most of what it had.
+    if [ -n "$REPORT_FLOOR_BREACHES" ]; then
+        warn "these ${level^^} targets are BELOW their recorded must-not-regress baseline:"
+        printf '%s\n' "$REPORT_FLOOR_BREACHES" | while read -r path now floor; do
+            printf '[run_coverage]     %s  now %s%%  <  floor %s%%\n' "$path" "$now" "$floor" >&2
+        done
+        warn "    This does not fail the gate, but coverage that existed has been lost.  Find out"
+        warn "    which change gave it back before treating this run as acceptable."
+    fi
+
     [ "$failures" -eq 0 ] || die "level ${level^^} failed the coverage gate.
        Close the gap by adding tests -- never by adding an exclusion glob or by editing
        production source.  Set COVERAGE_MIN explicitly only for a deliberate diagnostic
@@ -1602,6 +1997,8 @@ run_level() {
     log "${level^^} artifacts   : $LEVEL_ARTIFACT_DIR"
     setup_runtime_env
     preflight "$level"
+    # First filesystem write of the run, and only now that preflight has passed.
+    create_level_artifact_dir "$level"
     resolve_lcov_config "$level"
     # Before the FIRST lcov invocation of the level -- which is the counter zeroing below,
     # not the capture.  main() has already done this for the run; it is repeated here (and is
@@ -1730,16 +2127,70 @@ main() {
     check_tooling
 
     [ -d "$WS" ] || die "WS does not exist: $WS"
+    # SHAPE.  The accepted spelling is deliberately the same as the two sibling runners':
+    # digits, or digits.digits.  This runner used to accept integers only, which meant the
+    # three runners in this workspace disagreed about what a threshold is -- COVERAGE_MIN=80.5
+    # was a working diagnostic bar for the source plugin and a hard error here, so the three
+    # could not be wired interchangeably into one pipeline.  lcov's --fail-under-lines takes a
+    # fractional bar, so accepting one costs nothing and refusing it bought nothing.
+    #
+    # What is NOT accepted is anything that would have to be guessed at: empty, a letter (`8O`
+    # for `80` is the classic typo), a sign, surrounding spaces, or more than one decimal
+    # point.  A bar that cannot be read exactly is refused rather than coerced, because a
+    # coerced bar produces a gate verdict for a percentage nobody asked for.
     case "$COVERAGE_MIN" in
-        ''|*[!0-9]*) die "COVERAGE_MIN must be a non-negative integer, got '$COVERAGE_MIN'" ;;
+        ''|*[!0-9.]*|*.*.*|.*|*.)
+            die "COVERAGE_MIN must be a number spelled as digits or digits.digits -- for
+       example 80, 0, 100 or 80.5 -- and between 0 and 100 (got '$COVERAGE_MIN').  A threshold
+       that cannot be read exactly is refused rather than rounded, because a coerced bar would
+       produce a gate verdict for a percentage nobody asked for." ;;
     esac
-    # Range as well as shape.  An out-of-range bar is not harmless just because it fails
-    # safe: 101 means every run fails the gate no matter how good the coverage is, and a
-    # gate that cannot pass is as uninformative as one that cannot fail.  The sibling
-    # runners refuse >100 for the same reason.
-    [ "$COVERAGE_MIN" -le 100 ] || die "COVERAGE_MIN must be between 0 and 100, got '$COVERAGE_MIN'.
+    # RANGE as well as shape.  An out-of-range bar is not harmless just because it fails safe:
+    # 101 means every run fails the gate no matter how good the coverage is, and a gate that
+    # cannot pass is as uninformative as one that cannot fail.  The sibling runners refuse
+    # >100 for the same reason.  Decided from the value's own digits rather than with shell
+    # arithmetic, because `[ 80.5 -le 100 ]` is a syntax error in every POSIX shell.
+    local min_int="${COVERAGE_MIN%%.*}" min_frac=""
+    case "$COVERAGE_MIN" in
+        *.*) min_frac="${COVERAGE_MIN#*.}" ;;
+    esac
+    : "${min_int:=0}"
+    while [ "${#min_int}" -gt 1 ] && [ "${min_int#0}" != "$min_int" ]; do
+        min_int="${min_int#0}"
+    done
+    if [ "$min_int" -gt 100 ] || { [ "$min_int" -eq 100 ] && [ -n "${min_frac//0/}" ]; }; then
+        die "COVERAGE_MIN must be between 0 and 100, got '$COVERAGE_MIN'.
        A bar above 100% can never be met, so the gate could only ever fail and would say
        nothing about the tests."
+    fi
+    # 80 is this plugin's acceptance bar.  Any other value is a diagnostic, and saying so out
+    # loud is what stops such a run's verdict being quoted as an acceptance result.  80, 80.0
+    # and 80.00 are the same bar; 80.5 is not.
+    if [ "$min_int" -ne 80 ] || [ -n "${min_frac//0/}" ]; then
+        warn "COVERAGE_MIN is ${COVERAGE_MIN}%, not the required 80%.  This is a DIAGNOSTIC run:"
+        warn "    its verdict is NOT the acceptance verdict for this submodule."
+    fi
+
+    # L2_SHARDS decides how many processes the L2 case list is split across, and a bad value here
+    # does not fail loudly on its own -- 0 or a word would simply run nothing while the capture
+    # step still produced a report.  It is validated for shape and range before anything runs.
+    case "$L2_SHARDS" in
+        ''|*[!0-9]*)
+            die "L2_SHARDS must be a whole number of shards (got '$L2_SHARDS').  It selects how
+       many processes the L2 case list is split across via GTEST_TOTAL_SHARDS; a value that
+       cannot be read exactly would silently run a different subset of the suite than intended." ;;
+    esac
+    if [ "$L2_SHARDS" -lt 1 ] || [ "$L2_SHARDS" -gt 8 ]; then
+        die "L2_SHARDS must be between 1 and 8, got '$L2_SHARDS'.  0 would run no tests at all
+       while still producing a coverage report, and beyond 8 the per-shard Thunder start/stop
+       cost outweighs the ceiling headroom it buys."
+    fi
+    if [ "$L2_SHARDS" -eq 1 ]; then
+        warn "L2_SHARDS=1 runs the whole L2 suite in one process.  That suite's measured baseline"
+        warn "    is 852.84 s against the framework's hard 900 s COM-RPC ceiling, so a single-shard"
+        warn "    run may be stopped mid-suite by the framework and fail healthy tests as"
+        warn "    collateral.  See the L2_SHARDS comment near the top of this script."
+    fi
 
     # ARTIFACT_ROOT is validated before it is used, because every level's report directory is
     # derived from it and republishing a report removes the previous one with `rm -rf`.  A

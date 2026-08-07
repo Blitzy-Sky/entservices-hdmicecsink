@@ -5367,3 +5367,657 @@ TEST_F(HdmiCecSink_L2Test, RaisePowerModeChangedEvent_OFF)
         }
     }
 }
+
+// =====================================================================================
+// Additive coverage for the reachable L2 paths that no case exercised.
+//
+// Everything below this line is new; nothing above it was rewritten.  The clusters were chosen
+// from measurement: the L2 trace before these cases left HdmiCecSinkImplementation.cpp at
+// 1381/1771 (77.98%) and HdmiCecSinkImplementation.h at 121/171 (70.76%), and the uncovered
+// lines grouped into four reachable families:
+//
+//   1. the active-route chain      GetActiveRoute (31 lines) -> getActiveRoute (14) ->
+//                                  HdmiPortMap::getRoute (16, in the header), plus
+//                                  HdmiPortMap::addChild (14), removeChild (10) and
+//                                  update(LogicalAddress) (2) - 87 lines in total, and the whole
+//                                  reason HdmiCecSinkImplementation.h sat at 70.76%
+//   2. inbound <Feature Abort>     HdmiCecSinkProcessor::process(FeatureAbort) (25) plus
+//                                  reportFeatureAbortEvent (5)
+//   3. ARC teardown                stopArc (14), requestArcTermination (7)
+//   4. audio-device power status    RequestAudioDevicePowerStatus (11)
+//
+// plus the two profile-guard arms in the plugin shell (HdmiCecSink.cpp:60-61 and 109-110).
+//
+// WHY THE ROUTE CHAIN WAS NEVER REACHED, measured rather than guessed.  updateDeviceChain
+// (HdmiCecSinkImplementation.cpp:1933) forwards to HdmiPortMap::addChild only when
+//     phy_addr.getByteValue(0) == hdmiInputs[i].m_portID + 1
+// and hdmiInputs is built with m_portID = 0..m_numofHdmiInput-1, so byte 0 of the announced
+// physical address has to be 1, 2 or 3.  In the pre-existing trace that comparison was evaluated
+// 90 times across 30 calls and matched NOT ONCE, so addChild, getRoute, removeChild and
+// update(LogicalAddress) all had zero hits and GetActiveRoute could only ever take its
+// "no route" arm.  The cases below announce addresses under 1.x.x.x on purpose, and assert the
+// route that comes back rather than the fact that a call was made - so if the chain ever stops
+// resolving, these fail rather than passing quietly.
+// =====================================================================================
+
+namespace {
+    // Build a broadcast CEC frame: <header><opcode><operands...>, with the header's destination
+    // set to the broadcast address.  Kept local to these cases and expressed the same way the
+    // rest of this file writes frames by hand, so nothing about the existing injection idiom
+    // changes.
+    std::vector<uint8_t> BroadcastFrameBytes(uint8_t from, uint8_t opcode, const std::vector<uint8_t>& operands)
+    {
+        std::vector<uint8_t> bytes;
+        bytes.push_back(static_cast<uint8_t>((from << 4) | LogicalAddress::BROADCAST));
+        bytes.push_back(opcode);
+        bytes.insert(bytes.end(), operands.begin(), operands.end());
+        return bytes;
+    }
+
+    // Build a DIRECTED CEC frame addressed to the TV (logical address 0).  <Feature Abort> is
+    // ignored when broadcast, so its cases need this form rather than the one above.
+    std::vector<uint8_t> DirectedToTvFrameBytes(uint8_t from, uint8_t opcode, const std::vector<uint8_t>& operands)
+    {
+        std::vector<uint8_t> bytes;
+        bytes.push_back(static_cast<uint8_t>((from << 4) | LogicalAddress::TV));
+        bytes.push_back(opcode);
+        bytes.insert(bytes.end(), operands.begin(), operands.end());
+        return bytes;
+    }
+}
+
+/**
+ * @brief The active route is resolved through the port map the announcements built.
+ *
+ * Drives the whole chain end to end and asserts the route, which is what makes this a functional
+ * test rather than a coverage exercise:
+ *   1. <Report Physical Address> from logical address 4 at 1.0.0.0 - exactly port 0's own address
+ *      (HdmiPortMap's constructor sets m_physicalAddr to portID+1.0.0.0), so addChild takes its
+ *      "this announcement IS the port" arm and calls update(LogicalAddress), registering 4 as the
+ *      device on HDMI 1;
+ *   2. <Report Physical Address> from logical address 8 at 1.1.0.0 - byte 0 still matches port 0
+ *      and byte 1 is now non-zero, so addChild records 8 as the first child in that port's chain;
+ *   3. <Active Source> from logical address 8 - sets m_currentActiveSource and marks the device
+ *      active, which is getActiveRoute's third precondition;
+ *   4. GetActiveRoute over COM-RPC, then getActiveRoute over JSON-RPC - both must report a route.
+ *
+ * Covers HdmiCecSinkImplementation.cpp:1480-1530 (GetActiveRoute) and 1958-1985 (getActiveRoute),
+ * and HdmiCecSinkImplementation.h:294-325 (addChild), 351-385 (getRoute) and 291-292
+ * (update(LogicalAddress)).
+ */
+TEST_F(HdmiCecSink_L2Test, ActiveRouteIsResolvedThroughTheRegisteredPortChain)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener())
+        << "CEC could not be enabled, so no FrameListener was captured and nothing could be injected.";
+
+    const auto inject = [this](const std::vector<uint8_t>& bytes) {
+        CECFrame frame(bytes.data(), static_cast<size_t>(bytes.size()));
+        for (auto* listener : listeners) {
+            if (listener) {
+                listener->notify(frame);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    };
+
+    // 1. The device that IS HDMI port 0: physical address 1.0.0.0, packed as 0x10 0x00.
+    TEST_LOG("Announcing logical address 4 at 1.0.0.0 (port 0's own address)");
+    inject(BroadcastFrameBytes(4, 0x84, { 0x10, 0x00, 0x04 }));
+
+    // 2. A device one level below it: physical address 1.1.0.0, packed as 0x11 0x00.
+    TEST_LOG("Announcing logical address 8 at 1.1.0.0 (first child of port 0)");
+    inject(BroadcastFrameBytes(8, 0x84, { 0x11, 0x00, 0x04 }));
+
+    // 3. <Active Source> from that child, so getActiveRoute's m_isActiveSource precondition holds.
+    TEST_LOG("Making logical address 8 the active source");
+    inject(BroadcastFrameBytes(8, 0x82, { 0x11, 0x00 }));
+
+    // 4a. COM-RPC.
+    bool available = false;
+    uint8_t length = 0;
+    IHdmiCecSinkActivePathIterator* pathList = nullptr;
+    string activeRoute;
+    bool success = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->GetActiveRoute(available, length, pathList, activeRoute, success));
+    TEST_LOG("GetActiveRoute (COM-RPC): available=%d length=%u route='%s'",
+        static_cast<int>(available), static_cast<unsigned>(length), activeRoute.c_str());
+
+    EXPECT_TRUE(available)
+        << "no active route was reported after the port chain was announced and an active source was set; "
+           "if this fails, the 'addr = N, portID = M' lines logged by updateDeviceChain say which "
+           "physical-address byte arrived";
+    if (available) {
+        EXPECT_GT(static_cast<unsigned>(length), 0u) << "an available route with zero length is not a route";
+        EXPECT_FALSE(activeRoute.empty()) << "an available route with an empty description is not a route";
+        // The route string ends in the HDMI input the chain hangs off, which is byte 0 of the
+        // device's physical address minus one - HDMI0 for the 1.x.x.x addresses used here.
+        EXPECT_NE(std::string::npos, activeRoute.find("HDMI"))
+            << "the route description does not name an HDMI input: '" << activeRoute << "'";
+    }
+    if (pathList != nullptr) {
+        // The iterator is an out-parameter this test owns once GetActiveRoute has returned it.
+        Exchange::IHdmiCecSink::HdmiCecSinkActivePath entry{};
+        int entries = 0;
+        while (pathList->Next(entry)) {
+            TEST_LOG("  route entry: logicalAddress=%u physicalAddress='%s' osdName='%s'",
+                static_cast<unsigned>(entry.logicalAddress), entry.physicalAddress.c_str(), entry.osdName.c_str());
+            EXPECT_LT(entry.logicalAddress, static_cast<uint8_t>(LogicalAddress::UNREGISTERED));
+            ++entries;
+        }
+        EXPECT_GT(entries, 0) << "GetActiveRoute reported a route but its path iterator was empty";
+        pathList->Release();
+    }
+
+    // 4b. The same question over JSON-RPC, which is the transport a client actually uses.
+    JsonObject params, result;
+    EXPECT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSink.1", "getActiveRoute", params, result));
+    ASSERT_TRUE(result.HasLabel("available"));
+    EXPECT_TRUE(result["available"].Boolean())
+        << "COM-RPC and JSON-RPC disagree about whether a route is available";
+}
+
+/**
+ * @brief A three-level chain resolves to a three-hop route.
+ *
+ * The corner case of the test above.  addChild has three arms, selected by the deepest non-zero
+ * nibble of the announced physical address, and getRoute walks all three; only the shallowest was
+ * exercised there.  Announcing 1.1.0.0, 1.1.2.0 and 1.1.2.3 fills each level of the port's device
+ * chain and then asks for the route to the deepest device, which must come back with more hops
+ * than the single-child case.
+ */
+TEST_F(HdmiCecSink_L2Test, ActiveRouteResolvesADeeperDeviceChain)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener()) << "CEC could not be enabled.";
+
+    const auto inject = [this](const std::vector<uint8_t>& bytes) {
+        CECFrame frame(bytes.data(), static_cast<size_t>(bytes.size()));
+        for (auto* listener : listeners) {
+            if (listener) {
+                listener->notify(frame);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    };
+
+    // Port 0 first, then one device per level beneath it.  Physical addresses are packed two
+    // nibbles per byte: 1.1.0.0 -> 0x11 0x00, 1.1.2.0 -> 0x11 0x20, 1.1.2.3 -> 0x11 0x23.
+    inject(BroadcastFrameBytes(4, 0x84, { 0x10, 0x00, 0x04 }));   // the port itself
+    inject(BroadcastFrameBytes(8, 0x84, { 0x11, 0x00, 0x04 }));   // level 1
+    inject(BroadcastFrameBytes(9, 0x84, { 0x11, 0x20, 0x04 }));   // level 2
+    inject(BroadcastFrameBytes(11, 0x84, { 0x11, 0x23, 0x04 }));  // level 3
+
+    // Route to the deepest device.
+    TEST_LOG("Making logical address 11 (1.1.2.3) the active source");
+    inject(BroadcastFrameBytes(11, 0x82, { 0x11, 0x23 }));
+
+    bool available = false;
+    uint8_t length = 0;
+    IHdmiCecSinkActivePathIterator* pathList = nullptr;
+    string activeRoute;
+    bool success = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->GetActiveRoute(available, length, pathList, activeRoute, success));
+    TEST_LOG("GetActiveRoute for 1.1.2.3: available=%d length=%u route='%s'",
+        static_cast<int>(available), static_cast<unsigned>(length), activeRoute.c_str());
+
+    EXPECT_TRUE(available) << "a three-level chain produced no route";
+    if (available) {
+        // getRoute pushes one entry per non-zero nibble plus the port's own device, so a 1.1.2.3
+        // address must resolve to more hops than the single-child 1.1.0.0 case.
+        EXPECT_GE(static_cast<unsigned>(length), 2u)
+            << "a three-level chain resolved to " << static_cast<unsigned>(length)
+            << " hop(s); the deeper levels of the port map were not walked";
+    }
+    if (pathList != nullptr) {
+        pathList->Release();
+    }
+}
+
+/**
+ * @brief When the active source is the port device itself, the route is just that device.
+ *
+ * getRoute's other arm (HdmiCecSinkImplementation.h:378-383): byte 0 of the physical address
+ * matches the port but byte 1 is zero, so there is no chain to walk and the port's own logical
+ * address is the whole route.  This is the shallowest legal topology - a playback device plugged
+ * straight into the TV - and it must not be confused with "no route".
+ */
+TEST_F(HdmiCecSink_L2Test, ActiveRouteForADeviceDirectlyOnAPort)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener()) << "CEC could not be enabled.";
+
+    const auto inject = [this](const std::vector<uint8_t>& bytes) {
+        CECFrame frame(bytes.data(), static_cast<size_t>(bytes.size()));
+        for (auto* listener : listeners) {
+            if (listener) {
+                listener->notify(frame);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    };
+
+    // Port 1's own address is 2.0.0.0 (m_portID 1 + 1), packed as 0x20 0x00 - a different port
+    // from the tests above, which also proves the port lookup is by address and not by luck.
+    inject(BroadcastFrameBytes(5, 0x84, { 0x20, 0x00, 0x05 }));
+    inject(BroadcastFrameBytes(5, 0x82, { 0x20, 0x00 }));
+
+    bool available = false;
+    uint8_t length = 0;
+    IHdmiCecSinkActivePathIterator* pathList = nullptr;
+    string activeRoute;
+    bool success = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->GetActiveRoute(available, length, pathList, activeRoute, success));
+    TEST_LOG("GetActiveRoute for a device directly on port 1: available=%d length=%u route='%s'",
+        static_cast<int>(available), static_cast<unsigned>(length), activeRoute.c_str());
+
+    EXPECT_TRUE(available) << "a device plugged straight into a port produced no route";
+    if (available) {
+        EXPECT_GE(static_cast<unsigned>(length), 1u);
+        EXPECT_NE(std::string::npos, activeRoute.find("HDMI"))
+            << "the route description does not name an HDMI input: '" << activeRoute << "'";
+    }
+    if (pathList != nullptr) {
+        pathList->Release();
+    }
+}
+
+/**
+ * @brief A device that stops acknowledging is unregistered from the port map it was added to.
+ *
+ * The counterpart of addChild: removeDevice (HdmiCecSinkImplementation.cpp:2483-2505) calls
+ * HdmiPortMap::removeChild (header:327-349) for the port whose address matches the departing
+ * device's, and resets that port's own logical address.  Neither had ever run, for the same
+ * reason addChild had not - no announcement in this suite carried a physical address that matched
+ * a port.
+ *
+ * Driven the way the sibling removal tests drive it: announce under 1.x.x.x, make every ping go
+ * unacknowledged, then drop the HDMI input.  The observable outcome asserted here is that the
+ * route which resolved a moment ago no longer does - the port map genuinely forgot the chain
+ * rather than merely emitting an event.
+ */
+TEST_F(HdmiCecSink_L2Test, DeviceRemovalUnregistersTheChildFromThePortMap)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener()) << "CEC could not be enabled.";
+    ASSERT_NE(nullptr, g_registeredHdmiInListener) << "no HDMI-input listener was captured";
+
+    const auto inject = [this](const std::vector<uint8_t>& bytes) {
+        CECFrame frame(bytes.data(), static_cast<size_t>(bytes.size()));
+        for (auto* listener : listeners) {
+            if (listener) {
+                listener->notify(frame);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    };
+
+    inject(BroadcastFrameBytes(4, 0x84, { 0x10, 0x00, 0x04 }));
+    inject(BroadcastFrameBytes(8, 0x84, { 0x11, 0x00, 0x04 }));
+    inject(BroadcastFrameBytes(8, 0x82, { 0x11, 0x00 }));
+
+    bool available = false;
+    uint8_t length = 0;
+    IHdmiCecSinkActivePathIterator* pathList = nullptr;
+    string activeRoute;
+    bool success = false;
+    ASSERT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->GetActiveRoute(available, length, pathList, activeRoute, success));
+    if (pathList != nullptr) {
+        pathList->Release();
+        pathList = nullptr;
+    }
+    ASSERT_TRUE(available) << "the chain never resolved, so its removal cannot be observed";
+    TEST_LOG("route before removal: length=%u '%s'", static_cast<unsigned>(length), activeRoute.c_str());
+
+    // Every peer now fails to acknowledge, which is how the poll sweep decides a device is gone.
+    EXPECT_CALL(*p_connectionMock, ping(::testing::_, ::testing::_, ::testing::_))
+        .WillRepeatedly(::testing::Invoke(
+            [](const LogicalAddress&, const LogicalAddress&, const Throw_e&) {
+                throw CECNoAckException();
+            }));
+
+    // The port index matters.  onHdmiHotPlug() removes hdmiInputs[portId].m_logicalAddr -- the
+    // device sitting directly on THAT port -- so it has to be the port the chain above was
+    // announced on.  The chain is 1.x.x.x, and updateDeviceChain() places an address on the port
+    // whose (m_portID + 1) equals its first digit, so 1.x.x.x lives on port 0.  Unplugging port 1
+    // instead finds m_logicalAddr == UNREGISTERED there and removes nothing, which is exactly how
+    // this assertion first failed.  Dropping port 0 removes logical address 4 synchronously inside
+    // onHdmiHotPlug, which is what clears the port's own logical address and makes the route stop
+    // resolving; the failing pings installed above additionally let the asynchronous sweep report
+    // the child at 1.1.0.0 as gone, which is the only path that reaches removeChild's inner arms.
+    TEST_LOG("Dropping HDMI input 0 -- the port the 1.x.x.x chain was announced on");
+    g_registeredHdmiInListener->OnHdmiInEventHotPlug(dsHDMI_IN_PORT_0, true);
+    g_registeredHdmiInListener->OnHdmiInEventHotPlug(dsHDMI_IN_PORT_0, false);
+
+    // The synchronous removal above should already have cleared the route, so this loop normally
+    // exits on its first iteration.  The generous bound only exists so that a run in which the
+    // asynchronous poll sweep gets there first is still observed rather than timed out; the sweep
+    // interval is HDMICECSINK_PING_INTERVAL_MS (10 s) plus one sweep's worth of ping timeouts.
+    bool routeGone = false;
+    for (int attempt = 0; attempt < 300 && !routeGone; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        bool stillAvailable = false;
+        uint8_t stillLength = 0;
+        IHdmiCecSinkActivePathIterator* stillPathList = nullptr;
+        string stillRoute;
+        bool stillSuccess = false;
+        if (m_cecSinkPlugin->GetActiveRoute(stillAvailable, stillLength, stillPathList, stillRoute, stillSuccess)
+                == Core::ERROR_NONE) {
+            routeGone = !stillAvailable;
+        }
+        if (stillPathList != nullptr) {
+            stillPathList->Release();
+        }
+    }
+
+    EXPECT_TRUE(routeGone)
+        << "the port map still resolves a route for devices that stopped acknowledging; removeChild "
+           "did not unregister the chain";
+}
+
+/**
+ * @brief Inbound <Feature Abort> is recorded per aborted feature, and reported.
+ *
+ * Covers HdmiCecSinkProcessor::process(FeatureAbort) (HdmiCecSinkImplementation.cpp:437-484) and
+ * reportFeatureAbortEvent (2250-2258).  A peer sends <Feature Abort> when it does not implement
+ * something the TV asked for, and the implementation has to remember a sensible default for each
+ * such feature rather than retrying forever: CEC version falls back to 1.4b, the vendor ID to a
+ * placeholder, the OSD name to empty, and the power status to the feature-abort value.
+ *
+ * All four aborted features are injected, plus the two negative cases the handler is written to
+ * reject - a BROADCAST abort (ignored; abort is a directed message) and an abort carrying a reason
+ * other than "unrecognized opcode" (recorded, but no default substituted).
+ */
+TEST_F(HdmiCecSink_L2Test, InboundFeatureAbortIsRecordedForEachAbortedFeature)
+{
+    JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
+    StrictMock<AsyncHandlerMock_HdmiCecSink> async_handler;
+
+    uint32_t status = jsonrpc.Subscribe<JsonObject>(EVNT_TIMEOUT,
+        _T("reportFeatureAbortEvent"),
+        &AsyncHandlerMock_HdmiCecSink::reportFeatureAbortEvent,
+        &async_handler);
+    EXPECT_EQ(Core::ERROR_NONE, status);
+    ScopedCleanup unsubscribe([&jsonrpc]() {
+        jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("reportFeatureAbortEvent"));
+    });
+
+    EXPECT_CALL(async_handler, reportFeatureAbortEvent(::testing::_))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(Invoke(this, &HdmiCecSink_L2Test::reportFeatureAbortEvent));
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener()) << "CEC could not be enabled.";
+
+    const auto inject = [this](const std::vector<uint8_t>& bytes) {
+        CECFrame frame(bytes.data(), static_cast<size_t>(bytes.size()));
+        for (auto* listener : listeners) {
+            if (listener) {
+                EXPECT_NO_THROW(listener->notify(frame));
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    };
+
+    // The peer has to be a known device before its aborts mean anything.
+    inject(BroadcastFrameBytes(4, 0x84, { 0x10, 0x00, 0x04 }));
+
+    // <Feature Abort> is opcode 0x00; operands are the aborted opcode and the abort reason.
+    // Reason 0x00 is "unrecognized opcode", which is the one that substitutes a default.
+    struct AbortCase {
+        const char* description;
+        uint8_t abortedOpcode;
+    };
+    const std::vector<AbortCase> cases = {
+        { "<Get CEC Version> aborted -> default to 1.4b",         0x9F },
+        { "<Give Device Vendor ID> aborted -> placeholder vendor", 0x8C },
+        { "<Give OSD Name> aborted -> empty OSD name",             0x46 },
+        { "<Give Device Power Status> aborted -> abort status",     0x8F },
+    };
+
+    for (const AbortCase& abortCase : cases) {
+        TEST_LOG("Injecting %s", abortCase.description);
+        inject(DirectedToTvFrameBytes(4, 0x00, { abortCase.abortedOpcode, 0x00 }));
+    }
+
+    // Negative 1: a broadcast abort must be ignored outright - <Feature Abort> is directed only.
+    TEST_LOG("Injecting a BROADCAST <Feature Abort>, which must be ignored");
+    inject(BroadcastFrameBytes(4, 0x00, { 0x9F, 0x00 }));
+
+    // Negative 2: an abort for a reason other than "unrecognized opcode" (0x04 = "refused").
+    // It is still recorded against the device, but no default is substituted.
+    TEST_LOG("Injecting a <Feature Abort> with reason 'refused'");
+    inject(DirectedToTvFrameBytes(4, 0x00, { 0x9F, 0x04 }));
+
+    // The plugin has to remain answerable, and the device it was told about has to still be
+    // listed - an abort is information about a peer, not a reason to drop it.
+    JsonObject params, result;
+    EXPECT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSink.1", "getDeviceList", params, result));
+    EXPECT_TRUE(result.HasLabel("deviceList")) << "getDeviceList stopped answering after the aborts";
+}
+
+/**
+ * @brief ARC routing can be torn down after it has been set up.
+ *
+ * Covers stopArc (HdmiCecSinkImplementation.cpp:3270-3300) and requestArcTermination
+ * (3304-3313).  stopArc returns immediately when ARC is already terminated, and
+ * m_currentArcRoutingState starts at ARC_STATE_ARC_TERMINATED, so a bare SetupARCRouting(false)
+ * cannot reach either function: the session has to be started first.  That ordering is the whole
+ * content of this test, and it is why a naive "call it with false" case would have covered
+ * nothing.
+ */
+TEST_F(HdmiCecSink_L2Test, ArcRoutingCanBeTornDownAfterBeingSetUp)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener())
+        << "CEC could not be enabled; stopArc returns early unless cecEnableStatus is true.";
+
+    HdmiCecSinkSuccess result;
+    result.success = false;
+    TEST_LOG("Setting ARC routing up");
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->SetupARCRouting(true, result));
+    EXPECT_TRUE(result.success);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    result.success = false;
+    TEST_LOG("Tearing ARC routing down");
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->SetupARCRouting(false, result));
+    EXPECT_TRUE(result.success);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Idempotent: a second teardown hits stopArc's already-terminated guard and must still
+    // succeed rather than error or block.
+    result.success = false;
+    TEST_LOG("Tearing ARC routing down a second time (already terminated)");
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->SetupARCRouting(false, result));
+    EXPECT_TRUE(result.success);
+
+    // Still serving afterwards, which is what proves the ARC thread was signalled rather than
+    // left holding a lock.
+    JsonObject params, jsonResult;
+    EXPECT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSink.1", "getEnabled", params, jsonResult));
+}
+
+/**
+ * @brief The audio device's power status can be requested.
+ *
+ * Covers RequestAudioDevicePowerStatus (HdmiCecSinkImplementation.cpp:2212-2230), which asks the
+ * connected audio system for its power state.  Exercised over both transports, and in both of the
+ * states that matter: with CEC enabled, where the request is transmitted, and with CEC disabled,
+ * where it must be refused rather than dereferencing a connection that does not exist.
+ */
+TEST_F(HdmiCecSink_L2Test, AudioDevicePowerStatusCanBeRequested)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener()) << "CEC could not be enabled.";
+
+    // The audio system has to be a known device for the request to have a destination.
+    uint8_t audioAnnounce[] = { 0x5F, 0x84, 0x11, 0x00, 0x05 };
+    CECFrame audioFrame(audioAnnounce, sizeof(audioAnnounce));
+    for (auto* listener : listeners) {
+        if (listener) {
+            listener->notify(audioFrame);
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    HdmiCecSinkSuccess result;
+    result.success = false;
+    TEST_LOG("Requesting the audio device's power status over COM-RPC");
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->RequestAudioDevicePowerStatus(result));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    TEST_LOG("Requesting it again over JSON-RPC");
+    JsonObject params, jsonResult;
+    EXPECT_EQ(Core::ERROR_NONE,
+        InvokeServiceMethod("org.rdk.HdmiCecSink.1", "requestAudioDevicePowerStatus", params, jsonResult));
+
+    // With CEC off the request must be declined, not attempted: there is no connection to send on.
+    HdmiCecSinkSuccess disableResult;
+    ASSERT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->SetEnabled(false, disableResult));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    result.success = true;
+    TEST_LOG("Requesting the audio device's power status with CEC disabled");
+    EXPECT_NO_THROW(m_cecSinkPlugin->RequestAudioDevicePowerStatus(result));
+
+    // Hand CEC back on inside this test body over COM-RPC rather than leaving a slow transition to
+    // TearDown's JSON-RPC restore - see the note in the sibling source-plugin suite for the
+    // framework crash that pattern can provoke.
+    HdmiCecSinkSuccess reEnable;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->SetEnabled(true, reEnable));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+}
+
+/**
+ * @brief The plugin shell refuses to initialise under a non-TV profile, and deinitialises quietly.
+ *
+ * Covers HdmiCecSink.cpp:60-61 (Initialize's profile guard) and 109-110 (Deinitialize's).  This is
+ * a sink-role plugin: searchRdkProfile() reading STB, or nothing at all, means it does not belong
+ * on this device and must decline rather than half-start.
+ *
+ * Driven through the Controller, so Thunder itself calls Initialize, sees the non-empty error
+ * string and calls Deinitialize with reason INITIALIZATION_FAILED - the second guard is therefore
+ * reached on the framework's own path rather than by the test calling it directly.  The expected
+ * status is Core::ERROR_OPENING_FAILED because Controller::Activate normalises every result other
+ * than NONE/ILLEGAL_STATE/INPROGRESS/PENDING_CONDITIONS to it (Thunder Controller.cpp:884).
+ *
+ * /etc/device.properties is host-global; it is written back to a TV profile before this test
+ * returns, and the plugin is reactivated, because the fixture's destructor deactivates it and
+ * expects that to succeed.
+ */
+TEST_F(HdmiCecSink_L2Test, PluginRefusesToActivateUnderANonSinkProfile)
+{
+    // This is the only test that activates the plugin a SECOND time, and the fixture's
+    // constructor set device::Host::Register(IHdmiInEvents*) to .WillOnce(), sized for the one
+    // activation it performs itself.  Without a supplementary expectation the reactivation below
+    // over-saturates it and gmock fails the test at the fixture's line rather than at anything
+    // this test asserts.  A later expectation on the same method takes precedence for subsequent
+    // calls, so the constructor's remains satisfied rather than being replaced, and the captured
+    // listener is refreshed to the one the new plugin instance registers.
+    EXPECT_CALL(*p_hostImplMock, Register(::testing::A<device::Host::IHdmiInEvents*>()))
+        .WillRepeatedly(::testing::Invoke(
+            [this](device::Host::IHdmiInEvents* listener) -> dsError_t {
+                this->g_registeredHdmiInListener = listener;
+                return static_cast<dsError_t>(0);
+            }));
+
+    ASSERT_EQ(Core::ERROR_NONE, DeactivateService("org.rdk.HdmiCecSink"));
+
+    // Restoring the profile and the plugin is bound to a scope: a fatal assertion below would
+    // otherwise leave an STB profile on the host and a deactivated plugin for every later test.
+    ScopedCleanup restoreProfile([this]() {
+        createFile("/etc/device.properties", "RDK_PROFILE=TV");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        EXPECT_EQ(Core::ERROR_NONE, ActivateService("org.rdk.HdmiCecSink"))
+            << "the plugin did not come back up under the correct profile";
+    });
+
+    createFile("/etc/device.properties", "RDK_PROFILE=STB");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    TEST_LOG("Activating with RDK_PROFILE=STB; Initialize must refuse");
+    const uint32_t stbStatus = ActivateService("org.rdk.HdmiCecSink");
+    EXPECT_EQ(Core::ERROR_OPENING_FAILED, stbStatus)
+        << "an STB profile must fail activation of the SINK plugin; status was " << stbStatus;
+
+    // No profile line at all is the second half of the guard's condition (NOT_FOUND).
+    createFile("/etc/device.properties", "");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    TEST_LOG("Activating with no RDK_PROFILE line; Initialize must refuse");
+    const uint32_t emptyStatus = ActivateService("org.rdk.HdmiCecSink");
+    EXPECT_EQ(Core::ERROR_OPENING_FAILED, emptyStatus)
+        << "an absent profile must fail activation; status was " << emptyStatus;
+}
