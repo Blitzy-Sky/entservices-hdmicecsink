@@ -33,12 +33,15 @@
  *
  *          ONLY ONE NEGATIVE ARM IS EXERCISED, AND THAT IS NOT AN OVERSIGHT. The gate's other
  *          arm - a directed frame from an initiator that is not the audio system - needs a
- *          fixture carrying header 0x40, and this suite ships one for INITIATE ARC
- *          (Device_Initiate_Arc_Invalid_Initiator.yaml) but not for TERMINATE ARC. Naming a
- *          fixture that does not exist would make send_vcomponent_command return
- *          (0, "YAML file not found: ..."), so the arm is left unexercised and recorded here
- *          rather than faked. TCID20_ARC_Initiation_Flow already covers that arm of the
- *          identical gate expression on the initiation path.
+ *          fixture carrying header 0x40, and this suite ships one on the INITIATE ARC side but
+ *          none on the TERMINATE ARC side, so there is no valid document to post for it. THIS
+ *          MODULE POSTS THE TWO TERMINATE DOCUMENTS NAMED ABOVE AND NOTHING ELSE - no
+ *          initiation fixture, which is TCID20_ARC_Initiation_Flow's to post, and no invented
+ *          filename, because a name that does not resolve makes send_vcomponent_command return
+ *          (0, "YAML file not found: ...") and would read as a passing ARC case that injected
+ *          nothing. The arm is therefore left unexercised and recorded here rather than faked,
+ *          and TCID20_ARC_Initiation_Flow already covers it on the initiation path, where the
+ *          gate expression is identical and the fixture for it does exist.
  *
  *          WHAT THE NEGATIVE INJECTION DOES AND DOES NOT PROVE. It is expected to be ACCEPTED by
  *          the emulator - HTTP 200 means the frame reached the CEC bus - and then DISCARDED by
