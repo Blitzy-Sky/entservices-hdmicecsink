@@ -1,8 +1,8 @@
 HdmiCec:
   command: "cec_message"
-  description: "Trigger process(SetOSDName) from DENON (LA=1) - OSD name 'DENON'"
+  description: "Trigger process(SetOSDName) from DENON (LA=2) - OSD name 'DENON'"
   message:
     user_defined: true
-    # Header 0x10: initiator=1 (DENON, Recording Device 1), destination=0 (sink DUT, directed)
+    # Header 0x20: initiator=2 (DENON, Recording Device 2), destination=0 (sink DUT, directed)
     # Opcode 0x47: SetOSDName  "DENON" = 0x44 0x45 0x4E 0x4F 0x4E
-    payload: ["0x10", "0x47", "0x44", "0x45", "0x4E", "0x4F", "0x4E"]
+    payload: ["0x20", "0x47", "0x44", "0x45", "0x4E", "0x4F", "0x4E"]

@@ -23,9 +23,13 @@
 #  over ~/.lcovrc instead -- .github/workflows/L1-tests.yml:681 copies
 #  entservices-testframework/Tests/L1Tests/.lcovrc_l1, and L2-tests.yml:763 copies that
 #  repository's .lcovrc_l2 -- and both of those set `lcov_branch_coverage = 0`.  So in CI
-#  branch data is discarded no matter what this file says, and the runner deletes ~/.lcovrc
-#  for exactly that reason.  Fixing it at source would mean editing the test framework,
-#  which is out of scope; stating it plainly here is the honest alternative.
+#  branch data is discarded no matter what this file says.  That planted copy is exactly why
+#  the runner takes ~/.lcovrc out of the way before its first lcov call -- but it MOVES it,
+#  it does not delete it: the file is relocated into a private mode-0700 mktemp directory and
+#  moved back from an EXIT/INT/TERM/HUP trap, so a symlink returns as the same symlink and
+#  permissions, ownership and timestamps are untouched.  Nothing of yours is removed.  Fixing
+#  the suppression at source would mean editing the test framework, which is out of scope;
+#  stating it plainly here is the honest alternative.
 #
 #  WHY THE RUNNER ALSO PASSES --rc branch_coverage=1
 #  -------------------------------------------------

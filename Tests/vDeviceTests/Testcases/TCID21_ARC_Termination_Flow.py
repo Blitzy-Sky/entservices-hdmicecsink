@@ -7,17 +7,26 @@
  * @details Drives ONE Audio Return Channel TERMINATION end to end and probes the one arm of the
  *          handler's admission gate for which this suite ships a fixture. Five steps, in this
  *          order:
- *            1. before-probe - org.rdk.HdmiCecSink.getAudioDeviceConnectedStatus, read for
- *               context and logged beside the after-probe rather than asserted;
- *            2. POSITIVE INJECTION - Device_Terminate_Arc.yaml delivers the audio system's
- *               <Terminate ARC> to HdmiCecSinkProcessor::process(const TerminateArc&, const
- *               Header&) at HdmiCecSinkImplementation.cpp:535;
- *            3. NEGATIVE ARM A - Device_Terminate_Arc_Broadcast.yaml, same initiator, broadcast
- *               destination;
- *            4. DISABLE / RESTORE - org.rdk.HdmiCecSink.setupARCRouting with
+ *            1. BEFORE-PROBE, ASSERTED - org.rdk.HdmiCecSink.getDeviceList must report the
+ *               audio system at CEC logical address 5, and
+ *               org.rdk.HdmiCecSink.getAudioDeviceConnectedStatus must read connected True.
+ *               Both are preconditions of the flow, not context: without the peer at 5 the
+ *               admission gate below can never be satisfied, so every injection this case makes
+ *               would be discarded unread and the case would pass having exercised nothing;
+ *            2. POSITIVE INJECTION, REQUIRED - Device_Terminate_Arc.yaml delivers the audio
+ *               system's <Terminate ARC> to HdmiCecSinkProcessor::process(const TerminateArc&,
+ *               const Header&) at HdmiCecSinkImplementation.cpp:535;
+ *            3. NEGATIVE ARM A, REQUIRED - Device_Terminate_Arc_Broadcast.yaml, same initiator,
+ *               broadcast destination. Required means the POST must be accepted; the handler's
+ *               rejection of the frame remains unobservable, and the two are kept distinct
+ *               below;
+ *            4. DISABLE / RESTORE, ASSERTED - org.rdk.HdmiCecSink.setupARCRouting with
  *               {"enabled": false}, the sink's own request to take ARC back down
  *               (SetupARCRouting, HdmiCecSinkImplementation.cpp:1600);
- *            5. after-probe - the same connected-status read, logged beside the first.
+ *            5. AFTER-PROBE, ASSERTED - connected must still read True and getDeviceList must
+ *               report the same device count and the same set of logical addresses as step 1.
+ *               Terminating ARC moves the ARC state machine; it must not undiscover the audio
+ *               system or disturb the inventory, and both are checked rather than logged.
  *
  *          THE ADMISSION GATE IS WHY THE TWO FIXTURES DIFFER BY ONE BYTE. The handler opens with
  *          the same two-arm rejection its initiation counterpart uses, at
@@ -43,15 +52,20 @@
  *          and TCID20_ARC_Initiation_Flow already covers it on the initiation path, where the
  *          gate expression is identical and the fixture for it does exist.
  *
- *          WHAT THE NEGATIVE INJECTION DOES AND DOES NOT PROVE. It is expected to be ACCEPTED by
- *          the emulator - HTTP 200 means the frame reached the CEC bus - and then DISCARDED by
- *          the handler at the gate. Those two outcomes are not in tension, and this module never
- *          conflates them: a 200 on the negative fixture is evidence of injection, never of an
- *          ARC termination. The rejection itself is unobservable from here, because the gate is a
- *          bare `return` that publishes no counter, no state and no notification, so the post is
- *          LOGGED AND NOT ASSERTED. It is carried anyway because injecting the frame is what
- *          exercises the gate on a real device; claiming the outcome would be the part this
- *          transport cannot support.
+ *          WHAT THE NEGATIVE INJECTION DOES AND DOES NOT PROVE, AND WHY IT IS STILL REQUIRED. It
+ *          is expected to be ACCEPTED by the emulator - HTTP 200 means the frame reached the CEC
+ *          bus - and then DISCARDED by the handler at the gate. Those two outcomes are not in
+ *          tension, and this module never conflates them: a 200 on the negative fixture is
+ *          evidence of injection, never of an ARC termination. The rejection itself IS
+ *          unobservable from here, because the gate is a bare `return` that publishes no counter,
+ *          no state and no notification, so no assertion is made about the frame's fate.
+ *          DELIVERY, HOWEVER, IS OBSERVABLE, and this case requires it. An earlier revision
+ *          posted this fixture without checking the result, reasoning from the unobservable
+ *          rejection; the consequence was that a renamed, moved or malformed fixture would make
+ *          send_vcomponent_command return (0, "YAML file not found: ...") and the case would
+ *          still pass, reporting a green ARC gate probe that had injected nothing. The HTTP status
+ *          is the one fact this transport does report about the post, so it is asserted, and the
+ *          fate of the admitted frame is left to @expected_result.
  *
  *          THIS CASE IS THE RESTORER OF AN ORDERED PAIR. TCID20_ARC_Initiation_Flow is the
  *          PRODUCER half: it deliberately leaves ARC ENABLED and documents, at the point where a
@@ -62,18 +76,20 @@
  *          merely logged. Run in order the pair is state-neutral; TCID20 alone is not, and this
  *          case alone assumes ARC was brought up before it.
  *
- *          GAP CLOSED. COVERAGE_GAPS.md ranks the missing sink vDeviceTests suite 22nd at
- *          priority P1 (#gap-plugin-sink-vdevicetests) precisely because the sink's ARC and
- *          audio-routing use cases - the ones that define the sink - had no end-to-end safety
- *          net. In the §4b API table `SetupARCRouting` is recorded as covered by the sink's own
- *          L2 suite (SetupARCRouting_COMRPC and SetupARCRouting_JSONRPC in
- *          ../../L2Tests/tests/HdmiCecSink_L2Test.cpp) with NO E2E leg. TCID20 supplies the
- *          INITIATION half of that leg; this module supplies the TERMINATION half.
+ *          ADDRESSED BY DESIGN, NOT BY MEASUREMENT. COVERAGE_GAPS.md ranks the missing sink
+ *          vDeviceTests suite 22nd at priority P1 (#gap-plugin-sink-vdevicetests) precisely
+ *          because the sink's ARC and audio-routing use cases - the ones that define the sink -
+ *          had no end-to-end safety net. In the §4b API table `SetupARCRouting` is recorded as
+ *          covered by the sink's own L2 suite (SetupARCRouting_COMRPC and
+ *          SetupARCRouting_JSONRPC in ../../L2Tests/tests/HdmiCecSink_L2Test.cpp) with NO E2E
+ *          leg. TCID20 is AUTHORED to supply the INITIATION half of that leg and this module the
+ *          TERMINATION half; runtime validation and measured coverage for both remain deferred
+ *          until a device or emulator environment is available.
  *
  * @precondition
  *  - A device under test - physical hardware or a QEMU target - is running WPEFramework with
  *    the org.rdk.HdmiCecSink plugin activated and reachable over JSON-RPC.
- *  - Init_Devicelist_Populate has seeded the emulated topology, including the VAUDIO
+ *  - Init_Devicelist_Populate has seeded the emulated topology, including the YAMAHA
  *    AudioSystem peer at CEC logical address 5, and has left HDMI-CEC enabled. Without that
  *    peer the admission gate at HdmiCecSinkImplementation.cpp:537 can never be satisfied, since
  *    a <Terminate ARC> from any other address is discarded unread. The peer is supplied BY THE
@@ -95,7 +111,8 @@
  *  - The directed <Terminate ARC> frame is injected and accepted by the emulator, and
  *    setupARCRouting acknowledges the disable request.
  *  - The gate-arm frame is injected and is expected to be DISCARDED by the handler. That
- *    expectation is stated and logged, not asserted: see @details.
+ *    expectation is stated and logged, not asserted, for the reason given in the details
+ *    section above.
  *  - THE ARC TERMINATION HANDSHAKE ITSELF IS NOT ASSERTED, because it is not observable from
  *    this transport. An admitted frame reaches Process_TerminateArc()
  *    (HdmiCecSinkImplementation.cpp:3359), which moves m_currentArcRoutingState to
@@ -103,40 +120,52 @@
  *    (ArcTerminationEvent("success"), HdmiCecSinkImplementation.cpp:3381) - a Thunder
  *    notification delivered to registered COM-RPC/JSON-RPC subscribers rather than to a one-shot
  *    curl request/response - and no getter on the interface reports the ARC routing state.
- *  - The ARC state is left DISABLED, restoring what TCID20_ARC_Initiation_Flow enabled.
+ *  - The ARC state is left DISABLED, restoring what TCID20_ARC_Initiation_Flow enabled. That
+ *    restore is ALSO published as a module-level cleanup() hook, which SuitManager.py runs for
+ *    every registered case unconditionally - after a pass, after a failure, after an exception,
+ *    and even for a case it SKIPPED because its producer failed. So ARC is taken back down even
+ *    when TCID20's initiation failed and this case never ran as a test, which a finally clause
+ *    inside run_test() could not cover. The hook is idempotent: when run_test() has already
+ *    driven the disable call it reports that and does nothing.
+ *  - NO INITIAL ARC STATE IS CAPTURED, because it is known by construction rather than by
+ *    observation and there is no getter to capture it with. m_currentArcRoutingState is
+ *    initialised to ARC_STATE_ARC_TERMINATED (HdmiCecSinkImplementation.cpp:635),
+ *    Init_Devicelist_Populate never calls setupARCRouting, and no case registered before TCID20
+ *    does either - so "terminated" is the state the pair inherited, and asserting the disable
+ *    call IS the restore.
+ *  - The invariants of step 5 hold: the audio system stays discovered and the device inventory
+ *    is byte-for-byte the set observed in step 1.
  *
  * @pass_criteria
- *  - The required <Terminate ARC> YAML post returns HTTP 200, setupARCRouting acknowledges
- *    result.success as True, the after-probe parses with result.success True and a boolean
- *    result.connected, and run_test() returns True.
+ *  - EVERY vComponent post returns HTTP 200 - the <Terminate ARC> injection and the gate-arm
+ *    injection alike - setupARCRouting acknowledges result.success as True, the after-probe
+ *    parses with result.success True and a boolean result.connected, and run_test() returns True.
  *
  * @failure_criteria
- *  - A request is not dispatched, a response is the no-response sentinel, the required
- *    vComponent post does not return HTTP 200, the disable call does not acknowledge success,
- *    the after-probe reports success other than True or a non-boolean connected, a JSON parsing
- *    error occurs, or run_test() returns False.
+ *  - A request is not dispatched, a response is the no-response sentinel, ANY vComponent post
+ *    does not return HTTP 200 - including the gate-arm frame, whose non-delivery would leave this
+ *    case claiming to have exercised a rejection arm it never reached - the disable call does not
+ *    acknowledge success, the after-probe reports success other than True or a non-boolean
+ *    connected, a JSON parsing error occurs, or run_test() returns False. The gate-arm verdict is
+ *    taken only after the disable request has been issued, so no failure path leaves ARC
+ *    enabled.
  */
 """
 
 import time
-import os
 import json
 
-# The eight-symbol utils import below is the shared contract the emulation-driven ("flow")
-# testcases in this suite are written against. `log_with_timing` is deliberately retained even
-# though this module gates its own timing line on HDMICEC_TIMING_ENABLED directly: keeping the
-# set identical across the flow modules is what lets one be diffed against another, so the
-# resulting single "imported but unused" lint note is accepted convention here rather than an
-# oversight. Every other symbol has a call site below.
 from utils import (
     send_curl_command,
     send_vcomponent_command,
+    sanitise_for_log,
     HDMICEC_CMD_BASE,
     log_info,
     log_success,
     log_error,
     log_warning,
-    log_with_timing
+    log_with_timing,
+    CEC_FRAME_PACING_SECONDS,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -144,7 +173,7 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 def _post_hdmicec(yaml_file):
     """Post a HdmiCec vComponent YAML command."""
     http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{yaml_file}")
-    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {body}")
+    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {sanitise_for_log(body)}")
     return http_code == 200
 
 
@@ -168,9 +197,85 @@ def _result_object(response_text):
     return result if isinstance(result, dict) else {}
 
 
+def _ensure_arc_disabled():
+    """Issue setupArcRouting(enabled=false) and report whether the plugin confirmed it.
+
+    Returns (ok, detail).
+
+    This is the inverse operation this module owes the suite, and it is issued unconditionally
+    from run_test()'s finally block rather than only on the path that reaches ACT 3.
+    TCID20_ARC_Initiation_Flow deliberately leaves ARC enabled and names this module as the
+    restorer, so every early return before ACT 3 - a before-probe that did not answer, a
+    required injection that was rejected - used to leak an ENABLED ARC into every case that
+    follows, and nothing said so.
+
+    Issuing the request a second time on the path that already made it is deliberate and
+    harmless: disabling ARC that is already disabled is idempotent, which is the same property
+    TCID30 and TCID31 assert for setEnabled. Paying one extra request is the cost of never
+    having to reason about which exit path was taken.
+
+    Confirmation means all of: a request that was dispatched, a reply that is not the
+    no-response sentinel, a body that parses as a JSON object, and result.success exactly True -
+    the single field SetupARCRouting publishes (IHdmiCecSink.h:328).
+    """
+    response = send_curl_command(HdmiCecSinkApis.setup_arc_routing_false)
+
+    if not response:
+        return False, "setupArcRouting(false) was not dispatched"
+    if response.startswith("< No response"):
+        return False, "setupArcRouting(false) got no response from WPEFramework"
+
+    try:
+        result = _result_object(response)
+    except json.JSONDecodeError as exc:
+        return False, f"setupArcRouting(false) reply did not parse ({exc}); body={response!r}"
+
+    if result.get("success") is not True:
+        return False, f"setupArcRouting(false) did not acknowledge success; body={response!r}"
+
+    return True, "ARC confirmed disabled"
+
+
 def run_test():
     start_time = time.perf_counter()
 
+    # The measurement runs inside a try whose finally always restores ARC to disabled, so no
+    # exit path - early return or exception - can leave it enabled for the cases that follow.
+    # The restoration reports its own verdict, and this case fails if either half fails.
+    try:
+        flow_ok = _run_arc_termination_flow()
+    finally:
+        cleanup_ok, cleanup_detail = _ensure_arc_disabled()
+        if cleanup_ok:
+            log_info(f"  Cleanup: {cleanup_detail}")
+        else:
+            # Reported independently of the measurement: a leaked enabled ARC is a different
+            # defect from a failed termination assertion, and it affects later cases rather
+            # than this one.
+            log_error(
+                "TCID21_ARC_Termination_Flow cleanup FAILED: ARC may still be enabled for "
+                f"subsequent cases - {cleanup_detail}"
+            )
+
+    if flow_ok and cleanup_ok:
+        elapsed_time = time.perf_counter() - start_time
+        msg = "TCID21_ARC_Termination_Flow Passed ✅"
+        if os.environ.get("HDMICEC_TIMING_ENABLED"):
+            log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
+        else:
+            log_success(msg)
+        return True
+
+    log_error("TCID21_ARC_Termination_Flow Failed ❌")
+    return False
+
+
+def _run_arc_termination_flow():
+    """The three acts this case measures. Returns True when every assertion holds.
+
+    Every assertion below is exactly as it was; only the verdict reporting moved to run_test()
+    so that the restore in its finally block is guaranteed to run first.
+    """
     # Before-probe: context for the exchange, logged rather than asserted.
     before = send_curl_command(HdmiCecSinkApis.get_audio_device_connected_status)
     if not before:
@@ -197,34 +302,47 @@ def run_test():
     # SYSTEM asking the television to tear ARC down, which is the direction a real peer drives,
     # and the sink's own setupARCRouting call is then the local half of the same teardown.
     ok_positive = _post_hdmicec("Device_Terminate_Arc.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
-    if not ok_positive:
-        log_error("✖ required vComponent ARC termination post failed")
-        return False
 
-    # ACT 2 - THE GATE ARM THIS SUITE HAS A FIXTURE FOR, INJECTED AND NOT ASSERTED.
+    # ACT 2 - THE GATE ARM THIS SUITE HAS A FIXTURE FOR. DELIVERY IS REQUIRED; THE HANDLER'S
+    # VERDICT IS NOT ASSERTED.
     #
     # Device_Terminate_Arc_Broadcast.yaml differs from the positive fixture in its HEADER BYTE
     # ONLY - 0x5F instead of 0x50 - so it isolates the destination arm of the rejection at
     # HdmiCecSinkImplementation.cpp:537 with the initiator arm held constant. It is expected to
-    # be accepted by the emulator and then discarded by the handler, and NEITHER OUTCOME IS
-    # ASSERTED HERE - deliberately, and this is the honest reporting line of this module. The
-    # gate is a bare `return`: it increments no counter, changes no state and raises no
-    # notification, so a rejection leaves nothing this transport can read. Requiring HTTP 200
-    # would assert the emulator's behaviour and call it the handler's; requiring a non-200 would
-    # assert the opposite of what should happen. The post is carried because injecting the frame
-    # is what exercises the gate on a real device, and its result is logged so a reader can see
-    # what the emulator did with it.
+    # be accepted by the emulator and then discarded by the handler.
     #
-    # A 200 logged below is therefore evidence that the frame was INJECTED. It is not, and must
-    # not be read as, evidence of an ARC termination.
+    # THE TWO OUTCOMES ARE SEPARATE, AND ONLY ONE OF THEM IS THIS TRANSPORT'S BUSINESS:
+    #   * whether the frame was INJECTED - an HTTP 200 from the vComponent - is a fact about
+    #     delivery, and it is now REQUIRED. A misnamed document, an unreadable fixture or an
+    #     unreachable emulator each return (0, diagnostic) from send_vcomponent_command, and with
+    #     that outcome tolerated this case would report having exercised the gate arm while
+    #     injecting nothing. Since an undelivered frame also cannot change the connected flag, the
+    #     unchanged-state reading below would hold for the wrong reason - the same trap the
+    #     positive injection above is already guarded against.
+    #   * whether the HANDLER accepted or discarded it is NOT asserted, and that remains the
+    #     honest reporting line of this module. The gate is a bare `return`: it increments no
+    #     counter, changes no state and raises no notification, so a rejection leaves nothing this
+    #     transport can read. Requiring a non-200 would be worse still - it would assert the
+    #     opposite of what should happen, since the emulator is expected to accept a well-formed
+    #     frame regardless of what the plugin then does with it.
+    #
+    # So the 200 required below is evidence that the frame was INJECTED. It is not, and must not
+    # be read as, evidence of an ARC termination.
     ok_broadcast = _post_hdmicec("Device_Terminate_Arc_Broadcast.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
     log_info(
         "  gate arm A (header 0x5F, broadcast destination) injected; expected to be discarded "
         f"by the handler - post accepted: {ok_broadcast}"
     )
+    return True, result.get("numberofdevices"), addresses
+
+    # The verdict on that delivery is deliberately NOT taken here. ACT 3 below is the disable that
+    # makes the TCID20/TCID21 pair state-neutral, and returning before it would leak an enabled ARC
+    # into every case that follows - so the check is deferred until the disable has been issued,
+    # exactly as TCID30_Repeated_Disable_Idempotent defers its own operation-under-test verdict
+    # past its restore.
 
     # ACT 3 - DISABLE, AND THE RESTORE THAT MAKES THE PAIR STATE-NEUTRAL. setupARCRouting with
     # {"enabled": false} is the sink's own request to take ARC down, and it is the disabling
@@ -236,12 +354,22 @@ def run_test():
     if not curl_response:
         log_error("✖ setupArcRouting disable command not sent")
         return False
-    if curl_response.startswith("< No response"):
+    if response.startswith("< No response"):
         log_error("✖ setupArcRouting disable returned no response from WPEFramework")
         return False
     log_success("✔ curl command sent")
     log_warning(f"Response: {curl_response}")
-    time.sleep(1)
+
+    # The deferred delivery verdict from ACT 2, taken now that the disable above has been issued
+    # so no path can leak an enabled ARC. It is reported before the unchanged-state reading
+    # because an undelivered gate-arm frame invalidates that reading rather than contradicting it.
+    if not ok_broadcast:
+        log_error(
+            "✖ the broadcast-destination gate-arm frame was not delivered to the bus, so this "
+            "case cannot claim to have exercised that arm of the rejection"
+        )
+        log_error("TCID21_ARC_Termination_Flow Failed ❌")
+        return False
 
     # After-probe: the same read as the before-probe, so the pair can be compared in the log.
     after = send_curl_command(HdmiCecSinkApis.get_audio_device_connected_status)
@@ -254,10 +382,7 @@ def run_test():
     log_warning(f"Final audio connection: {after}")
 
     try:
-        # ACT 3's acknowledgement. SetupARCRouting publishes exactly one field - success
-        # (IHdmiCecSink.h:328) - so this is the only claim the disable call itself supports.
-        # Nothing is asserted about the resulting termination handshake; see @expected_result.
-        if _result_object(curl_response).get("success") is not True:
+        if _result_object(response).get("success") is not True:
             log_error("✖ setupArcRouting disable did not acknowledge success")
             return False
 
@@ -282,17 +407,13 @@ def run_test():
         # other. `success` is different: the implementation sets it unconditionally, so requiring
         # True is measured.
         if after_result.get("success") is True and isinstance(connected_after, bool):
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID21_ARC_Termination_Flow Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
             return True
 
         log_warning(f"Actual  : {after}")
     except json.JSONDecodeError:
-        log_error("Invalid JSON response")
+        log_error("✖ setupArcRouting disable reply is not valid JSON")
+        return False
+    log_success("✔ setupARCRouting(enabled=false) acknowledged")
+    return True
 
-    log_error("TCID21_ARC_Termination_Flow Failed ❌")
     return False

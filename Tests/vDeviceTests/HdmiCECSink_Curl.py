@@ -30,10 +30,11 @@
  * @dependencies
  *  - utils.py supplies the shared WPEFRAMEWORK_JSONRPC_URL endpoint and the shell-free
  *    send_curl_command dispatcher that executes these constants as argv lists. It is the
- *    only module this one imports, and the only one it needs today.
- *  - The consumers of these constants - the planned SuitManager.py and the sink
- *    Testcases/TCID*.py modules - are not present in this directory yet; they will draw
- *    their command strings from here when they land.
+ *    only module this one imports, and the only one it needs.
+ *  - The consumers of these constants are all present in this directory: every one of the
+ *    33 Testcases/TCID*.py modules imports this module for its command strings, and so
+ *    does Init_Devicelist_Populate.py (as HdmiCecSinkApis) for suite initialisation.
+ *    SuitManager.py declares it as a suite dependency and loads those cases.
  *
  * @expected_result
  *  - Importers receive well-formed curl argv lists for the sink JSON-RPC APIs.
@@ -121,13 +122,18 @@ get_vendor_id = [
 ]
 
 
-# NEGATIVE-PATH CONSTANT. `org.rdk.HdmiCecSink.getCecVersion` is NOT a registered JSON-RPC
-# method, so this command yields a method-not-found error rather than a CEC version. The name
-# says so explicitly, because a constant called `get_cec_version` sitting among the working
-# constants above reads as a capability and would be picked up by the next person writing a test
-# case expecting it to return something.
+# THERE IS NO getCecVersion CONSTANT HERE, AND THAT IS THE POINT.
 #
-# Four independent confirmations that the method is unregistered:
+# `org.rdk.HdmiCecSink.getCecVersion` is not a registered JSON-RPC method. A constant for it
+# used to sit at this point, named get_cec_version_unregistered, and TCID05 called it and
+# treated the dispatcher's method-not-found reply as a PASS. That asserted a property of the
+# DISPATCHER rather than of the plugin's CEC-version surface: the same reply, and the same pass,
+# would come back from a build with no CEC support at all. Keeping a command constant for an
+# unpublished method also invites the next reader to use it as though it were a capability,
+# which is what the "_unregistered" suffix was trying and failing to prevent.
+#
+# Four independent confirmations that the method is unregistered, retained because they are the
+# evidence for the removal:
 #   1. absent from the generated registration list in the built
 #      interfaces/json/JHdmiCecSink.h (grep for it returns 0 hits);
 #   2. absent from the 24 `handler.Exists` assertions in the L1 RegisteredMethods test;
@@ -139,28 +145,17 @@ get_vendor_id = [
 #      test that remains disabled for precisely this reason.
 # The mechanism behind all four: the method is absent from IHdmiCecSink.h's published set and
 # therefore from Exchange::JHdmiCecSink::Register, which is the plugin's only JSON-RPC
-# registration path.
+# registration path. Publishing it is a production change - a declaration on
+# Exchange::IHdmiCecSink so ThunderTools generates the binding, plus a plugin implementation -
+# which AAP Directive 6 requires be reported rather than made.
 #
-# Where the CEC version IS observable: through the <Give CEC Version> exchange defined in
-# vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml, and in a device
-# record from getDeviceList -- never from a getCecVersion call.
-#
-# It is kept rather than deleted so that the negative case stays available and the analysis
-# stays attached to it; the matching retention rationale is recorded above the disabled L1 test
-# in ../L1Tests/tests/test_HdmiCecSink.cpp. Retargeting it at a registered method would be
-# wrong -- getCecVersion has no registered equivalent. If the plugin ever registers it, rename
-# this back and drop this comment.
-#
-# Argv form, like every constant above: send_curl_command executes without a shell, so the
-# payload and the endpoint are passed to curl as single arguments rather than parsed by /bin/sh.
-get_cec_version_unregistered = [
-    "curl",
-    "--max-time", "5",
-    "--header", "Content-Type: application/json",
-    "--request", "POST",
-    "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.getCecVersion"}',
-    WPEFRAMEWORK_JSONRPC_URL,
-]
+# Where the CEC version IS observable, and what TCID05_Get_CEC_Version now exercises: a
+# directed <Get CEC Version> drives the sink's own responder
+# (HdmiCecSinkProcessor::process(GetCECVersion)), a directed <CEC Version> from a peer is
+# recorded by process(CECVersion) into that peer's device-list entry, and `get_device_list`
+# above reads it back as the entry's "cecVersion". If the plugin ever publishes the method, add
+# a `get_cec_version` constant here alongside the others and re-enable
+# DISABLED_getCecVersion in ../L1Tests/tests/test_HdmiCecSink.cpp.
 
 
 print_device_list = [
@@ -245,11 +240,24 @@ set_active_source = [
 
 # The three key-control commands below address logical address 5, the Audio System.
 #
-# That is the address the suite's own topology allocates: both
-# vcomponent_configurations/hdmicec/hdmicec_vcomponent_configuration.yaml and the device-list
-# payloads describe an Audio System peer at 5, and the sink's user-control paths are the ones an
-# Audio System answers. Logical address 4 has no peer in this topology, so a command aimed at it
-# would be sent to nothing and could not be observed.
+# That is the address the suite's own topology gives the emulated device ITSELF, not merely one
+# of its peers. vcomponent_configurations/hdmicec/hdmicec_vcomponent_configuration.yaml and the
+# config.emulated_device block of vcomponent_configurations/commands/Device_Config_Add_Network.yaml
+# both declare device_type "AudioSystem", and the vComponent offers an audio system exactly one
+# logical address - LOGICAL_ADDRESS_AUDIOSYSTEM == 5 - so 5 is fixed rather than chosen. Two
+# properties follow, and together they are why every key-control command here targets it:
+#
+#   * It is present as soon as the topology is configured. Device_Config_Add_Network.yaml is the
+#     FIRST document Init_Devicelist_Populate.py posts, so address 5 exists before any per-peer
+#     payload is injected.
+#   * It is the one address whose registration is separately observable. HdmiCecSinkImplementation
+#     ::addDevice() raises ReportAudioDeviceConnectedStatus only under `if(logicalAddress == 0x5)`;
+#     every other address gets OnDeviceAdded alone.
+#
+# Other logical addresses ARE occupied in this topology - the DeviceListConfig/ payloads seed
+# peers as initiators 1, 3, 4, 5, 10 and 11, so a command sent to 4 (SONY, PlaybackDevice) would
+# reach a real peer once Init_Devicelist_Populate.py has injected its ReportPhysicalAddress
+# document. Address 5 is preferred because it needs no such injection to be there.
 send_key_press_event = [
     "curl",
     "--max-time", "5",
@@ -320,24 +328,97 @@ set_menu_language = [
 ]
 
 
+# THE WRITTEN VALUE IS EXPORTED, AND THE COMMAND IS BUILT FROM IT.
+#
+# A test case that writes this OSD name and then reads it back has to know what it wrote in
+# order to assert the readback, and the only correct source for that is the command that did the
+# writing. Restating the literal in the test case looks equivalent and is not: the two copies
+# drift, and the drift shows up as a test that passes against the wrong value or fails against
+# the right one. TCID10_Set_OSD_Name imports the constant below and requires exact equality
+# against it, so changing the name here changes what that case demands, in one edit.
+#
+# The value is compared verbatim rather than normalised because the plugin returns it verbatim:
+# OSDName::toString() in hdmicec/ccec/include/ccec/Operands.hpp returns the stored string
+# unchanged, and this name is 6 characters against an OSDName MAX_LEN of 14, so nothing is
+# truncated on the way through.
+SET_OSD_NAME_VALUE = "Sky TV"
+
 set_osd_name = [
     "curl",
     "--max-time", "5",
     "--header", "Content-Type: application/json",
     "--request", "POST",
-    "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setOSDName","params":{"name":"Sky TV"}}',
+    "-d",
+    '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setOSDName","params":'
+    f'{{"name":"{SET_OSD_NAME_VALUE}"}}}}',
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
 
-set_routing_change = [
-    "curl",
-    "--max-time", "5",
-    "--header", "Content-Type: application/json",
-    "--request", "POST",
-    "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setRoutingChange","params":{"oldPort":"HDMI0","newPort":"HDMI1"}}',
-    WPEFRAMEWORK_JSONRPC_URL,
-]
+# THE THREE ROUTING-CHANGE REQUESTS, AND WHY THERE ARE THREE.
+#
+# setRoutingChange resolves each port name independently
+# (HdmiCecSinkImplementation.cpp:2389-2427): a name containing "TV" is the television's own
+# address, and anything else is parsed as "HDMI" followed by an input index that must exist in the
+# port map. The two branches do different things to the sink's notion of the active source, and
+# only the port names decide which:
+#   - oldPort naming TV      -> m_currentActiveSource becomes -1 (nothing is the source)
+#   - newPort naming TV      -> m_currentActiveSource becomes the television's own address
+#   - neither naming TV      -> the addresses are resolved, <Routing Change> is broadcast, and
+#                               m_currentActiveSource is NOT touched
+# TCID19_Active_Path_Routing_Change_Flow needs all three, because a case that only ever sends the
+# third shape cannot tell a working setRoutingChange from one that does nothing at all.
+#
+# The port names are named constants rather than three sets of literals so the pair that has to
+# stay consistent - the input this suite treats as "some HDMI input" and the token the plugin
+# matches for the television - is declared once. HDMI0 and HDMI1 are the two lowest input indices
+# and so exist on any television with two or more HDMI inputs; a port index the device does not
+# have is refused by the plugin before it broadcasts (cpp:2400/2424), which would make the request
+# a silent no-op.
+_ROUTING_TV_PORT = "TV"
+_ROUTING_HDMI_PORT_A = "HDMI0"
+_ROUTING_HDMI_PORT_B = "HDMI1"
+
+
+def _set_routing_change_request(old_port, new_port):
+    '''Build the curl argv for one setRoutingChange request.
+
+    Three requests differ only in their two port names, so the argv is built once here rather
+    than copied three times - a copy being where the timeout, the header or the endpoint drifts
+    apart between siblings.
+    Args:
+        old_port: Value for the oldPort parameter, either "TV" or "HDMI<n>"
+        new_port: Value for the newPort parameter, either "TV" or "HDMI<n>"
+    Returns:
+        A curl argv list in the same shape as every other constant in this module.
+    '''
+    return [
+        "curl",
+        "--max-time", "5",
+        "--header", "Content-Type: application/json",
+        "--request", "POST",
+        "-d",
+        '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setRoutingChange","params":'
+        f'{{"oldPort":"{old_port}","newPort":"{new_port}"}}}}',
+        WPEFRAMEWORK_JSONRPC_URL,
+    ]
+
+
+# Input to input: resolves both addresses and broadcasts <Routing Change> without moving the
+# active source. This is the pre-existing constant and its parameters are unchanged.
+set_routing_change = _set_routing_change_request(
+    _ROUTING_HDMI_PORT_A, _ROUTING_HDMI_PORT_B
+)
+
+# Input to television: makes the television the active source.
+set_routing_change_to_tv = _set_routing_change_request(
+    _ROUTING_HDMI_PORT_A, _ROUTING_TV_PORT
+)
+
+# Television to input: leaves nothing holding the active source.
+set_routing_change_from_tv = _set_routing_change_request(
+    _ROUTING_TV_PORT, _ROUTING_HDMI_PORT_B
+)
 
 
 setup_arc_routing_true = [
@@ -360,12 +441,26 @@ setup_arc_routing_false = [
 ]
 
 
+# THE WRITTEN VALUE IS EXPORTED, AND THE COMMAND IS BUILT FROM IT - same contract as
+# SET_OSD_NAME_VALUE above, and for the same reason: TCID12_Verify_Vendor_ID_Readback imports
+# this constant and requires the readback to equal it, so the value lives in exactly one place.
+#
+# Unlike the OSD name, this one CANNOT be compared verbatim, and the reason is in the
+# middleware. getVendorId returns appVendorId.toString(), and CECBytes::toString() in
+# hdmicec/ccec/include/ccec/Operands.hpp formats each byte with std::hex and NO zero padding
+# and no "0x" prefix - so the three bytes 0x00, 0x19, 0xFB render as "019fb", not "0x0019FB".
+# The two strings denote the same 24-bit identifier and differ only in presentation, so the
+# comparison is made on the integer value: int("019fb", 16) == int("0x0019FB", 16) == 0x0019FB.
+SET_VENDOR_ID_VALUE = "0x0019FB"
+
 set_vendor_id = [
     "curl",
     "--max-time", "5",
     "--header", "Content-Type: application/json",
     "--request", "POST",
-    "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setVendorId","params":{"vendorid":"0x0019FB"}}',
+    "-d",
+    '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setVendorId","params":'
+    f'{{"vendorid":"{SET_VENDOR_ID_VALUE}"}}}}',
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 

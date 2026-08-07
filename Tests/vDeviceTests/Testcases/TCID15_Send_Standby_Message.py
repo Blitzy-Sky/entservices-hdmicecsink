@@ -67,13 +67,6 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# These six utils symbols are the pinned per-case import contract every TCID module in this suite
-# shares, so log_with_timing is imported although this case gates its own message inline: the
-# inline form keeps the choice of log level with the call that prints, whereas log_with_timing
-# returns a string and would move that choice away from the call site. Nothing beyond the set is
-# imported, and the vComponent helpers in particular are not: that omission is the band boundary
-# the comment closing run_test() explains, and it is load-bearing for this case.
-
 
 def run_test():
     start_time = time.perf_counter()

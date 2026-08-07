@@ -19,19 +19,50 @@
 # * limitations under the License.
 # *
 #* ******************************************************************************
-# Emulated peer for the sink (TV) device under test.
+# THE EMULATED DEVICE IS THE DEVICE UNDER TEST ITSELF, NOT A PEER.
 #
-# device_type "AudioSystem" fixes this peer's CEC logical address: the vComponent's
+# The vComponent replaces the HDMI-CEC HAL beneath the sink plugin, and the block below declares
+# the identity that HAL presents for the DUT. HdmiCecOpen resolves hdmicec/emulated_device against
+# the device map and then, for a TV, fixes physical address 0.0.0.0 and leaves the logical address
+# at 0x0F for the application to claim (rdk-halif-test-hdmi_cec/vcomponent/src/vcHdmiCec.c:770-775).
+#
+# device_type MUST BE "TV", and that is a HAL requirement rather than a preference.
+# HdmiCecSinkImplementation::allocateLAforTV() claims LogicalAddress::TV for the sink, and
+# HdmiCecAddLogicalAddress rejects the request outright unless the emulated device is a TV AND the
+# address is 0 (vcHdmiCec.c:833-853). HdmiCecTx and HdmiCecTxAsync then refuse to transmit while a
+# TV still holds 0x0F (:959, :995). Declaring the DUT as an AudioSystem therefore leaves it unable
+# to register its address and unable to send a single frame - every test case downstream fails for
+# a reason that has nothing to do with the case.
+#
+# Declaring the DUT as a TV IS NOT ROLE INVERSION. Nothing here reconfigures the device under test
+# to stand in for one of its own peers: the sink IS the television, and this is the document that
+# says so. The emulated PEERS remain source-role throughout - see
+# ../commands/Device_Config_Add_Network.yaml, whose device_type values are limited to
+# AudioSystem, PlaybackDevice, RecordingDevice and Tuner.
+#
+# THE AUDIO SYSTEM IS A CHILD PEER, AT LOGICAL ADDRESS 5 AND PHYSICAL ADDRESS 2.0.0.0.
 # vcDevice_AllocateLogicalAddress offers an audio system exactly one candidate,
-# LOGICAL_ADDRESS_AUDIOSYSTEM == 5, so every directed command a test case sends to this peer -
-# and every directed reply defined in hdmicec_vcomponent_cec_responses.yaml - is addressed to
-# logical address 5. The client commands in ../../HdmiCECSink_Curl.py are written against that
-# address; changing device_type here without changing them there would break the pairing.
+# LOGICAL_ADDRESS_AUDIOSYSTEM == 5, and address 5 is the only one for which
+# HdmiCecSinkImplementation::addDevice() additionally raises ReportAudioDeviceConnectedStatus -
+# which is what makes the System Audio Mode and short-audio-descriptor flows observable at all.
+# process(InitiateArc) (HdmiCecSinkImplementation.cpp:508-534) constrains the physical address too:
+# it derives the ARC port's address from HdmiArcPortID - 0 gives 1.0.0.0, 1 gives 2.0.0.0, 2 gives
+# 3.0.0.0 - and engages the ARC path only when deviceList[0x5].m_physicalAddr matches it or is
+# still the unknown sentinel 15.15.15.15. Because this suite seeds that address explicitly, an
+# audio system anywhere else disables every ARC flow silently, so it is placed on HDMI input 1 -
+# the input this suite's own fixtures pin as the ARC port and the only one they report connected
+# (test_HdmiCecSink.cpp:853, HdmiCecSink_L2Test.cpp:961 and :1224 all stub getHDMIARCPortId to 1).
+# That peer is declared as YAMAHA in ../commands/Device_Config.yaml and
+# ../commands/Device_Config_Add_Network.yaml, which are the documents a test case posts to
+# materialise the network; the directed exchanges in hdmicec_vcomponent_cec_responses.yaml and the
+# key-control commands in ../../HdmiCECSink_Curl.py are both written against logical address 5.
+# Those four documents move together: changing the audio system's identity in one without the
+# others breaks the pairing.
 HdmiCec:
-  name: "VAUDIO"
+  name: "VTV"
   language: "eng"
   cec_version: "1.4"
-  device_type: "AudioSystem"
+  device_type: "TV"
   power_status: "on"
   fault: no
 

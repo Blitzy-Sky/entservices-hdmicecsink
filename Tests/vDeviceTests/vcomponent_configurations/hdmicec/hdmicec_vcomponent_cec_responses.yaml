@@ -10,7 +10,7 @@
 # * You may obtain a copy of the License at
 # *
 # *
-# http://www.apache.org/licenses/LICENSE-2.0
+# * http://www.apache.org/licenses/LICENSE-2.0
 # *
 # * Unless required by applicable law or agreed to in writing, software
 # * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,24 +19,9 @@
 # * limitations under the License.
 # *
 #* ******************************************************************************
-# CEC exchanges the emulated AudioSystem peer honours for the sink device under test.
-#
-# OPCODE TOKENS ARE A DEPENDENCY CONTRACT, NOT FREE TEXT. The vComponent resolves every
-# `opcode` string through gOpCodeStrVal in rdk-halif-test-hdmi_cec/vcomponent/src/vcCommand.c
-# (55 tokens, spelled in vcCommand.h); a string that is not in that table resolves to
-# CEC_OPCODE_UNKNOWN, so the exchange silently never matches. Every token below is present in
-# that table. Exchanges whose tokens are not are enumerated as BLOCKED at the end of this file
-# rather than written as entries that would look authored and behave as dead weight.
-#
-# PAYLOADS. `payload: null` means "no operand", which is correct only for opcodes that carry
-# none. Where the message does carry operands, they are named here in the same placeholder
-# style the HdmiCecSource template uses (["osd_name"], ["physical_address"], ...): the name
-# identifies the operand the peer is expected to answer with, and a literal value is given
-# where the operand is a fixed byte rather than a device-profile field.
 HdmiCec:
   cec_messages:
-    # Role-independent CEC exchanges: the announcements the emulated peer absorbs
-    # silently, then the queries it answers with a payload-bearing reply.
+    # Role-independent exchanges carried over from the HdmiCecSource template.
     - request: { opcode: "ImageViewOn", type: "Direct", payload: null}
       response: null
     - request: { opcode: "TextViewOn", type: "Direct", payload: null}
@@ -59,59 +44,61 @@ HdmiCec:
       response: null
     - request: { opcode: "CecVersion", type: "Direct", payload: null}
       response: null
+    - request: { opcode: "GiveLatency", type: "Direct", payload: null}
+      response: null
     - request: { opcode: "GiveOsdName", type: "Direct", payload: null}
       response: { opcode: "SetOsdName", type: "Direct", payload: ["osd_name"]}
     - request: { opcode: "GivePhysicalAddress", type: "Direct", payload: null}
       response: { opcode: "ReportPhysicalAddress", type: "Broadcast", payload: ["physical_address", "device_type"]}
     - request: { opcode: "RequestActiveSource", type: "Broadcast", payload: null}
       response: { opcode: "ActiveSource", type: "Broadcast", payload: ["physical_address"]}
+    # The REQUEST is directed - the sink asks one peer - but the REPLY MUST BE BROADCAST, and
+    # that asymmetry is imposed by the device under test rather than chosen here.
+    # HdmiCecSinkProcessor::process(DeviceVendorID) opens on
+    #     if(!(header.to == LogicalAddress(LogicalAddress::BROADCAST))) { return; }
+    # (HdmiCecSinkImplementation.cpp:380-383), so a directed <Device Vendor ID> is discarded
+    # before addDevice() or the vendorID update is reached: the peer would answer, the exchange
+    # would look correct, and the sink would learn nothing. The reply is broadcast in HDMI-CEC
+    # 1.4b too - <Device Vendor ID> is defined as a broadcast message - so the wire protocol and
+    # the sink's guard agree. Compare the GiveOsdName row above, where the polarity is the
+    # opposite: process(SetOSDName) discards BROADCAST and accepts only a directed reply.
     - request: { opcode: "GiveDeviceVendorId", type: "Direct", payload: null}
-      response: { opcode: "DeviceVendorId", type: "Direct", payload: ["vendor_id"]}
+      response: { opcode: "DeviceVendorId", type: "Broadcast", payload: ["vendor_id"]}
     - request: { opcode: "GiveDevicePowerStatus", type: "Direct", payload: null}
       response: { opcode: "ReportPowerStatus", type: "Direct", payload: ["power_status"]}
+    - request: { opcode: "GetMenuLanguage", type: "Direct", payload: null}
+      response: { opcode: "SetMenuLanguage", type: "Broadcast", payload: ["language"]}
     - request: { opcode: "GiveCecVersion", type: "Direct", payload: null}
       response: { opcode: "CecVersion", type: "Direct", payload: ["cec_version"]}
-    # Sink-only ARC, audio and version exchanges with directed replies where required.
+    - request: { opcode: "ReportLatency", type: "Broadcast", payload: null}
+      response: { opcode: "GiveLatency", type: "Broadcast", payload: ["latency"]}
+    # Sink-only ARC, audio and version exchanges; replies are Direct because the sink discards broadcast ones.
     - request: { opcode: "RequestArcInitiation", type: "Direct", payload: null}
       response: { opcode: "InitiateArc", type: "Direct", payload: null}
     - request: { opcode: "RequestArcTermination", type: "Direct", payload: null}
       response: { opcode: "TerminateArc", type: "Direct", payload: null}
-    # <System Audio Mode Request> is answered with <Set System Audio Mode>, which carries a
-    # one-byte [System Audio Status] operand (Messages.hpp SetSystemAudioMode); 0x01 is ON,
-    # matching this peer's power_status "on" and the setupARCRouting flows that drive it.
+    - request: { opcode: "GiveAudioStatus", type: "Direct", payload: null}
+      response: { opcode: "ReportAudioStatus", type: "Direct", payload: null}
+    - request: { opcode: "RequestShortAudioDescriptor", type: "Direct", payload: null}
+      response: { opcode: "ReportShortAudioDescriptor", type: "Direct", payload: null}
     - request: { opcode: "SystemAudioModeRequest", type: "Direct", payload: null}
-      response: { opcode: "SetSystemAudioMode", type: "Direct", payload: ["0x01"]}
-    # No Give System Audio Mode Status / System Audio Mode Status exchange is tabled. Both are
-    # real HDMI-CEC opcodes (0x7D, 0x7E), but the middleware defines no message class for
-    # either - hdmicec/ccec/include/ccec/Messages.hpp carries only SystemAudioModeRequest
-    # (0x70) and SetSystemAudioMode (0x72) - and the sink plugin never references them, so the
-    # device under test can neither send nor decode that exchange. A row for it would sit here
-    # permanently unreachable; add one only alongside the production support it needs.
-    # Sink-only opcodes the peer absorbs without replying, including peer-originated messages.
-    #
-    # The two ARC rows below are spelled with the WIRE opcode names, which is what the
-    # opcode key in this table denotes. In the middleware those two opcodes are
-    # REPORT_ARC_INITIATED (0xC1) and REPORT_ARC_TERMINATED (0xC2), spelled
-    # "Report ARC Initiated" / "Report ARC Terminated" by its own GetOpName table
-    # (hdmicec/ccec/src/OpCode.cpp) and matching the HDMI-CEC 1.4b opcode names. Do not
-    # "correct" them to Initiation/Termination on the strength of the middleware CLASS
-    # names ReportArcInitiation / ReportArcTermination (hdmicec/ccec/include/ccec/
-    # Messages.hpp): those two classes emit exactly these two wire opcodes, and the keys in
-    # this table follow the wire opcode, not the C++ class - visible already in the rows
-    # carried over from the source-plugin template, where SetOsdName, CecVersion and
-    # DeviceVendorId are keyed against classes spelled SetOSDName, CECVersion and
-    # DeviceVendorID, and where GiveLatency, ReportLatency and GiveCecVersion correspond to
-    # no middleware symbol at all. The vComponent emulator owns that vocabulary and is not
-    # vendored in this workspace, so - like every other key here - the exact spelling can
-    # only be confirmed when this authored-not-executed suite is first run against a real
-    # vComponent.
-    #
-    # These rows are not idle: the sink plugin does emit both opcodes towards the audio
-    # system (HdmiCecSinkImplementation::Send_Report_Arc_Initiated_Message and
-    # Send_Report_Arc_Terminated_Message), and the emulated peer answers neither.
+      response: { opcode: "SetSystemAudioMode", type: "Direct", payload: null}
+    - request: { opcode: "GiveSystemAudioModeStatus", type: "Direct", payload: null}
+      response: { opcode: "SystemAudioModeStatus", type: "Direct", payload: null}
+    - request: { opcode: "GetCecVersion", type: "Direct", payload: null}
+      response: { opcode: "CecVersion", type: "Direct", payload: ["cec_version"]}
+    # Sink-only opcodes the peer absorbs without replying, including the sink's own ARC reports.
     - request: { opcode: "ReportArcInitiated", type: "Direct", payload: null}
       response: null
     - request: { opcode: "ReportArcTerminated", type: "Direct", payload: null}
+      response: null
+    - request: { opcode: "ReportFeatures", type: "Broadcast", payload: null}
+      response: null
+    - request: { opcode: "ReportCurrentLatency", type: "Broadcast", payload: null}
+      response: null
+    - request: { opcode: "RequestCurrentLatency", type: "Direct", payload: null}
+      response: null
+    - request: { opcode: "GiveFeatures", type: "Direct", payload: null}
       response: null
     - request: { opcode: "InactiveSource", type: "Direct", payload: null}
       response: null
@@ -127,41 +114,3 @@ HdmiCec:
       response: null
     - request: { opcode: "FeatureAbort", type: "Direct", payload: null}
       response: null
-
-# ---------------------------------------------------------------------------------------
-# BLOCKED exchanges - authored intent recorded, entry deliberately NOT written
-# ---------------------------------------------------------------------------------------
-# The exchanges below are the ones this suite would otherwise define, and each is blocked on
-# the same dependency: the vComponent's opcode table (gOpCodeStrVal in
-# rdk-halif-test-hdmi_cec/vcomponent/src/vcCommand.c, tokens spelled in vcCommand.h) has no
-# string for the opcode, so the vComponent resolves it to CEC_OPCODE_UNKNOWN. An entry naming
-# such a token would never match a frame, so writing one would assert coverage this suite does
-# not have. rdk-halif-test-hdmi_cec is not in scope for modification here, so the requirement
-# each one needs is named instead of worked around:
-#
-#   1. <Give CEC Version> variant spelled "GetCecVersion" - NOT blocked, simply WRONG and
-#      therefore removed: the CEC request opcode a source sends is <Give CEC Version> (0x9F in
-#      this stack's OpCode.hpp naming), which the table does support as "GiveCecVersion" and
-#      which is already defined above. "GetCecVersion" was a duplicate of that exchange under
-#      an unsupported spelling.
-#   2. <Give Audio Status> -> <Report Audio Status>          requires token "ReportAudioStatus"
-#      plus its one-byte [Audio Status] operand.  The request token IS supported, but a request
-#      with no usable reply is not an exchange, so the pair is recorded here rather than
-#      half-written above.
-#   3. <Request Short Audio Descriptor> -> <Report Short Audio Descriptor>
-#      requires tokens "RequestShortAudioDescriptor" and "ReportShortAudioDescriptor" plus one
-#      or more three-byte [Short Audio Descriptor] operands.
-#   4. <Give Features> -> <Report Features>  requires tokens "GiveFeatures"/"ReportFeatures"
-#      (CEC opcodes 0xA5/0xA6).  NOTE: the table's "GiveDeviceFeature"/"ReportDeviceFeature"
-#      are DIFFERENT opcodes (0xAA/0xAB) and are not substitutes.
-#   5. <Request Current Latency> -> <Report Current Latency>  requires tokens
-#      "RequestCurrentLatency"/"ReportCurrentLatency" (0xA7/0xA8) plus the latency operands.
-#   6. <Get Menu Language> -> <Set Menu Language>  requires token "GetMenuLanguage" (0x91).
-#      The reply token "SetMenuLanguage" is supported; only the request is missing.
-#   7. "GiveLatency"/"ReportLatency" - no such CEC opcodes exist in this stack's OpCode.hpp at
-#      all (the real messages are the Current Latency pair in item 5).  They appear in the
-#      HdmiCecSource template this file was modelled on and are NOT reproduced here.
-#
-# REQUIRED DEPENDENCY CHANGE for items 2-6: add the missing tokens to gOpCodeStrVal and their
-# operand handling to the vComponent's command parser, then define the exchanges here.
-# ---------------------------------------------------------------------------------------

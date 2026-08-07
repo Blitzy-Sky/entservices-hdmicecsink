@@ -89,22 +89,12 @@
 """
 
 import time
-import os
 import json
 
-# The eight-symbol utils import below is the shared contract the emulation-driven ("flow")
-# testcases in this suite are written against. `log_with_timing` is deliberately retained even
-# though this module gates its own timing line on HDMICEC_TIMING_ENABLED directly: keeping the
-# set identical across the flow modules is what lets one be diffed against another, so the
-# resulting single "imported but unused" lint note is accepted convention here rather than an
-# oversight. Every other symbol has a call site below.
-#
-# send_vcomponent_command and HDMICEC_CMD_BASE are what distinguish a flow module from a
-# single-API one: only a flow injects frames, so only a flow needs the vComponent transport and
-# the command-document base directory.
 from utils import (
     send_curl_command,
     send_vcomponent_command,
+    sanitise_for_log,
     HDMICEC_CMD_BASE,
     log_info,
     log_success,
@@ -118,7 +108,7 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 def _post_hdmicec(yaml_file):
     """Post a HdmiCec vComponent YAML command."""
     http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{yaml_file}")
-    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {body}")
+    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {sanitise_for_log(body)}")
     return http_code == 200
 
 
@@ -262,4 +252,3 @@ def run_test():
 
     log_error("TCID22_System_Audio_Mode_Flow Failed ❌")
     return False
-

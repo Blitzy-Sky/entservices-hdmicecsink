@@ -38,8 +38,8 @@
  *    authored for device-level execution.
  *
  * @dependencies
- *  - Standard Python libraries: os, json, shlex, subprocess, re, collections, pathlib,
- *    urllib.parse
+ *  - Standard Python libraries: os, json, selectors, shlex, stat, subprocess, time, re,
+ *    collections, pathlib, urllib.parse
  *
  * @expected_result
  *  - Helpers return the structured result documented per function: a parsed dict, an
@@ -57,12 +57,48 @@
 
 import os
 import json
+import selectors
 import shlex
+import stat
 import subprocess
+import time
 import re
 from collections import namedtuple
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+
+# Sentinel returned by send_curl_command when no usable response was obtained. Callers detect
+# a transport failure with response.startswith("< No response"), so this string is byte-exact.
+# ── CEC bus pacing: the suite's only deliberately timed constructs ──────────────────────────────
+#
+# DEFERRED, and named rather than scattered as magic numbers so the deferral is auditable.
+#
+# Every other wait in this suite was replaced with an observable condition: JSON-RPC and vComponent
+# requests are synchronous, so their reply is the completion signal (see send_curl_command and
+# send_vcomponent_command below), plugin readiness is observed through Controller.1.status (see
+# await_plugin_ready), and device state is observed by re-reading getDeviceList until it reports what
+# the test is waiting for.
+#
+# These four values are what remains, and they are all the SAME thing: the gap after a CEC frame has
+# been handed to the emulator. Nothing observable exists to wait on there. A vComponent POST's HTTP
+# 200 confirms only that the emulator accepted the document - not that the frame was carried on the
+# bus, decoded, and absorbed by the middleware - and the handlers these frames exercise frequently
+# have no observable outcome at all: several are bare `return` guards that increment no counter,
+# change no state and raise no notification. Where an outcome IS observable the test waits for that
+# outcome instead of for one of these values.
+#
+# Removing them would rest on an assumption that cannot be checked from here: that frames posted
+# back to back are never coalesced or dropped by the transport before the middleware sees them. So
+# they are recorded as deferred rather than deleted or guessed at, and they are the specific reason
+# this suite is reported as not fully wait-free. Closing them needs a per-frame acknowledgement the
+# device does not expose.
+CEC_SHORT_PACING_SECONDS = 0.2      # a fixture with no state-visible outcome
+CEC_FRAME_PACING_SECONDS = 1.0      # one injected frame
+CEC_PIPELINE_PACING_SECONDS = 1.5   # a frame whose effect must reach the device list
+CEC_TOPOLOGY_PACING_SECONDS = 2.0   # a device add or remove - the longest path through the pipeline
+
 
 # The import set above is the standard-library dependency contract this module publishes in
 # its docstring, and every sibling module in the suite is written against it, so the two are
@@ -74,6 +110,13 @@ from urllib.parse import urlsplit
 #   * `collections.namedtuple` gives the request description below its shape, and
 #     `urllib.parse.urlsplit` decomposes an endpoint for the per-call re-validation in
 #     _validate_endpoint.
+#   * `stat` supplies S_ISREG for the fstat check in _read_payload, which is what makes the
+#     payload decision rest on an open DESCRIPTOR rather than on a path that can be swapped
+#     between the check and the open.
+#   * `selectors` and `time` are what make the response reader BOUNDED: the reader multiplexes
+#     curl's stdout, stderr and stdin against a monotonic deadline and stops at a byte ceiling,
+#     which subprocess.run() cannot do because it accumulates whatever the child produces
+#     until the child exits.  See _run_curl.
 #   * `tempfile` is NOT imported, and is correspondingly absent from @dependencies. The
 #     template needs it for an indicator-specific YAML-rewrite path that this suite
 #     deliberately does not carry; the sink posts its vComponent payloads verbatim, so an
@@ -383,17 +426,80 @@ YELLOW = "\033[93m"
 BLUE = "\033[94m"
 CYAN = "\033[96m"
 
+# Ceiling on the length of one log line. Deliberately far above anything this suite composes -
+# the longest message it builds is a few hundred characters, and the widest evidence line is
+# three device-list snapshots side by side - so no legitimate message is ever near it, while a
+# response that arrived unbounded from a device still cannot become a screen-length log entry.
+_LOG_LINE_MAX_CHARS = 16384
+
+
+def _guard_log_line(msg):
+    '''Neutralise control characters in a composed log line, and bound its length.
+
+    This is the floor under every log call in the suite, and it exists because a log line is
+    EVIDENCE. A device-level run leaves no artefact but its console transcript, and parts of
+    almost every line in that transcript were composed from data a device sent back. A single
+    ESC reaching a terminal lets that data reposition the cursor, clear the lines above it, or
+    repaint a refusal as a tick; a single newline lets one response become several log records,
+    one of which can be made to look exactly like this suite's own output.
+
+    Applying the guard HERE rather than at each of the several hundred call sites is deliberate.
+    Whether a particular interpolation is dangerous turns on a distinction that is easy to get
+    wrong and easier to lose: a bare string from the wire prints its control bytes literally,
+    while the same string inside a dict or rendered with !r is escaped already by Python's own
+    repr. Enumerating the dangerous sites correctly once is possible; keeping that enumeration
+    correct as the suite grows is not. At this level the property holds for every call, present
+    and future, by construction.
+
+    What it does NOT do is escape everything: printable text and non-ASCII glyphs pass through
+    untouched, so this suite's own tick, warning and cross marks still render, and text that was
+    already escaped by utils.sanitise_for_log is left exactly as that function rendered it. Only
+    C0 controls, DEL and C1 controls are replaced, each by a visible \\xNN escape, and a
+    backslash already present is NOT doubled here - doing so would double the escapes
+    sanitise_for_log produced and make its output unreadable. sanitise_for_log remains the
+    stronger, fully-escaping, tightly-bounded rendering for an individual value from the wire;
+    this is the last line of defence for whatever reaches a log call by another route.
+
+    Args:
+        msg: The composed message. A non-str is rendered with str() first.
+    Returns:
+        Single-line text with no control characters, truncated to _LOG_LINE_MAX_CHARS with an
+        explicit marker when it was longer.
+    '''
+    if not isinstance(msg, str):
+        try:
+            msg = str(msg)
+        except Exception:  # pragma: no cover - defensive; a __str__ that raises is pathological
+            return "<unprintable log message>"
+
+    dropped = len(msg) - _LOG_LINE_MAX_CHARS
+    if dropped > 0:
+        msg = f"{msg[:_LOG_LINE_MAX_CHARS]}...[+{dropped} chars truncated]"
+
+    if not any(ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in msg):
+        # The common case by a wide margin, and identity for every message this suite composes
+        # itself: scan once and return the original object rather than rebuilding it.
+        return msg
+
+    return "".join(
+        f"\\x{ord(character):02x}"
+        if ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F
+        else character
+        for character in msg
+    )
+
+
 def log_info(msg):
-    print(f"{CYAN}{msg}{RESET}")
+    print(f"{CYAN}{_guard_log_line(msg)}{RESET}")
 
 def log_success(msg):
-    print(f"{GREEN}{BOLD}{msg}{RESET}")
+    print(f"{GREEN}{BOLD}{_guard_log_line(msg)}{RESET}")
 
 def log_warning(msg):
-    print(f"{YELLOW}{msg}{RESET}")
+    print(f"{YELLOW}{_guard_log_line(msg)}{RESET}")
 
 def log_error(msg):
-    print(f"{RED}{BOLD}{msg}{RESET}")
+    print(f"{RED}{BOLD}{_guard_log_line(msg)}{RESET}")
 
 
 def log_with_timing(msg, elapsed_time):
@@ -410,6 +516,69 @@ def log_with_timing(msg, elapsed_time):
     if os.environ.get("HDMICEC_TIMING_ENABLED"):
         return f"{msg} time consumed: {elapsed_time:.3f}s"
     return msg
+
+
+# Default character budget applied to a remote-derived string before it is logged. The
+# vComponent's diagnostics and this module's own refusal explanations are a line or two; the
+# budget keeps a hostile or malfunctioning endpoint from filling the run log with one response.
+LOGGED_VALUE_MAX_CHARS = 512
+
+
+def sanitise_for_log(value, max_chars=LOGGED_VALUE_MAX_CHARS):
+    '''Render a remote-derived value as bounded, escaped, pure-ASCII text fit for a console.
+
+    Every string in a run log that came off the wire passes through here first. The reason is
+    log integrity, not tidiness: an endpoint that answers with terminal control sequences can
+    otherwise reposition the cursor, clear what a previous line said, or repaint a failure as a
+    tick, and the console transcript is the only evidence a device-level run leaves behind. An
+    ESC, a carriage return or a backspace reaching a terminal is what makes that possible, so
+    none of them reaches one from here.
+
+    The escaping is total rather than selective. Only the printable ASCII range 0x20-0x7E
+    survives literally, and a literal backslash is doubled so the escapes it introduces cannot
+    be forged by a body that contains "\\x1b" as text. Everything else - C0 and C1 controls,
+    DEL, newlines, tabs, and every non-ASCII code point - is replaced by a \\xNN, \\uNNNN or
+    \\UNNNNNNNN escape. The result is single-line by construction, so one response can never
+    become several log lines, and a body cannot fabricate a line that looks like this suite's
+    own output.
+
+    Args:
+        value: Any object. A str is used as-is; anything else is rendered with str() first, so
+               an HTTP status code or a parsed fragment can be passed in without ceremony.
+        max_chars: Maximum number of INPUT characters rendered. The remainder is dropped and
+                   its length reported, so a truncated body is visibly truncated rather than
+                   silently short. Because one input character can expand to at most ten output
+                   characters, the returned text is bounded by 10*max_chars plus the marker.
+    Returns:
+        Escaped ASCII text, with "...[+N chars truncated]" appended when the input was longer
+        than the budget. Never raises: an object whose str() raises renders as "<unprintable>".
+    '''
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:  # pragma: no cover - defensive; a __str__ that raises is pathological
+            return "<unprintable>"
+
+    budget = max_chars if isinstance(max_chars, int) and max_chars > 0 else LOGGED_VALUE_MAX_CHARS
+    dropped = len(value) - budget
+    rendered = []
+    for character in value[:budget]:
+        code = ord(character)
+        if character == "\\":
+            rendered.append("\\\\")
+        elif 0x20 <= code <= 0x7E:
+            rendered.append(character)
+        elif code <= 0xFF:
+            rendered.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            rendered.append(f"\\u{code:04x}")
+        else:
+            rendered.append(f"\\U{code:08x}")
+
+    text = "".join(rendered)
+    if dropped > 0:
+        text = f"{text}...[+{dropped} chars truncated]"
+    return text
 
 
 # ---------- REQUEST DESCRIPTION ----------
@@ -460,38 +629,228 @@ def _normalise_timeout(timeout, default=5):
     return value if value > 0 else default
 
 
+# Upper bound on how much a single curl invocation may hand back on stdout and stderr
+# together.  Every response this suite reads is a JSON-RPC envelope or a short vComponent
+# acknowledgement - kilobytes - so the ceiling exists purely to bound a hostile or broken
+# endpoint that streams at network speed for the whole timeout window.  It matches the payload
+# cap deliberately: the same order of magnitude is generous for anything legitimate.
+_MAX_RESPONSE_BYTES = 1024 * 1024
+
+# Read granularity for the bounded reader.  One page-ish chunk per readable event keeps the
+# loop responsive to the deadline without a syscall per byte.
+_READ_CHUNK_BYTES = 65536
+
+
+def _terminate_child(proc):
+    '''Stop a curl that is still running, and reap it, without ever blocking indefinitely.
+
+    SIGTERM first, because curl exits promptly on it and a terminated child yields a
+    diagnosable status; SIGKILL only if it is still there after a short grace period.  The
+    process is always waited for: an unreaped child would otherwise stay a zombie for the rest
+    of the suite run, and its pipe file descriptors would stay open in this process.
+    '''
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        proc.kill()
+        proc.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        # Nothing further is available at this level; the finally block in _run_curl closes
+        # the pipes either way, so no descriptor is leaked even in this case.
+        pass
+
+
+def _pump_child(proc, deadline, input_bytes, max_bytes):
+    '''Move bytes to and from a running curl under a byte ceiling and a wall-clock deadline.
+
+    WHY THIS EXISTS, rather than subprocess.run(..., capture_output=True): run() reads until
+    the child closes its pipes and accumulates every byte in this process, with no ceiling.  A
+    malicious or merely broken endpoint can therefore stream for the whole timeout window and
+    exhaust this process's memory before the timeout ever fires - the timeout bounds the
+    DURATION of the read, never its SIZE.  A suite that dies of memory exhaustion reports
+    nothing at all, which is a worse failure than the transport error it was trying to observe.
+
+    So stdout and stderr are read incrementally through a selector, the running total is
+    checked after every chunk, and the child is killed the moment the ceiling is crossed.
+    stdin is written through the SAME selector rather than up front: a server that never reads
+    the request body would otherwise block this process in write() once the pipe buffer filled,
+    which is the same denial of service arriving from the other direction.
+
+    Returns:
+        (stdout_bytes, stderr_bytes, overflow, timed_out)
+    '''
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    total = 0
+    overflow = False
+    timed_out = False
+    pending = memoryview(input_bytes) if input_bytes else None
+
+    selector = selectors.DefaultSelector()
+    try:
+        for name in ("stdout", "stderr"):
+            stream = getattr(proc, name)
+            if stream is not None:
+                selector.register(stream.fileno(), selectors.EVENT_READ, name)
+        if pending is not None and proc.stdin is not None:
+            selector.register(proc.stdin.fileno(), selectors.EVENT_WRITE, "stdin")
+        elif proc.stdin is not None:
+            proc.stdin.close()
+
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            # Capped so the deadline is re-evaluated regularly even on a silent connection.
+            for key, mask in selector.select(timeout=min(remaining, 0.5)):
+                which = key.data
+                if which == "stdin":
+                    try:
+                        written = os.write(key.fd, pending[:_READ_CHUNK_BYTES])
+                    except BrokenPipeError:
+                        # curl exited or stopped reading; nothing more can be delivered.
+                        selector.unregister(key.fd)
+                        _close_quietly(proc.stdin)
+                        continue
+                    except OSError:
+                        selector.unregister(key.fd)
+                        _close_quietly(proc.stdin)
+                        continue
+                    pending = pending[written:]
+                    if not pending:
+                        selector.unregister(key.fd)
+                        # EOF on the request body is what tells curl the POST is complete.
+                        _close_quietly(proc.stdin)
+                    continue
+
+                try:
+                    chunk = os.read(key.fd, _READ_CHUNK_BYTES)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                captured[which].extend(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    overflow = True
+                    break
+            if overflow:
+                break
+    finally:
+        selector.close()
+
+    return bytes(captured["stdout"]), bytes(captured["stderr"]), overflow, timed_out
+
+
+def _close_quietly(stream):
+    '''Close a pipe end, tolerating one that is already closed or already broken.'''
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except (OSError, ValueError):
+        pass
+
+
 def _run_curl(argv, timeout, input_bytes=None):
-    '''Run curl as an argument list with no shell, bounded in time.
+    '''Run curl as an argument list with no shell, bounded in time AND in bytes.
 
     This is the ONLY place in the suite that starts a process. shell=False means the argument
     list is passed to execve untouched, so no element of it - endpoint, payload or parameter
     value - can be interpreted as a command, a redirection or a second argument.
+
+    The response is read through _pump_child, which stops at _MAX_RESPONSE_BYTES and kills the
+    child rather than accumulating whatever an endpoint chooses to send.  An overflow is
+    reported as a FAILURE with its own diagnostic: a truncated body is not an answer, and
+    handing back the first megabyte of a stream as though it were a response would let a
+    hostile endpoint decide what this suite believes.
     Args:
-        argv: Complete argument list, already carrying "--" before its URL
-        timeout: curl --max-time budget in seconds, also used to bound subprocess.run
+        argv: Complete argument list, already carrying "--" before its URL where applicable
+        timeout: curl --max-time budget in seconds, also used to bound the read loop
         input_bytes: Optional request body delivered on curl's stdin
     Returns:
-        (ok, returncode, stdout, stderr) where ok is True only when curl exited 0.
-        returncode is None when curl could not be run or exceeded its bound.
+        (ok, returncode, stdout, stderr) where ok is True only when curl exited 0 within its
+        budget and produced no more than the byte ceiling.  returncode is None when curl could
+        not be run, exceeded its bound, or was killed for overflowing.
     '''
+    deadline = time.monotonic() + timeout + _SUBPROCESS_TIMEOUT_MARGIN_SECONDS
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            check=False,
             shell=False,
-            input=input_bytes,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout + _SUBPROCESS_TIMEOUT_MARGIN_SECONDS,
         )
-    except subprocess.TimeoutExpired:
-        return False, None, "", f"curl exceeded its {timeout}s budget and was terminated"
     except (OSError, ValueError) as exc:
         return False, None, "", f"curl could not be executed: {exc}"
 
-    stdout = (completed.stdout or b"").decode("utf-8", errors="replace")
-    stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
-    return completed.returncode == 0, completed.returncode, stdout, stderr
+    try:
+        stdout_bytes, stderr_bytes, overflow, timed_out = _pump_child(
+            proc, deadline, input_bytes, _MAX_RESPONSE_BYTES
+        )
+        if overflow:
+            _terminate_child(proc)
+            return (
+                False,
+                None,
+                "",
+                f"the endpoint sent more than the {_MAX_RESPONSE_BYTES} byte response ceiling; "
+                "curl was terminated and the partial body discarded",
+            )
+        if timed_out:
+            _terminate_child(proc)
+            return False, None, "", f"curl exceeded its {timeout}s budget and was terminated"
+
+        # Both pipes reached EOF, so the child is finishing; still bounded, because a curl that
+        # closed its outputs and then hung would otherwise wait here for ever.
+        remaining = max(deadline - time.monotonic(), 0.1)
+        try:
+            returncode = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _terminate_child(proc)
+            return False, None, "", f"curl exceeded its {timeout}s budget and was terminated"
+    finally:
+        # Always: reap the child if it is somehow still running, and close every pipe this
+        # process holds.  subprocess.run() did both implicitly; Popen does not.
+        _terminate_child(proc)
+        _close_quietly(proc.stdin)
+        _close_quietly(proc.stdout)
+        _close_quietly(proc.stderr)
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+    return returncode == 0, returncode, stdout, stderr
+
+
+# Written by curl at the very end of its output because of "-w".  The body is everything
+# before it, so the marker is a newline plus the numeric status and nothing else; splitting on
+# the LAST newline keeps a body that itself contains newlines intact.
+_HTTP_CODE_WRITE_OUT = "\n%{http_code}"
+
+
+def _split_http_status(stdout):
+    '''Split curl output produced with _HTTP_CODE_WRITE_OUT into (body, status).
+
+    Returns status None when no numeric status is present, which is itself a failure: it means
+    curl did not complete a request/response exchange, so there is nothing to believe about
+    whatever text did arrive.
+    '''
+    if not stdout:
+        return "", None
+    body, _, tail = stdout.rpartition("\n")
+    candidate = tail.strip()
+    if candidate.isdigit():
+        return body, int(candidate)
+    # No trailing status: the whole output is unattributed text.
+    return stdout, None
 
 
 def _jsonrpc_argv(payload, timeout):
@@ -499,10 +858,16 @@ def _jsonrpc_argv(payload, timeout):
 
     The endpoint is re-validated here rather than trusted from module scope, and "--" is
     placed immediately before it so curl cannot read it as an option.
+
+    "-w" is included so the HTTP STATUS comes back alongside the body.  Without it curl exits 0
+    for any completed exchange, including a 500 or a 404 that carries a body - and a body is
+    exactly what a server returns with an error status, so "curl exited 0 and something came
+    back" is not evidence that the request was served.
     '''
     url = _validate_endpoint(WPEFRAMEWORK_JSONRPC_URL, "WPEFRAMEWORK_JSONRPC_URL")
     return [
         "curl", "-sS",
+        "-w", _HTTP_CODE_WRITE_OUT,
         "--connect-timeout", str(min(_CONNECT_TIMEOUT_SECONDS, timeout)),
         "--max-time", str(timeout),
         "-H", "Content-Type: application/json",
@@ -516,8 +881,19 @@ def _jsonrpc_argv(payload, timeout):
 def _dispatch_jsonrpc(method, params, request_id, timeout):
     '''Post one JSON-RPC request and return (ok, body, diagnostic).
 
-    ok is True only when curl exited 0 AND a non-empty body came back. A transport failure
-    never yields a body, so no caller can mistake an unreachable device for an answer.
+    THREE independent conditions must all hold before a body is handed back, because each one
+    fails in a way the others cannot see:
+
+      * curl exited 0.  A transport failure never yields a body.
+      * the HTTP status is 2xx.  curl exits 0 for a COMPLETED exchange whatever the status, so
+        a 500 or a 404 carrying a JSON body used to be returned as an answer - and an error
+        status is precisely when a server sends a body.  A 401 page or a proxy's 502 document
+        is not a JSON-RPC response.
+      * the body is non-empty.
+
+    The remaining two conditions - that the body is exactly one valid JSON-RPC envelope, and
+    that its id matches the one sent - are enforced by the caller against the parsed envelope,
+    where the request id is known.
     '''
     payload = {
         "jsonrpc": "2.0",
@@ -537,9 +913,24 @@ def _dispatch_jsonrpc(method, params, request_id, timeout):
             diagnostic = f"{diagnostic}: {detail}"
         return False, "", diagnostic
 
-    body = stdout.strip()
+    body_text, status = _split_http_status(stdout)
+    if status is None:
+        return False, "", (
+            "curl exited 0 but reported no HTTP status, so no request/response exchange "
+            "completed"
+        )
+    if not 200 <= status < 300:
+        detail = body_text.strip()
+        if len(detail) > 200:
+            detail = detail[:200] + "..."
+        diagnostic = f"the endpoint answered HTTP {status}, which is not a success status"
+        if detail:
+            diagnostic = f"{diagnostic}; body: {detail!r}"
+        return False, "", diagnostic
+
+    body = body_text.strip()
     if not body:
-        return False, "", "curl exited 0 but the response body was empty"
+        return False, "", f"the endpoint answered HTTP {status} with an empty body"
 
     return True, body, ""
 
@@ -576,14 +967,36 @@ def send_jsonrpc_command(method, params=None, request_id=1, timeout=5):
         Parsed response dict on success, None on any transport or parse failure.
     '''
     budget = _normalise_timeout(timeout)
-    # A transport failure, an empty body or a body that is not a JSON-RPC envelope all yield
-    # None. The caller is never handed a synthesised success object, so an unreachable device
-    # reads as a failure rather than as a pass.
+    # A transport failure, a non-2xx status, an empty body, a body that is not a JSON-RPC
+    # envelope, or an envelope answering a DIFFERENT request all yield None. The caller is never
+    # handed a synthesised success object, so an unreachable or misbehaving device reads as a
+    # failure rather than as a pass.
     ok, body, diagnostic = _dispatch_jsonrpc(method, params, request_id, budget)
     if not ok:
         log_warning(f"Inside Utils.py : {method} not dispatched - {diagnostic}")
         return None
-    return _parse_jsonrpc_envelope(body)
+
+    envelope = _parse_jsonrpc_envelope(body)
+    if envelope is None:
+        log_warning(
+            f"Inside Utils.py : {method} answered with something that is not a single valid "
+            "JSON-RPC 2.0 envelope"
+        )
+        return None
+
+    # THE ID MUST MATCH.  JSON-RPC pairs a response to its request by id, and this suite issues
+    # one request per exchange, so an envelope carrying a different id is not this call's
+    # answer - it is a stale, cached or fabricated response, and treating it as this call's
+    # result would attribute somebody else's outcome to this test.  Compared loosely on the
+    # string form because a JSON id may legitimately arrive as 42 or "42".
+    if "id" not in envelope or str(envelope.get("id")) != str(request_id):
+        log_warning(
+            f"Inside Utils.py : {method} answered with id {envelope.get('id')!r} but the "
+            f"request carried id {request_id!r}; the response does not belong to this request"
+        )
+        return None
+
+    return envelope
 
 
 def activate_plugin(callsign):
@@ -612,12 +1025,223 @@ def activate_plugin(callsign):
     return "result" in response
 
 
+def _request_id_from_argv(argv):
+    '''Return the JSON-RPC id carried by a curl argv's request body, or None.
+
+    The suite's command definitions all pass their body with -d/--data, so the id the target is
+    expected to echo is recoverable from the command itself.  None means "no id could be
+    established", which is not treated as an id mismatch - it is simply one check that cannot be
+    applied to that command.
+    '''
+    data_flags = ("-d", "--data", "--data-raw", "--data-ascii", "--data-binary")
+    for index, token in enumerate(argv):
+        if token in data_flags and index + 1 < len(argv):
+            candidate = argv[index + 1]
+        elif token.startswith("--data=") or token.startswith("--data-raw="):
+            candidate = token.split("=", 1)[1]
+        else:
+            continue
+        try:
+            decoded = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(decoded, dict) and "id" in decoded:
+            return decoded["id"]
+    return None
+
+
+def send_jsonrpc_envelope(curl_command, label):
+    '''Dispatch a suite command definition and return its reply envelope, or None.
+
+    The shared front half of every assertion a test case makes about a JSON-RPC call. It returns
+    a value ONLY when all five of these hold, and logs the specific reason for the failure
+    otherwise, naming `label` so a run log says which of a case's several calls went wrong:
+
+      * the command was dispatched and a reply came back - the NO_RESPONSE_SENTINEL is refused
+        here, and refused by prefix, because it is a truthy string and an emptiness test alone
+        would read a dead endpoint as a healthy one;
+      * the reply is syntactically valid JSON;
+      * the reply is a JSON object rather than an array or a scalar;
+      * it declares jsonrpc 2.0;
+      * its id is the id the command sent, so the envelope describes THIS call.
+
+    send_curl_command already enforces the transport half of that - curl's exit status, a 2xx
+    HTTP status, exactly one envelope, and the matching id - so a caller only needing a reply is
+    safe without this. What this adds is the same guarantee re-established where a VERDICT is
+    formed: a test whose result is "the plugin acknowledged this write" or "the plugin refused
+    this call" cannot rest that result on a helper's internal behaviour, because an envelope
+    belonging to another request carries another request's answer.
+
+    Args:
+        curl_command: A command definition from HdmiCECSink_Curl.py, argv or string form.
+        label: How this call should be named in a diagnostic, e.g. "baseline setVendorId".
+    Returns:
+        The parsed envelope as a dict, or None when any condition above failed.
+    '''
+    response = send_curl_command(curl_command)
+    if not response:
+        log_error(f"✖ {label}: command not sent")
+        return None
+    if response.startswith("< No response"):
+        log_error(f"✖ {label}: no usable response from WPEFramework")
+        return None
+
+    try:
+        envelope = json.loads(response)
+    except ValueError:
+        log_error(
+            f"✖ {label}: reply is not valid JSON "
+            f"({sanitise_for_log(response, max_chars=256)})"
+        )
+        return None
+
+    if not isinstance(envelope, dict):
+        log_error(
+            f"✖ {label}: reply is valid JSON but not a JSON-RPC envelope "
+            f"({type(envelope).__name__})"
+        )
+        return None
+    if envelope.get("jsonrpc") != "2.0":
+        log_error(
+            f"✖ {label}: reply does not declare jsonrpc 2.0 "
+            f"(jsonrpc={sanitise_for_log(envelope.get('jsonrpc'), max_chars=32)})"
+        )
+        return None
+
+    sent_id = expected_request_id(curl_command)
+    if sent_id is None:
+        log_error(
+            f"✖ {label}: the command definition carries no readable JSON-RPC id, so the reply "
+            "cannot be correlated to it"
+        )
+        return None
+    if str(envelope.get("id")) != str(sent_id):
+        log_error(
+            f"✖ {label}: reply answers request id "
+            f"{sanitise_for_log(envelope.get('id'), max_chars=32)}, not the {sent_id} that was "
+            "sent, so it describes a different call"
+        )
+        return None
+
+    return envelope
+
+
+def envelope_result(envelope):
+    '''Return an envelope's "result" mapping, or None when there is not one.
+
+    A JSON-RPC 2.0 reply carries result or error and never both, so None here means "this reply
+    is not an answer" - either it is a refusal, or its result is an off-contract type. Returning
+    None for a non-mapping result rather than raising is what lets a caller state the shape
+    requirement as one condition instead of guarding every field read.
+    '''
+    if not isinstance(envelope, dict):
+        return None
+    result = envelope.get("result")
+    return result if isinstance(result, dict) else None
+
+
+def envelope_error(envelope):
+    '''Return an envelope's "error" mapping, or None when there is not one.'''
+    if not isinstance(envelope, dict):
+        return None
+    error = envelope.get("error")
+    return error if isinstance(error, dict) else None
+
+
+def require_ack(curl_command, label):
+    '''True only when a write was dispatched AND the plugin acknowledged it.
+
+    "Acknowledged" is the sink's published success shape: a result member carrying
+    success == True, tested identically rather than truthily so that a 1, a "true" or a missing
+    member is not read as agreement.
+
+    This exists because the alternative - dispatching a write and not looking at the reply - is
+    indistinguishable from not dispatching it at all. A case that writes, reads back, and finds
+    the value it expected proves nothing if the write never left the host: the value it found is
+    simply the value that was already there.
+
+    Args:
+        curl_command: The write command definition.
+        label: How the write should be named in a diagnostic.
+    Returns:
+        True on an acknowledged write; False otherwise, with the reason already logged.
+    '''
+    envelope = send_jsonrpc_envelope(curl_command, label)
+    if envelope is None:
+        return False
+
+    error = envelope_error(envelope)
+    if error is not None:
+        log_error(
+            f"✖ {label}: refused by the plugin "
+            f"(code={sanitise_for_log(error.get('code'), max_chars=32)}, "
+            f"message={sanitise_for_log(error.get('message'), max_chars=192)})"
+        )
+        return False
+
+    result = envelope_result(envelope)
+    if result is None:
+        log_error(
+            f"✖ {label}: reply carries neither an error nor a result object, so the write was "
+            "not acknowledged"
+        )
+        return False
+    if result.get("success") is not True:
+        log_error(
+            f"✖ {label}: not acknowledged - success="
+            f"{sanitise_for_log(result.get('success'), max_chars=32)}"
+        )
+        return False
+
+    log_success(f"✔ {label}: acknowledged")
+    return True
+
+
+def expected_request_id(curl_command):
+    '''Return the JSON-RPC id a suite command definition sends, or None when there is none.
+
+    send_curl_command already refuses a reply whose id does not match the one sent, so a caller
+    never has to check correlation to be safe. This exists for the caller that has to check it
+    ANYWAY - a test whose verdict is "the dispatcher rejected this specific call" cannot rest
+    that verdict on a helper's internal behaviour, because a reply correlated to some other
+    request would carry some other request's error. Reading the id from the command definition,
+    rather than repeating the literal in the test, is what keeps the two from drifting when a
+    command's id changes.
+
+    Args:
+        curl_command: Either a curl argv sequence or the command STRING form, in the same two
+                      shapes send_curl_command accepts.
+    Returns:
+        The id value as it appears in the request body, or None when the command carries no
+        parseable JSON body with an id member.
+    '''
+    if isinstance(curl_command, str):
+        try:
+            argv = shlex.split(curl_command)
+        except ValueError:
+            return None
+    else:
+        argv = list(curl_command)
+    return _request_id_from_argv(argv)
+
+
+def _with_http_status_write_out(argv):
+    '''Return argv with "-w <status marker>" inserted, unless it already carries a -w.
+
+    Inserted immediately after the curl binary, so it lands before any "--" and before the URL
+    and can never be mistaken for the URL's option terminator.
+    '''
+    if any(token == "-w" or token.startswith("--write-out") for token in argv):
+        return list(argv)
+    return [argv[0], "-w", _HTTP_CODE_WRITE_OUT] + list(argv[1:])
+
+
 def send_curl_command(curl_command):
-    '''Run a curl command and return its JSON response line as a string.
+    '''Run a curl command and return its JSON-RPC response line as a string.
 
     Accepts either the complete curl command STRING that HdmiCECSink_Curl.py exports, or an
     already-built argv sequence. Either way the command is executed WITHOUT A SHELL: a
-    string is split into an argv list with shlex and handed straight to subprocess.run, so
+    string is split into an argv list with shlex and handed straight to a bounded subprocess, so
     no part of it - least of all the environment-derived endpoint URL appended to every
     constant in HdmiCECSink_Curl.py - can ever be interpreted as shell syntax. A URL
     carrying `;`, `&&` or `$(...)` therefore becomes inert argv text that curl rejects,
@@ -625,18 +1249,36 @@ def send_curl_command(curl_command):
     substitution, globbing) are consequently not supported here, by design; nothing in this
     suite uses them.
 
+    WHAT COUNTS AS A RESPONSE, and why the bar is where it is.  This helper used to return the
+    first line of curl's output that happened to parse as JSON, having consulted neither curl's
+    exit status nor the HTTP status.  Two very ordinary server behaviours defeated that:
+
+      * a server that answers 500 (or 401, or a proxy's 502) WITH a JSON body - which is
+        exactly when a server sends a body - was reported as a successful response;
+      * a server that sends success-looking JSON and then stalls until curl gives up at exit 28
+        was reported as a successful response, because the JSON had already been printed.
+
+    All four conditions below must therefore hold, and each is checked because the others
+    cannot see its failure:
+
+      1. curl exited 0 - so the exchange completed rather than timing out or being refused;
+      2. the HTTP status is 2xx - so the request was actually served;
+      3. exactly ONE line of the body is a complete JSON-RPC 2.0 envelope - so a document with
+         several JSON fragments, or none, is not silently reduced to whichever line came first;
+      4. the envelope's id matches the id the command sent, when the command carried one - so a
+         stale or fabricated response cannot be attributed to this request.
+
     The response is returned as a raw string, not a parsed object: callers run their own
     json.loads on it so that they can distinguish a malformed payload from a missing one.
     Any failure - a command that cannot be tokenised, a curl binary that is absent, a
-    transport error, an unparsable body, or no body at all - yields the
-    "< No response from WPEFramework >" sentinel, which callers detect with
-    response.startswith("< No response").
+    transport error, a non-success status, an unparsable body, an id mismatch, a response over
+    the byte ceiling, or no body at all - yields the "< No response from WPEFramework >"
+    sentinel, which callers detect with response.startswith("< No response").
     Args:
         curl_command: Complete curl command string, or a sequence of argv tokens
     Returns:
-        The first response line that parses as JSON, otherwise the sentinel string.
+        The single JSON-RPC envelope line, otherwise the sentinel string.
     '''
-    output_response = NO_RESPONSE_SENTINEL
     try:
         if isinstance(curl_command, (list, tuple)):
             # Already structured: use it as argv verbatim, which is the shape a caller
@@ -664,66 +1306,84 @@ def send_curl_command(curl_command):
         if not argv:
             raise ValueError("empty curl command")
 
-        # shell=False (the default) is the whole point.  stdout is captured because the JSON
-        # line is parsed out of it, and stderr is captured so that curl's own explanation can be
-        # printed with the exit status when nothing usable came back - a failure that is reported
-        # rather than silently flattened into the sentinel.  The call is bounded by
-        # CURL_TIMEOUT_SECONDS so a hung endpoint cannot stall the run, and subprocess.run waits
-        # for the child and closes its pipes before returning, so no process handle survives this
-        # call even when the command fails - the os.popen form it replaces left the handle to the
-        # garbage collector.
-        completed = subprocess.run(
-            argv,
-            check=False,
-            shell=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=CURL_TIMEOUT_SECONDS,
-        )
+        expected_id = _request_id_from_argv(argv)
+        argv = _with_http_status_write_out(argv)
 
-        # Find the line that is a valid JSON for extracting only the json response.
-        # keepends=True preserves the trailing newline the previous readlines() form
-        # returned, so callers see byte-identical strings.
-        for line in (completed.stdout or "").splitlines(keepends=True):
-            try:
-                json.loads(line)
-            except json.JSONDecodeError:
-                # Not JSON - keep looking at the remaining lines.
-                continue
-            output_response = line
-            break
+        # Bounded in time AND in bytes by _run_curl, which reads incrementally and kills the
+        # child at the response ceiling rather than accumulating whatever the endpoint chooses
+        # to send.  It also reaps the child and closes every pipe on every path.
+        ok, returncode, stdout, stderr = _run_curl(argv, CURL_TIMEOUT_SECONDS)
 
-        # Report the documented sentinel when nothing usable came back, including the case
-        # where curl itself failed and said why on stderr.
-        if len(output_response) < 5:
-            output_response = NO_RESPONSE_SENTINEL
-            stderr = (completed.stderr or "").strip()
-            if completed.returncode != 0 and stderr:
+        if not ok:
+            detail = stderr.strip() or stdout.strip()
+            print(
+                "Inside Utils.py : send_curl_command got no usable response - curl exited "
+                f"{returncode}" + (f": {detail}" if detail else "")
+            )
+            return NO_RESPONSE_SENTINEL
+
+        body, status = _split_http_status(stdout)
+        if status is None:
+            print(
+                "Inside Utils.py : send_curl_command got no HTTP status back, so no "
+                "request/response exchange completed"
+            )
+            return NO_RESPONSE_SENTINEL
+        if not 200 <= status < 300:
+            snippet = body.strip()
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            print(
+                f"Inside Utils.py : the endpoint answered HTTP {status}, which is not a success "
+                f"status" + (f"; body: {snippet!r}" if snippet else "")
+            )
+            return NO_RESPONSE_SENTINEL
+
+        # EXACTLY ONE envelope.  Collecting every match rather than breaking at the first one is
+        # the point: a body carrying two envelopes is not a response this suite can attribute,
+        # and quietly taking the first would hide that.
+        envelope_lines = []
+        for line in body.splitlines(keepends=True):
+            if _parse_jsonrpc_envelope(line) is not None:
+                envelope_lines.append(line)
+
+        if not envelope_lines:
+            snippet = body.strip()
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            print(
+                "Inside Utils.py : the response carried no JSON-RPC 2.0 envelope"
+                + (f"; body: {snippet!r}" if snippet else "")
+            )
+            return NO_RESPONSE_SENTINEL
+        if len(envelope_lines) > 1:
+            print(
+                f"Inside Utils.py : the response carried {len(envelope_lines)} JSON-RPC "
+                "envelopes; exactly one is expected, so none of them is attributable to this "
+                "request"
+            )
+            return NO_RESPONSE_SENTINEL
+
+        response_line = envelope_lines[0]
+        envelope = _parse_jsonrpc_envelope(response_line)
+        if expected_id is not None:
+            if "id" not in envelope or str(envelope.get("id")) != str(expected_id):
                 print(
-                    "Inside Utils.py : curl exited "
-                    f"{completed.returncode}: {stderr}"
+                    f"Inside Utils.py : the response carried id {envelope.get('id')!r} but the "
+                    f"request sent id {expected_id!r}; it does not answer this request"
                 )
-    except subprocess.TimeoutExpired:
-        output_response = NO_RESPONSE_SENTINEL
-        print(
-            "Inside Utils.py : send_curl_command timed out after "
-            f"{CURL_TIMEOUT_SECONDS}s"
-        )
-    except Exception as exc:
-        # The sentinel is assigned HERE rather than returned from a finally block. Returning
-        # from finally discards whatever the except branch decided and would hand the caller
-        # an empty string on failure - indistinguishable from a successful empty reply.
-        # The docstring promises the sentinel on any failure - a caller testing
-        # response.startswith("< No response") must see a transport or tokenisation failure as
-        # exactly that, not as an empty string.
-        output_response = NO_RESPONSE_SENTINEL
-        print(f"Inside Utils.py : Exception in send_curl_command function: {exc}")
+                return NO_RESPONSE_SENTINEL
 
-    # Returned after the try/except rather than from a finally block: a `return` inside
-    # `finally` discards whatever the except branch assigned, which is what previously made
-    # the documented sentinel unreachable.
-    return output_response
+        return response_line
+    except ValueError as exc:
+        # An untokenisable command, or an endpoint this module refuses.  The sentinel is
+        # returned rather than an empty string, because a caller testing
+        # response.startswith("< No response") must see a failure as exactly that.
+        print(f"Inside Utils.py : Exception in send_curl_command function: {exc}")
+        return NO_RESPONSE_SENTINEL
+    except OSError as exc:
+        print(f"Inside Utils.py : send_curl_command could not run curl: {exc}")
+        return NO_RESPONSE_SENTINEL
 
 
 def _approved_configuration_roots():
@@ -754,6 +1414,13 @@ def _approved_payload_path(yaml_file_path):
     may be a symbolic link. Together they close arbitrary-file disclosure (a path such as
     /etc/shadow, or a link pointing at one) and the "link planted inside the suite tree"
     variant, whichever component the link occupies.
+
+    These are NAME checks, and a name check is only true at the moment it runs.  What makes the
+    decision hold at the moment of the read is _read_payload, which opens the returned path once
+    with O_NOFOLLOW and re-validates the resulting DESCRIPTOR with fstat: a file replaced by a
+    symbolic link after this function returns is refused there rather than followed.  Neither
+    half is sufficient alone - this one bounds WHERE a payload may come from, that one bounds
+    WHAT is actually read.
     '''
     roots = _approved_configuration_roots()
     if not roots:
@@ -809,14 +1476,71 @@ def _approved_payload_path(yaml_file_path):
 
 
 def _read_payload(path):
-    '''Read an approved YAML payload, refusing anything larger than the documented cap.'''
-    with open(path, "rb") as handle:
-        payload = handle.read(_VCOMPONENT_MAX_PAYLOAD_BYTES + 1)
-    if len(payload) > _VCOMPONENT_MAX_PAYLOAD_BYTES:
+    '''Read an approved YAML payload through ONE descriptor, validated after it is opened.
+
+    THE RACE THIS CLOSES.  _approved_payload_path decides that a path is acceptable by
+    inspecting the NAME - is it a symlink, does it resolve inside an approved root, is it a
+    regular file.  Opening the same name afterwards is a SECOND resolution of it, and between
+    the two anything that can write the containing directory can replace the file with a
+    symbolic link to somewhere else.  The checks would all have passed on the file that was
+    there; the bytes posted to the vComponent endpoint would come from the file that is there
+    now - any file the test identity can read, /etc/shadow included on a suite running as root.
+
+    So the file is opened ONCE with O_NOFOLLOW, and every remaining decision is made on that
+    DESCRIPTOR rather than on the path:
+
+      * O_NOFOLLOW makes the open itself fail with ELOOP if the final component is a symbolic
+        link, so a link swapped in after the name checks is refused rather than followed.
+      * O_CLOEXEC keeps the descriptor out of the curl this module is about to spawn; the
+        payload is delivered on curl's stdin, so curl has no business holding the file too.
+      * fstat on the open descriptor - not stat on the path - confirms it is a regular file and
+        is within the cap.  A descriptor cannot be substituted once it is open, so what is
+        measured here and what is read below are the same object by construction.
+      * the read is bounded, and re-checked as it goes, because st_size is a snapshot that a
+        concurrent writer can grow underneath the loop.
+
+    Raises ValueError with the reason on any refusal, which send_vcomponent_command turns into
+    a (0, diagnostic) result rather than a post.
+    '''
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        # ELOOP here is the interesting one: it means a symbolic link now stands at a path this
+        # module had already accepted as a regular file.
         raise ValueError(
-            f"refused to post {path}: larger than the {_VCOMPONENT_MAX_PAYLOAD_BYTES} byte cap"
-        )
-    return payload
+            f"refused to post {path}: could not open it safely ({exc.strerror}); ELOOP means a "
+            "symbolic link now stands at that path"
+        ) from exc
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(
+                f"refused to post {path}: the open descriptor is not a regular file"
+            )
+        if info.st_size > _VCOMPONENT_MAX_PAYLOAD_BYTES:
+            raise ValueError(
+                f"refused to post {path}: {info.st_size} bytes, larger than the "
+                f"{_VCOMPONENT_MAX_PAYLOAD_BYTES} byte cap"
+            )
+
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _VCOMPONENT_MAX_PAYLOAD_BYTES:
+                raise ValueError(
+                    f"refused to post {path}: it grew past the "
+                    f"{_VCOMPONENT_MAX_PAYLOAD_BYTES} byte cap while being read"
+                )
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+    return b"".join(chunks)
 
 
 def send_vcomponent_command(yaml_file_path, timeout=10):
@@ -918,3 +1642,57 @@ def send_vcomponent_command(yaml_file_path, timeout=10):
         # A rejected endpoint is a configuration defect, reported rather than dispatched.
         print(f"Inside Utils.py : Exception in send_vcomponent_command: {exc}")
         return 0, str(exc)
+
+
+def await_plugin_ready(callsign, timeout=30.0, recheck_interval=0.5):
+    '''Block until the controller reports the plugin activated, or the deadline expires.
+
+    Activation is asynchronous with respect to Controller.1.activate: the call returns once the
+    request is accepted, while Initialize() and the plugin's own worker threads come up afterwards.
+    The state that matters is therefore an observable one - Controller.1.status@<callsign> reports
+    it - so this waits for that state instead of guessing how long it takes.
+
+    The status is read BEFORE any wait, so a plugin that is already up costs nothing, and expiry is
+    returned rather than swallowed: recheck_interval is the interval between two readings of an
+    observable state, and timeout is a failure deadline.
+
+    Args:
+        callsign: Plugin callsign, e.g. "org.rdk.HdmiCecSink"
+        timeout: Failure deadline in seconds. Returning False means the plugin never reported
+            itself activated within it, which is a condition the caller must handle.
+        recheck_interval: Seconds between two readings of Controller.1.status.
+    Returns:
+        True once the controller reports the plugin activated; False on expiry, or when the
+        controller could not be reached or answered without a usable state.
+    '''
+    deadline = time.time() + max(0.0, float(timeout))
+    interval = max(0.05, float(recheck_interval))
+    while True:
+        response = send_jsonrpc_command(f"Controller.1.status@{callsign}")
+        if response and "error" not in response:
+            if _reports_activated(response.get("result")):
+                return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _reports_activated(result):
+    '''True when a Controller.1.status result says the plugin is activated.
+
+    Thunder answers with a list of service descriptors, but a single object is accepted too so a
+    framework revision that returns one is not misread as "not ready". Any other shape, and any
+    state other than "activated", reads as not ready rather than as an error - the caller's
+    deadline is what turns a persistent not-ready into a failure.
+    '''
+    if isinstance(result, dict):
+        entries = [result]
+    elif isinstance(result, list):
+        entries = [entry for entry in result if isinstance(entry, dict)]
+    else:
+        return False
+    for entry in entries:
+        state = entry.get("state")
+        if isinstance(state, str) and state.strip().lower() == "activated":
+            return True
+    return False

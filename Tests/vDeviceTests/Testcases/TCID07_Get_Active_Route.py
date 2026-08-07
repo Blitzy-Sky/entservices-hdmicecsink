@@ -9,12 +9,15 @@
  *          with their mutual consistency. This is the device-level leg of the sink's route
  *          resolution path: HdmiCecSinkImplementation::getActiveRoute
  *          (HdmiCecSinkImplementation.cpp:1958) and the nested port-map walk it delegates to,
- *          HdmiPortMap::getRoute (HdmiCecSinkImplementation.h:351), are both catalogued as
- *          zero-hit, and GetActiveRoute is catalogued as covered by the sink's own L2 suite
- *          with no end-to-end leg - the sink has no device-level suite at all
- *          (COVERAGE_GAPS.md, "Missing sink device-level (E2E) suite", P1). This module
- *          supplies that leg, and claims no coverage change: the suite is authored here and
- *          not executed, so such a claim would be unmeasured.
+ *          HdmiPortMap::getRoute (HdmiCecSinkImplementation.h:351), were both catalogued as
+ *          zero-hit, and GetActiveRoute as covered by the sink's own L2 suite with no
+ *          end-to-end leg, because before this change the sink had no device-level suite at
+ *          all (COVERAGE_GAPS.md, "Missing sink device-level (E2E) suite", P1). Every one of
+ *          those statements is the gap register's PRE-CHANGE BASELINE, not a description of
+ *          the tree this file sits in: the suite that closes the "no device-level suite" gap
+ *          is the one this module belongs to. It supplies the missing leg, and claims no
+ *          coverage change: the suite is authored here and not executed, so such a claim
+ *          would be unmeasured.
  *
  *          The route text is read from the key "ActiveRoute", with a capital A - the one
  *          field of the sink's JSON-RPC surface that is not lowerCamelCase
@@ -64,9 +67,6 @@ from utils import (
     log_with_timing
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
-
-# log_with_timing is imported and not called: the six-symbol set above is the import contract
-# every TCID module here shares, and the timing decision is taken inline in run_test() below.
 
 
 def run_test():

@@ -81,16 +81,6 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# log_with_timing belongs to the import contract every case module in this suite publishes, and it
-# is retained here unused on purpose rather than by oversight - it is the ONE pyflakes finding
-# this file carries ("imported but unused"), and it is accepted knowingly. The timing decoration
-# below is written INLINE so that every TCID*.py module reads identically at the point where it
-# reports its result, which is what makes a diff between two cases show only the behaviour under
-# test. Routing the message through log_with_timing instead would collapse the finding but would
-# also make this the only case in the directory whose reporting block differs, and dropping the
-# symbol would make it the only case whose import block differs. Either costs more in
-# reviewability than the unused name costs in lint noise, so the shared shape wins.
-
 
 def run_test():
     start_time = time.perf_counter()

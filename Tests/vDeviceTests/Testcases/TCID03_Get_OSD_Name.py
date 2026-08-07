@@ -63,13 +63,6 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# log_with_timing is imported and not called here, deliberately: it belongs to the fixed
-# six-symbol helper set every testcase module in this suite imports, so the import block reads
-# identically across all 33 cases. The pass path below applies the same HDMICEC_TIMING_ENABLED
-# gate inline, which is the form the testcase modules use, while log_with_timing returns its
-# decorated text for a caller that wants to pick the log level itself. The set is pinned - do
-# not delete the import and do not silence it with a lint pragma.
-
 
 def run_test():
     '''Read the sink's own OSD name over JSON-RPC and validate the shape of the answer.

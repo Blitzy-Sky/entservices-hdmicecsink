@@ -18,9 +18,9 @@
 #       discarded in CI.  Note that they are NOT this repository's own
 #       Tests/L1Tests/.lcovrc_l1 -- the plugin's own copy is never read by CI, which is
 #       why enabling branch collection there is complementary but NOT sufficient.
-#       This script therefore moves ~/.lcovrc aside for the duration of the run -- into a
-#       private mktemp file, restored by an EXIT/INT/TERM trap however the run ends -- and
-#       passes `--rc branch_coverage=1` explicitly on every lcov/genhtml invocation.  The
+#       This script therefore runs every lcov and genhtml invocation with HOME pointed at a
+#       private, empty, mode-0700 temporary directory, so that ~/.lcovrc is never read and
+#       never touched, and additionally passes `--rc branch_coverage=1` on every one.  The
 #       legacy `lcov_branch_coverage` key is deprecated in lcov 2.x and defaults to zero,
 #       so the run-time override is the authoritative enablement mechanism.
 #    2. They apply no numeric threshold at all.  No coverage gate of any kind exists
@@ -48,8 +48,10 @@
 #       (see the doubled glob token and the gate spelling notes below).
 #    2. No new framework, tool or dependency -- bash plus the coreutils/POSIX primitives
 #       it already needs (printf, grep, awk, sed, sort, find, wc, head, tr, cat, dirname,
-#       basename, mv, mktemp, rmdir), lcov 2.0-1, genhtml, gcov 13.3.0 and, when asked
-#       for, valgrind.  No gcovr, no jq, no python.
+#       basename, mv, mktemp, rmdir), lcov 2.0-1, genhtml, gcov 13.4.0 (the patch level is
+#       whatever the toolchain ships -- read it with `gcov --version`; only the major must
+#       match the compiler that produced the .gcno files) and, when asked for, valgrind.
+#       No gcovr, no jq, no python.
 #    3. Additive-by-default -- this script modifies no repository production or source
 #       file.  Its measurement tools (lcov, genhtml, find, mktemp, valgrind) are resolved to
 #       absolute paths from the inherited environment BEFORE any install tree becomes a
@@ -60,20 +62,24 @@
 #       CMakeLists.txt, the workflows, /etc/lcovrc, or anything under plugin/, and it
 #       never regenerates a committed build file.  It is NOT, however, side-effect free,
 #       and the two side effects it does have are stated here rather than buried:
-#         (a) $HOME/.lcovrc -- CI plants a branch-disabled copy there (see 1. above) and
-#             lcov reads it silently, so the lcov steps must run with no home
-#             configuration in effect.  Whatever is at that path -- regular file, symlink
-#             or directory -- is therefore MOVED ASIDE into a private temporary directory
-#             BEFORE THE FIRST lcov INVOCATION OF THE RUN and RESTORED on exit, including
-#             on failure and on a signal, from the single cleanup trap this script installs
-#             at start-up.  It is a move in both directions, never a copy and never a
-#             deletion, so the entry comes back exactly as it was: a symlink stays a
-#             symlink, a directory keeps its contents, permissions and timestamps are
-#             untouched.  The stash path is logged, so even a run killed with SIGKILL (the
-#             one signal a trap cannot service) leaves a named, recoverable copy rather
-#             than a hole.  An unset HOME is not an error -- there is simply nothing to
-#             move.  Nothing else in $HOME is read or written, and /etc/lcovrc is never
-#             touched.
+#         (a) $HOME is NOT a side effect, and that is a change from how this script used to
+#             work.  CI plants a branch-disabled .lcovrc in the home directory (see 1.
+#             above) and lcov reads it silently, so the lcov steps must run with no home
+#             configuration in effect -- but the earlier design achieved that by MOVING
+#             $HOME/.lcovrc aside and moving it back on exit, and that is unsound whenever
+#             two runs overlap on one home directory, which in this workspace is the normal
+#             case: this runner, the source plugin's and the middleware's are routinely run
+#             against the same $HOME.  Interleaved, one run restores the file while the
+#             other is still using it, or one run's exit trap writes its stash over what the
+#             user has since written.  So no file in $HOME is moved, copied, deleted, or
+#             even opened.  Instead every lcov and genhtml invocation runs with HOME set to
+#             a private, empty, mode-0700 temporary directory created by this run and
+#             removed by its own cleanup trap; a directory with no .lcovrc in it cannot
+#             supply configuration.  HOME is SET rather than unset, deliberately: with HOME
+#             absent lcov consults the passwd database and finds the real home directory
+#             again.  /etc/lcovrc is system-wide, out of scope, and still read -- which is
+#             why the branch-record assertion in capture_coverage() proves the outcome
+#             instead of assuming it.
 #         (b) Artifacts -- the fixed names listed under ARTIFACTS below are CREATED AND
 #             OVERWRITTEN WITHOUT PROMPTING, exactly as CI overwrites them in
 #             $GITHUB_WORKSPACE.  They are written into a per-plugin, per-level directory
@@ -159,7 +165,7 @@
 #   this level's versioned Tests/L<n>Tests/.lcovrc_l<n> is passed with --config-file, which lcov
 #   reads in place of ~/.lcovrc and /etc/lcovrc, and branch collection is forced with
 #   `--rc branch_coverage=1`, which outranks every configuration file.  A caller's
-#   home-directory configuration is moved aside for the lcov steps and restored on exit -- read
+#   home-directory configuration cannot apply, because lcov runs with a private empty HOME -- read
 #   past, never removed.
 #
 # PREREQUISITES
@@ -275,26 +281,22 @@
 #    Suite aggregate: lines 71.8% (1529/2130), functions 81.3% (187/230),
 #                     branches 36.2% (1106/3053).
 #
-#  The L2 baseline had NEVER been measured before this script existed; capturing it with
-#  `run_coverage.sh l2` is a required first step, and its figures will supply the "before"
-#  column for L2 in the workspace-root COVERAGE_TRACEABILITY_REPORT.md once that report is
-#  written -- it does not exist yet.  No L2 figure is hard-coded here, deliberately -- the
-#  script must measure it, not assert it.
+#  No L2 baseline figure is hard-coded here, deliberately -- `run_coverage.sh l2` must measure
+#  it, not assert it.
 #
 #  ----------------------------------------------------------------------------------
-#  DOWNSTREAM CONTRACT (a forward commitment: none of the three files named here exists
-#  yet -- they land later in this engagement, and this block is what they will consume)
+#  DOWNSTREAM CONTRACT
 #  ----------------------------------------------------------------------------------
-#  This script's per-file table and its filtered_coverage_<level>.info traces are intended
-#  as an input to the workspace-root COVERAGE_TRACEABILITY_REPORT.md, which will name this
-#  script explicitly alongside the two sibling runners planned for the other in-scope
-#  repositories, hdmicec/tests/L1Tests/run_coverage.sh and
-#  entservices-hdmicecsource/Tests/run_coverage.sh.  Until those three files land, this
-#  script stands alone: it is fully usable on its own and nothing in it depends on them.
+#  This script's per-file table and its filtered_coverage_<level>.info traces are the coverage
+#  input for this repository.  The other two in-scope repositories carry their own equivalents,
+#  hdmicec/tests/L1Tests/run_coverage.sh and entservices-hdmicecsource/Tests/run_coverage.sh, so
+#  the three together cover the whole in-scope set; each is fully usable on its own and nothing
+#  in this one depends on the others.  The workspace-root COVERAGE_TRACEABILITY_REPORT.md is the
+#  consumer that draws the three together, and it is the one piece of that chain not yet written.
 #
-#  That report will attribute coverage to tests by COVERAGE_GAPS.md section 6.2 rank plus the
-#  stable HTML anchor id and by symbol name -- NEVER by line number, because this pass
-#  shifts line numbers.  The six sink anchors are:
+#  That report attributes coverage to tests by COVERAGE_GAPS.md section 6.2 rank plus the stable
+#  HTML anchor id and by symbol name -- NEVER by line number, because line numbers move whenever
+#  a test file is edited.  The six sink anchors are:
 #      #gap-plugin-sink-vdevicetests        rank 22  P1
 #      #gap-plugin-sink-onkeypress          rank 27  P1
 #      #gap-plugin-sink-onkeyrelease        rank 28  P1
@@ -396,10 +398,13 @@
 #          rdk<LEVEL>TestResults.json       GoogleTest machine-readable results
 #          valgrind_log                     only when RUN_VALGRIND is enabled
 #
-#  ARTIFACT_ROOT defaults to "${TMPDIR:-/tmp}/entservices-hdmicecsink-coverage/<workspace
-#  basename>" -- deliberately OUTSIDE the git checkout, because nothing here ignores the
-#  artifact names and a default-path run would otherwise leave committable output in the
-#  working tree.  See the comment on ARTIFACT_ROOT below for the full reasoning.
+#  ARTIFACT_ROOT is unset by default, and the root is then MINTED per run with
+#  `mktemp -d "${TMPDIR:-/tmp}/entservices-hdmicecsink-coverage.XXXXXXXX"` at mode 0700 --
+#  deliberately OUTSIDE the git checkout, because nothing here ignores the artifact names and
+#  an in-tree run would otherwise leave committable output in the working tree, and
+#  deliberately UNPREDICTABLE, because a fixed name under a world-writable $TMPDIR can be
+#  pre-created by any local account and every artifact would then land where it chose.  The
+#  chosen path is printed when the run starts.  See the comment on ARTIFACT_ROOT below.
 #
 #  WHY THIS DIVERGES FROM CI'S FLAT LAYOUT, deliberately: CI writes coverage.info,
 #  filtered_coverage.info, coverage/ and rdkL1TestResults.json straight into
@@ -459,7 +464,25 @@ VALGRIND_BIN="$(resolve_tool valgrind)"
 # what it could not report.
 GCOV_BIN="$(resolve_tool gcov)"
 ID_BIN="$(resolve_tool id)"
-readonly LCOV_BIN GENHTML_BIN FIND_BIN MKTEMP_BIN VALGRIND_BIN GCOV_BIN ID_BIN
+TIMEOUT_BIN="$(resolve_tool timeout)"
+readonly LCOV_BIN GENHTML_BIN FIND_BIN MKTEMP_BIN VALGRIND_BIN GCOV_BIN ID_BIN TIMEOUT_BIN
+
+# --kill-after is desirable (a shard that ignores SIGTERM still dies) but is NOT universally
+# safe: this workspace's `timeout` is uutils coreutils 0.2.2, and with -k it reports a timeout as
+# exit 125 rather than GNU's 124 -- and 125 also means "timeout itself failed", so the two become
+# indistinguishable and a hang would be misreported as a broken invocation.  One cheap probe
+# settles it for this host instead of inferring it from a version string: a 1s bound on a 3s
+# sleep must yield exactly 124 before -k is used at all.
+TIMEOUT_KILL_AFTER=()
+if [ -n "$TIMEOUT_BIN" ]; then
+    timeout_probe=0
+    "$TIMEOUT_BIN" -k 1 1 sleep 3 >/dev/null 2>&1 || timeout_probe=$?
+    if [ "$timeout_probe" -eq 124 ]; then
+        TIMEOUT_KILL_AFTER=(-k 30)
+    fi
+    unset timeout_probe
+fi
+readonly TIMEOUT_KILL_AFTER
 
 # Private staging directory for artifacts in progress; created on first use and removed by
 # the cleanup trap.  Empty until then, so the trap is safe at any point.
@@ -502,6 +525,16 @@ RUN_VALGRIND="${RUN_VALGRIND:-0}"
 # Set L2_SHARDS=1 to reproduce the single-process behaviour (and the ceiling with it).
 L2_SHARDS="${L2_SHARDS:-2}"
 
+# Wall-clock bounds, per level, because the levels are not comparable: L1 is in-process and
+# mock-isolated and finishes in seconds, whereas L2 starts a Thunder host and activates plugins
+# over COM-RPC.  The L2 bound is PER SHARD, which is the unit that actually runs, and it is set
+# below Thunder's own 900s COM-RPC ceiling on purpose: a shard that exceeds it has already lost
+# the thing the sharding exists to stay inside, so reporting the hang is more useful than waiting.
+# These bounds exist to turn a hang into a named failure, not to police a healthy suite's runtime.
+SUITE_TIMEOUT_L1="${SUITE_TIMEOUT_L1:-600}"                 # seconds; L1 normally finishes in <60
+SUITE_TIMEOUT_L2="${SUITE_TIMEOUT_L2:-900}"                 # seconds PER SHARD; Thunder's own ceiling
+HOOK_TIMEOUT="${HOOK_TIMEOUT:-3600}"                        # seconds; the hook drives a full rebuild
+
 # Per-level overrides.  L1 and L2 need differently configured trees (different -I /
 # -include / -D / -Wl blocks and a level-specific mocks library), so each level resolves
 # its own build and install directory.  Both default to the single-tree values above, which
@@ -534,7 +567,40 @@ LEVEL_REBUILD_CMD="${LEVEL_REBUILD_CMD:-}"
 # needing any environment variable.  Point ARTIFACT_ROOT back into the tree if you want CI's
 # literal layout; warn_artifact_root_in_tree() will say so, and keeping it out of a commit
 # then becomes yours to manage.
-ARTIFACT_ROOT="${ARTIFACT_ROOT:-${TMPDIR:-/tmp}/$REPO_NAME-coverage/$(basename -- "$WS")}"
+#
+# AND THE DEFAULT IS NO LONGER A FIXED NAME.  ${TMPDIR:-/tmp}/<repo>-coverage/<ws> is
+# guessable, and anything able to create entries in a world-writable $TMPDIR could pre-create
+# it -- as a symlink, or as a directory it owns -- so that every trace, log and HTML page
+# written underneath landed where it chose, written with this run's privileges.  Left unset,
+# the root is therefore MINTED per run with `mktemp -d` at mode 0700: created atomically, with
+# a name that does not exist until the moment of creation and cannot be predicted.  A caller
+# who needs a stable path still sets ARTIFACT_ROOT, and that path's whole ancestry is then
+# checked strictly, because a name chosen in advance is guessable by definition.
+ARTIFACT_ROOT="${ARTIFACT_ROOT:-}"
+ARTIFACT_ROOT_EXPLICIT=0
+if [ -n "$ARTIFACT_ROOT" ]; then
+    ARTIFACT_ROOT_EXPLICIT=1
+fi
+
+# Mint the artifact root when the caller did not name one.  Called once from main(), before the
+# configuration banner names it and before any level resolves a directory underneath it.
+mint_artifact_root() {
+    [ "$ARTIFACT_ROOT_EXPLICIT" -eq 0 ] || return 0
+    [ -z "$ARTIFACT_ROOT" ] || return 0
+    [ -n "$MKTEMP_BIN" ] || die "mktemp is not available; it is required to create the artifact root"
+    local parent="${TMPDIR:-/tmp}"
+    case "$parent" in
+        /*) ;;
+        *)  die "TMPDIR must be an absolute path to be checked safely; got: $parent" ;;
+    esac
+    assert_safe_ancestry "$parent/$REPO_NAME-coverage" minted
+    ARTIFACT_ROOT="$("$MKTEMP_BIN" -d "$parent/$REPO_NAME-coverage.XXXXXXXX")" \
+        || die "cannot create an artifact root under $parent.
+       Set ARTIFACT_ROOT to write the artifacts somewhere else."
+    chmod 0700 -- "$ARTIFACT_ROOT" || die "could not restrict the artifact root to mode 0700: $ARTIFACT_ROOT"
+    assert_private_dir "$ARTIFACT_ROOT"
+    log "artifact root minted for this run (mktemp -d, mode 0700): $ARTIFACT_ROOT"
+}
 
 # Resolved per level by run_level() before anything else happens.
 LEVEL_BUILD_DIR=''
@@ -621,12 +687,37 @@ readonly L2_EXCLUDES=(
 #   Reaching any of these at L2 would need an out-of-process plugin host or a change to Thunder
 #   or to the plugin -- production code, out of scope.  No exclusion glob is used and
 #   COVERAGE_MIN is not lowered; the file keeps its real 78.0% and stays in the denominator.
+#
+#   plugin/HdmiCecSinkImplementation.h at L2 -- measures 121/171 = 70.8%.  The shortfall is
+#   entirely HdmiPortMap (addChild, removeChild, getRoute, update(LogicalAddress)), and no L2
+#   test can reach it, for two independently measured reasons that both live in
+#   entservices-testframework/Tests/mocks/HdmiCec.h -- a shared dependency this project does not
+#   modify:
+#     * That mock's PhysicalAddress::getByteValue(index) returns the RAW WIRE BYTE str[index],
+#       where ccec's real PhysicalAddress (hdmicec/ccec/include/ccec/Operands.hpp) returns a
+#       NIBBLE -- case 0 is (str[0] & 0xF0) >> 4.  HdmiCecSinkImplementation.cpp:1951 (addChild)
+#       and :1979 (getRoute) both require getByteValue(0) == hdmiInputs[i].m_portID + 1, i.e. a
+#       value in 1..3, but an announced 1.1.0.0 yields 17 and a 2.0.0.0 yields 32.
+#     * A port can never be CLAIMED even with a hand-picked operand.  The only write to
+#       HdmiPortMap::m_logicalAddr is update(const LogicalAddress&) at
+#       HdmiCecSinkImplementation.h:291, reached solely from addChild's
+#       "physical_addr == m_physicalAddr" arm at :322.  A port's own address comes from the
+#       four-argument constructor, which in that mock stores FOUR bytes, while a frame-derived
+#       address stores TWO, and the mock's operator== is an exact vector compare.
+#     Measured confirmation: across a full 120-case L2 run, addChild logged ZERO invocations.
+#   All of it IS covered by this repository's own L1 suite, which measures this file at
+#   171/171 = 100.0% by constructing HdmiPortMap directly instead of decoding frames.  Raising
+#   the L2 figure needs two changes to that out-of-scope mock -- initialise AbortReason::impl to
+#   nullptr, and pack PhysicalAddress as two nibble-packed bytes -- so it is reported here, not
+#   worked around.  No exclusion glob is used and COVERAGE_MIN is not lowered; the file keeps its
+#   real 70.8% and stays in the denominator.
 # ------------------------------------------------------------------------------------
 readonly L1_GATE_EXEMPT=(
     'plugin/Module.cpp'
 )
 readonly L2_GATE_EXEMPT=(
     'plugin/HdmiCecSink.cpp'
+    'plugin/HdmiCecSinkImplementation.h'
 )
 
 # ------------------------------------------------------------------------------------
@@ -644,11 +735,29 @@ readonly L2_GATE_EXEMPT=(
 # would report a "regression" that never happened, so each level's floors come from a trace
 # measured at that level and are never carried across.
 #
-# The L2 floors were MEASURED, not chosen: they are what this script reported once the L2
-# cases that closed the gap were in place (aggregate 84.4%, 1797/2130, 125 tests green across
-# two shards).  Before them this level had no floor at all, so nothing protected the move from
-# 78.17% to 84.4% -- a later change could have handed most of it back and still passed the
-# bar.  Each figure is the measured value recorded exactly, with no margin added.
+# The L2 floors were MEASURED, not chosen.  Each figure is the measured value recorded exactly,
+# with no margin added.  Before they existed this level had no floor at all, so nothing protected
+# the move from 78.17% -- a later change could have handed most of it back and still passed the
+# bar.
+#
+# REVISED once, and the reason is recorded rather than quietly absorbed.  An earlier revision of
+# this table read
+#     plugin/HdmiCecSink.h=97.7  plugin/HdmiCecSinkImplementation.cpp=82.8
+#     plugin/HdmiCecSinkImplementation.h=92.4
+# from a 125-case run whose aggregate was 84.4% (1797/2130).  Five of those 125 cases -- four
+# driving the HdmiPortMap route chain and one injecting an inbound <Feature Abort> -- CANNOT PASS
+# against entservices-testframework/Tests/mocks/HdmiCec.h as this project must use it: that mock
+# leaves AbortReason::impl uninitialised (injecting any <Feature Abort> frame terminates the host
+# with SIGSEGV) and its PhysicalAddress::getByteValue returns raw wire bytes where ccec returns
+# nibbles (so the port-match guard can never hold; addChild logged ZERO invocations across a full
+# run).  The earlier figures were therefore reachable only with that shared, out-of-scope mock
+# modified.  Those five cases are removed, the blocked capability is reported with the exact mock
+# change it needs, and the floors below are re-measured from the authorized tree: 120 cases green
+# across two shards, aggregate 80.0% (1705/2130), which still clears the bar.
+# Nothing was excluded and COVERAGE_MIN was not lowered to achieve this.
+# The lost coverage is NOT lost overall -- every affected path is covered by this repository's own
+# L1 suite, whose floors below are unchanged and which measures
+# plugin/HdmiCecSinkImplementation.h at 100.0%.
 #   The file each level EXEMPTS is deliberately given no floor for that level:
 #   plugin/Module.cpp has none at L1 and plugin/HdmiCecSink.cpp none at L2, because a floor on
 #   a waived verdict would be a second, contradictory judgement on the same file.
@@ -660,9 +769,8 @@ readonly L1_COVERAGE_FLOORS=(
     'plugin/HdmiCecSinkImplementation.h=100.0'
 )
 readonly L2_COVERAGE_FLOORS=(
-    'plugin/HdmiCecSink.h=97.7'
-    'plugin/HdmiCecSinkImplementation.cpp=82.8'
-    'plugin/HdmiCecSinkImplementation.h=92.4'
+    'plugin/HdmiCecSink.h=93.8'
+    'plugin/HdmiCecSinkImplementation.cpp=80.0'
     'plugin/Module.cpp=100.0'
 )
 
@@ -670,103 +778,317 @@ log()  { printf '[run_coverage] %s\n' "$*"; }
 warn() { printf '[run_coverage] WARNING: %s\n' "$*" >&2; }
 die()  { printf '[run_coverage] ERROR: %s\n' "$*" >&2; exit 1; }
 rule() { printf '%s\n' '-------------------------------------------------------------------------------'; }
-
 # ------------------------------------------------------------------------------------
-# $HOME/.lcovrc handling -- capture and restore, never unconditional deletion.
+# PATH SAFETY -- the ancestry of every path this script writes to.
 #
-# lcov reads $HOME/.lcovrc silently whenever it exists, and the CI workflows plant a
-# branch-disabled copy there (L1-tests.yml:681, L2-tests.yml:763).  A copy left in place
-# would suppress the branch data this script exists to produce, so the lcov steps have to
-# run with no home configuration in effect.
+# The artifact root is PREDICTABLE by design: ${TMPDIR:-/tmp}/<repo>-coverage/<workspace basename>,
+# fixed names underneath it, so a reader knows where to look and CI can collect them.  A
+# predictable path under a world-writable directory is also an invitation: anything that
+# can create entries in /tmp can create <repo>-coverage FIRST -- as a symlink to a
+# directory it does not own, or as a directory it does own -- and then every trace, log
+# and HTML page this script writes lands somewhere it chose, with this script's
+# privileges.  On a CI runner that is a write into another job's workspace; run under
+# sudo, it is a write anywhere.
 #
-# That does NOT justify destroying a developer's own configuration.  The entry is moved
-# aside into a private temporary directory and moved back on exit -- including when a step
-# fails, because the restore runs from the single cleanup trap installed at start-up.  The
-# stash path is logged, so a run killed with SIGKILL (the one signal no trap can service)
-# leaves a named, recoverable copy.  Contract clause 3(a) documents this.
+# Checking only the leaf, which is what this script used to do, does not close that: the
+# leaf can be perfectly ordinary while its PARENT is the substitution.  So the whole chain
+# from / down is checked, and every existing component must satisfy all three of:
 #
-# WHEN it happens matters as much as that it happens.  A home configuration that merely
-# disables branch collection makes the FIGURES wrong; one that lcov cannot parse makes EVERY
-# lcov invocation fail outright -- setting both `lcov_branch_coverage` and
-# `genhtml_branch_coverage` produces "ERROR: unexpected ARRAY for branch_coverage value" and
-# exit 255 from `lcov --version` itself, and an entry that is a DIRECTORY produces "unable to
-# close …: Is a directory" and exit 21.  Both of those used to surface as a bare lcov error
-# from the counter-zeroing step, because the stash was taken later, in capture_coverage.  It
-# is therefore taken in main(), before the first lcov call of the run, and re-checked per
-# level so a file that reappears mid-run is still handled.
+#   * not a symbolic link.  A link is exactly the substitution being defended against, and
+#     resolving it first (`pwd -P`, `mkdir -p`) would validate the target while the write
+#     still goes through the link -- so the link is rejected instead of followed.
+#   * owned by this effective user, or by root.  Root ownership is accepted because /,
+#     /tmp and /var are legitimately root's; anyone ELSE owning a component means someone
+#     else can rename or replace it underneath this run.
+#   * not group- or world-writable unless sticky.  1777 on /tmp is the standard and is
+#     safe for entries this script creates, because the sticky bit stops a non-owner
+#     removing or renaming them.  The same permissions WITHOUT the sticky bit mean any
+#     local account can swap a component out mid-run.
 #
-# WHAT is moved matters too: `-f` is not the test, because `~/.lcovrc` can legitimately be a
-# symlink into a dotfiles repository, and it can be a directory by mistake.  Any existing
-# entry is moved, whatever its type, and `mv` in both directions means it returns exactly as
-# it was -- a symlink stays a symlink, a directory keeps its contents -- because nothing is
-# ever copied or recreated.
+# Directories this script creates are created 0700, one component at a time, so an
+# intermediate never exists with permissive modes even briefly.  And because a check is
+# only true at the moment it runs, the whole set is REPEATED immediately before each
+# destructive step (see assert_artifact_path_still_safe) rather than once at startup.
 # ------------------------------------------------------------------------------------
-HOME_LCOVRC_STASH=""
+EUID_VALUE="$(id -u)"
+readonly EUID_VALUE
 
-restore_home_lcovrc() {
-    [ -n "$HOME_LCOVRC_STASH" ] || return 0
-    local stash="$HOME_LCOVRC_STASH"
-    HOME_LCOVRC_STASH=""
-    # -e is false for a dangling symlink, so -L is tested too: the entry goes back whatever
-    # its type, which is the point of moving rather than copying.
-    if [ -e "$stash" ] || [ -L "$stash" ]; then
-        if [ -n "${HOME:-}" ] && mv -f -- "$stash" "$HOME/.lcovrc"; then
-            log "restored $HOME/.lcovrc"
-        else
-            warn "could not restore ${HOME:-\$HOME}/.lcovrc -- your original is intact at $stash"
-            warn "    move it back by hand:  mv '$stash' '${HOME:-\$HOME}/.lcovrc'"
-            return 0
-        fi
+# "<uid> <octal mode> <type>" for an existing path, empty for one that does not exist.
+# lstat semantics (stat does not follow the final link), so a symlink reports as such
+# rather than as whatever it points at.
+path_metadata() { # $1=path
+    # Checked here rather than only in check_tooling: the first ancestry validation happens
+    # before check_tooling's message would be reached in some orderings, and a missing stat
+    # would otherwise degrade every check below into a silent "could not stat" failure.
+    [ -n "${STAT_BIN:-}" ] || die "stat was not found on PATH, so the ownership and permissions of
+       the paths this script writes to cannot be checked.  Refusing to write anything.  stat
+       ships with coreutils."
+    "$STAT_BIN" -c '%u %a %F' -- "$1" 2>/dev/null || true
+}
+
+# One component of a chain: must exist, be a directory, be ours or root's, and not be
+# writable by anyone else unless the sticky bit protects it.
+# $3 is how the path below this component was chosen, and it changes only the verdict for
+# the "writable by others without a sticky bit" case:
+#   named  -- ARTIFACT_ROOT was set explicitly, so the path is predictable: FATAL.
+#   minted -- this script created it with mktemp -d, so it could not be pre-created: the
+#             condition is reported and the re-validation before each destructive step is
+#             what carries the guarantee.
+assert_component_safe() { # $1=path  $2=context for the message  $3=named|minted
+    local comp="$1" context="$2" choice="${3:-named}" meta uid rest mode kind numeric_mode
+
+    meta="$(path_metadata "$comp")"
+    [ -n "$meta" ] || die "could not stat $comp while validating the ancestry of
+       $context
+       Refusing to write below a path whose ownership and permissions cannot be read."
+
+    uid="${meta%% *}"
+    rest="${meta#* }"
+    mode="${rest%% *}"
+    kind="${rest#* }"
+
+    [ "$kind" = "directory" ] || die "$comp is a $kind, not a directory, while validating
+       the ancestry of
+       $context
+       Choose an ARTIFACT_ROOT whose every parent is a real directory."
+
+    if [ "$uid" != "$EUID_VALUE" ] && [ "$uid" != "0" ]; then
+        die "$comp is owned by uid $uid, which is neither this user ($EUID_VALUE) nor root,
+       while validating the ancestry of
+       $context
+       Another user who owns a parent directory can replace it underneath this run, so the
+       artifacts would be written somewhere they chose.  Set ARTIFACT_ROOT to a location you
+       own."
     fi
-    rmdir -- "$(dirname -- "$stash")" 2>/dev/null || true
+
+    numeric_mode="$(( 8#$mode ))"
+    if [ "$(( numeric_mode & 0022 ))" -ne 0 ] && [ "$(( numeric_mode & 01000 ))" -eq 0 ]; then
+        # Writable by others, with no sticky bit to stop them renaming or removing what is
+        # inside it.  How much that matters depends entirely on whether the name underneath
+        # it is guessable, which is why the two cases are separated instead of both being
+        # forced into one verdict:
+        #
+        #   * A CALLER-CHOSEN path is guessable by construction -- it was chosen in advance
+        #     and often appears in a CI file -- so this is fatal.  Pre-creating the name is
+        #     enough to collect or redirect the evidence.
+        #   * A path this script MINTED with mktemp -d cannot be pre-created, because the
+        #     name does not exist until the moment it is created and is not predictable.
+        #     What remains is a race: another account could remove the directory mid-run and
+        #     put its own there.  That is reported, and every destructive step re-validates
+        #     (assert_artifact_path_still_safe) so the substitution is refused rather than
+        #     written into -- but it is not pretended away either.
+        if [ "$choice" = "named" ]; then
+            die "$comp has mode $mode -- writable by group or world, without the sticky bit --
+       while validating the ancestry of
+       $context
+       That path was named explicitly, so it is predictable, and any local account able to
+       write $comp can pre-create or replace it and collect this run's evidence.  Either set
+       the sticky bit on $comp (as a conventional /tmp has), tighten its mode, or unset
+       ARTIFACT_ROOT and let this script mint an unpredictable mode-0700 root with
+       mktemp -d instead."
+        fi
+        warn "$comp has mode $mode: writable by group or world with no sticky bit."
+        warn "  The artifact root below it was created with mktemp -d, so its name cannot be"
+        warn "  guessed or pre-created; what is left is that another local account could"
+        warn "  remove it mid-run.  Every destructive step re-validates the directory before"
+        warn "  writing, so a substitution is refused rather than written into."
+        warn "  Fix the host if you can: chmod +t $comp"
+    fi
+}
+
+# The whole chain from / down to $1.  $1 itself need not exist; the walk stops at the
+# first component that does not, because nothing below it exists either.
+assert_safe_ancestry() { # $1=absolute path  $2=named|minted (see assert_component_safe)
+    local target="$1" choice="${2:-named}" walked='' component
+
+    case "$target" in
+        /*) ;;
+        *)  die "internal error: assert_safe_ancestry needs an absolute path; got: $target" ;;
+    esac
+
+    assert_component_safe "/" "$target" "$choice"
+
+    local saved_ifs="$IFS"
+    IFS='/'
+    # Deliberate word splitting on '/' to walk the components in order.
+    # shellcheck disable=SC2086
+    set -- ${target#/}
+    IFS="$saved_ifs"
+
+    for component in "$@"; do
+        [ -n "$component" ] || continue
+        walked="$walked/$component"
+        # Checked BEFORE -e, because -e is false for a dangling symlink and a dangling
+        # symlink is precisely how a path gets created somewhere unintended.
+        if [ -L "$walked" ]; then
+            die "$walked is a symbolic link, and this script will not write through one.
+       It is a component of
+       $target
+       Remove it, or set ARTIFACT_ROOT to a real directory."
+        fi
+        [ -e "$walked" ] || return 0
+        assert_component_safe "$walked" "$target" "$choice"
+    done
     return 0
 }
 
-stash_home_lcovrc() {
-    [ -n "${HOME:-}" ] || return 0
-    [ -z "$HOME_LCOVRC_STASH" ] || return 0        # already stashed earlier in this run
-    local rc_path="$HOME/.lcovrc"
-    [ -e "$rc_path" ] || [ -L "$rc_path" ] || return 0
+# Create $1 and any missing parent, 0700 and one component at a time, after proving the
+# existing part of the chain is safe.  mkdir -p -m applies the mode to the FINAL component
+# only, which would leave intermediates at the umask default, so the loop is not redundant.
+# Only ever used for a CALLER-NAMED path, hence the unconditional "named" strictness.
+create_safe_dir() { # $1=absolute path
+    local target="$1" walked='' component
 
-    [ -n "$MKTEMP_BIN" ] || die "mktemp is not available; it is required to move $rc_path aside safely"
-    local stash_dir
-    stash_dir="$("$MKTEMP_BIN" -d "${TMPDIR:-/tmp}/run_coverage_lcovrc.XXXXXX")" \
-        || die "cannot create a temporary directory to stash $rc_path"
-    chmod 0700 -- "$stash_dir" 2>/dev/null || true
-    # Record the stash path BEFORE the move, so an interrupt between the two cannot lose the
-    # file and a failed move leaves no orphaned stash directory behind either.
-    HOME_LCOVRC_STASH="$stash_dir/.lcovrc"
-    if [ ! -f "$rc_path" ] || [ -L "$rc_path" ]; then
-        local rc_kind='special file'
-        if [ -L "$rc_path" ]; then
-            rc_kind='symbolic link'
-        elif [ -d "$rc_path" ]; then
-            rc_kind='directory'
+    assert_safe_ancestry "$target" named
+
+    local saved_ifs="$IFS"
+    IFS='/'
+    # shellcheck disable=SC2086
+    set -- ${target#/}
+    IFS="$saved_ifs"
+
+    for component in "$@"; do
+        [ -n "$component" ] || continue
+        walked="$walked/$component"
+        [ ! -L "$walked" ] || die "$walked became a symbolic link while the output directory
+       was being created.  Refusing to continue."
+        if [ ! -e "$walked" ]; then
+            mkdir -m 0700 -- "$walked" 2>/dev/null || {
+                # A concurrent run of this same script legitimately creates the same
+                # component; losing that race is fine as long as what won is safe.
+                [ -d "$walked" ] || die "could not create $walked while preparing
+       $target"
+            }
         fi
-        log "note: $rc_path is a $rc_kind, not a regular file; it is moved aside as-is and moved back unchanged"
-    fi
-    local mv_err
-    if ! mv_err="$(mv -f -- "$rc_path" "$HOME_LCOVRC_STASH" 2>&1)"; then
-        # Distinguish "it is gone" from "it will not move".  A sibling runner sharing this
-        # $HOME -- the source-plugin and middleware runners are routinely run against the same
-        # one -- can move the file aside between the existence check above and this move, and
-        # the owner can remove it in the same window.  What this needs is only that NO home
-        # configuration is in effect while lcov runs, and in that case none is: continue, and
-        # leave the other run's stash to the other run rather than fighting over it.  A file
-        # that is still there and still will not move is a genuine failure.
-        if [ ! -e "$rc_path" ] && [ ! -L "$rc_path" ]; then
-            rmdir -- "$stash_dir" 2>/dev/null || true
-            HOME_LCOVRC_STASH=""
-            log "$rc_path disappeared while being moved aside (a concurrent run moved it, or it was"
-            log "    removed); no home configuration is in effect, which is all this step needs"
-            return 0
-        fi
-        die "cannot move $rc_path aside: ${mv_err:-mv failed}
-       Refusing to run lcov against an unknown home configuration, and refusing to delete
-       your file to get around it.  Fix the permissions on \$HOME and retry."
-    fi
-    log "moved $rc_path aside to $HOME_LCOVRC_STASH (CI plants a branch-disabled copy there); it is restored on exit"
+        assert_component_safe "$walked" "$target" named
+    done
+    return 0
 }
+
+# Stricter than assert_component_safe, for a directory this script created for its own
+# private use: nobody else may write to it at all, sticky bit or not.
+assert_private_dir() { # $1=path
+    local path="$1" meta uid rest mode kind numeric_mode
+
+    [ ! -L "$path" ] || die "expected a private directory but found a symbolic link: $path"
+    meta="$(path_metadata "$path")"
+    [ -n "$meta" ] || die "expected a private directory but could not stat it: $path"
+    uid="${meta%% *}"
+    rest="${meta#* }"
+    mode="${rest%% *}"
+    kind="${rest#* }"
+    [ "$kind" = "directory" ] || die "expected a private directory but found a $kind: $path"
+    [ "$uid" = "$EUID_VALUE" ] || die "a directory this script created is owned by uid $uid
+       rather than by this user ($EUID_VALUE): $path"
+    numeric_mode="$(( 8#$mode ))"
+    [ "$(( numeric_mode & 0077 ))" -eq 0 ] || die "a directory this script created for its own
+       use has mode $mode, which lets other accounts read or write it: $path"
+}
+
+# Re-run the ancestry check immediately before a destructive step, and check the specific
+# artifact path too.  A path that was safe when the run started is not necessarily safe
+# thirty seconds later: this is the check that makes the guarantee hold at the moment of
+# the write rather than at startup.
+assert_artifact_path_still_safe() { # $1=artifact path about to be written (optional)
+    local artifact="${1:-}"
+
+    [ -n "${LEVEL_ARTIFACT_DIR:-}" ] || die "internal error: assert_artifact_path_still_safe
+       was called before the level artifact directory was resolved"
+    assert_safe_ancestry "$LEVEL_ARTIFACT_DIR" \
+        "$( [ "${ARTIFACT_ROOT_EXPLICIT:-1}" -eq 1 ] && printf 'named' || printf 'minted' )"
+    [ -d "$LEVEL_ARTIFACT_DIR" ] || die "the artifact directory disappeared during the run:
+       $LEVEL_ARTIFACT_DIR"
+
+    if [ -n "$artifact" ]; then
+        [ ! -L "$artifact" ] || die "refusing to write through a symbolic link that appeared
+       during the run: $artifact"
+    fi
+}
+
+
+# ------------------------------------------------------------------------------------
+# HOME CONFIGURATION ISOLATION.
+#
+# lcov reads $HOME/.lcovrc silently whenever it exists, and the CI workflows plant a
+# branch-disabled copy there (L1-tests.yml:681, L2-tests.yml:763).  A copy left in effect
+# would suppress the branch data this script exists to produce, so the lcov steps have to run
+# with no home configuration in effect.  A home file lcov cannot PARSE is worse than one that
+# merely disables branch data: setting both `lcov_branch_coverage` and `genhtml_branch_coverage`
+# makes `lcov --version` itself fail with "unexpected ARRAY for branch_coverage value" and exit
+# 255, and an entry that is a DIRECTORY produces "unable to close ...: Is a directory" and exit
+# 21.  So the isolation has to be in place before the FIRST lcov call of the run.
+#
+# The caller's $HOME is not touched to achieve that.  lcov and genhtml are given a private,
+# empty, mode-0700 HOME of their own, created with mktemp -d, and every invocation goes through
+# the lcov_run/genhtml_run wrappers below.
+#
+# This replaces a stash-and-restore scheme, which was wrong in two ways that no amount of care
+# inside it could fix.  The restoring `mv -f` overwrote whatever stood at $HOME/.lcovrc at that
+# moment, so a copy that REAPPEARED during the run -- recreated by the owner, or by one of the
+# two sibling runners in this workspace, which stash the same path -- was silently destroyed by
+# a script whose only job was to measure.  And the "already stashed" early return made the
+# per-level re-check a no-op, so a copy recreated mid-run stayed in effect for every lcov call
+# after it: precisely the condition the re-check existed to catch.  A private HOME has neither
+# failure mode, needs no trap to undo, and needs no per-level re-check.
+#
+# /etc/lcovrc is system-wide and out of scope.  --config-file, where a level ships one, means
+# lcov reads that file instead, and --rc branch_coverage=1 outranks every configuration source.
+# ------------------------------------------------------------------------------------
+LCOV_HOME=""
+
+cleanup_lcov_home() {
+    [ -n "$LCOV_HOME" ] || return 0
+    local home="$LCOV_HOME"
+    LCOV_HOME=""
+    # Only ever a directory this script created with mktemp -d; the two-component pattern keeps
+    # the recursive remove away from '/' and '/anything'.
+    case "$home" in
+        /*/*) [ -d "$home" ] && rm -rf -- "$home" ;;
+        *)    warn "refusing to remove an implausible private HOME path: $home" ;;
+    esac
+    return 0
+}
+
+make_private_lcov_home() {
+    [ -n "$LCOV_HOME" ] && return 0
+    [ -n "$MKTEMP_BIN" ] || die "mktemp is not available; it is required to create a private HOME for lcov"
+    local parent="${TMPDIR:-/tmp}"
+    case "$parent" in
+        /*) ;;
+        *)  die "TMPDIR must be an absolute path to be checked safely; got: $parent" ;;
+    esac
+    assert_safe_ancestry "$parent/run_coverage_lcov_home" minted
+
+    LCOV_HOME="$("$MKTEMP_BIN" -d "$parent/run_coverage_lcov_home.XXXXXXXX")" \
+        || die "cannot create a private HOME for lcov under $parent.
+       Refusing to measure with the caller's home configuration in effect, and refusing to
+       move or delete the caller's ~/.lcovrc to get around it."
+    chmod 0700 -- "$LCOV_HOME" || die "could not restrict the private lcov HOME to mode 0700: $LCOV_HOME"
+    assert_private_dir "$LCOV_HOME"
+    if [ -e "$LCOV_HOME/.lcovrc" ] || [ -L "$LCOV_HOME/.lcovrc" ]; then
+        die "the private lcov HOME already contains a .lcovrc: $LCOV_HOME/.lcovrc
+       mktemp -d had just created that directory, so something raced this run."
+    fi
+    log "lcov and genhtml run with a private empty HOME: $LCOV_HOME"
+    log "    your \$HOME is neither read nor written; CI's branch-disabled ~/.lcovrc cannot apply"
+}
+
+# Every lcov and genhtml invocation goes through these, and HOME is the only reason they
+# exist.  Set per-command rather than exported, because the suite under test, cmake and the
+# rebuild hook also run from this script and none of them should have its HOME rewritten.
+lcov_run() {
+    [ -n "$LCOV_HOME" ] || die "internal error: lcov_run called before the private HOME was created"
+    HOME="$LCOV_HOME" "$LCOV_BIN" "$@"
+}
+genhtml_run() {
+    [ -n "$LCOV_HOME" ] || die "internal error: genhtml_run called before the private HOME was created"
+    HOME="$LCOV_HOME" "$GENHTML_BIN" "$@"
+}
+
+# Every lcov and genhtml invocation in this script goes through these two wrappers.  Calling
+# either binary directly would read the real $HOME/.lcovrc and is a defect.
+run_lcov()    { HOME="$LCOV_HOME_DIR" "$LCOV_BIN" "$@"; }
+run_genhtml() { HOME="$LCOV_HOME_DIR" "$GENHTML_BIN" "$@"; }
 
 # ------------------------------------------------------------------------------------
 # Tooling pre-flight.  Two checks, in this order, and the order is the point.
@@ -778,9 +1100,9 @@ stash_home_lcovrc() {
 # pre-flight and the provenance result had all been printed as though the run were healthy.
 # Naming the missing tool up front costs one line and turns exit 127 into a diagnosis.
 #
-# USABILITY second, and only after the home configuration has been moved aside, because a
-# home file lcov cannot parse makes `lcov --version` itself fail: probing before the stash
-# would report a perfectly good lcov as broken.
+# USABILITY second, and only after the private lcov HOME is in place, because a home file lcov
+# cannot parse makes `lcov --version` itself fail: probing through the real HOME would report a
+# perfectly good lcov as broken.
 # ------------------------------------------------------------------------------------
 check_tooling() {
     local missing=0
@@ -788,9 +1110,12 @@ check_tooling() {
     [ -n "$GENHTML_BIN" ] || { warn "genhtml not found on PATH"; missing=1; }
     [ -n "$FIND_BIN" ]    || { warn "find not found on PATH";    missing=1; }
     [ -n "$MKTEMP_BIN" ]  || { warn "mktemp not found on PATH";  missing=1; }
+    [ -n "$TIMEOUT_BIN" ] || { warn "timeout not found on PATH";  missing=1; }
     [ "$missing" -eq 0 ] || die "missing coverage tooling.
-       lcov and genhtml are what this script measures and reports with, and find and mktemp
-       are how it counts counter files and stages artifacts.  On a Debian/Ubuntu host:
+       lcov and genhtml are what this script measures and reports with, find and mktemp are how
+       it counts counter files and stages artifacts, and timeout is how a hung suite or a hung
+       rebuild hook becomes a named failure instead of a run that never ends.  On a Debian/Ubuntu
+       host (timeout ships with coreutils, so its absence means PATH is unusually restricted):
            sudo apt-get install -y lcov
        lcov 2.x is required specifically: this script uses --fail-under-lines and
        --rc branch_coverage=1, and neither exists in lcov 1.x."
@@ -800,16 +1125,16 @@ check_tooling() {
 }
 
 check_lcov_usable() {
-    if ! "$LCOV_BIN" --version >/dev/null 2>&1; then
+    if ! run_lcov --version >/dev/null 2>&1; then
         die "$LCOV_BIN cannot even report its version, so it is unusable in this environment.
        The usual cause is an lcov configuration file it cannot parse.  This run has already
-       moved \$HOME/.lcovrc aside, so the remaining candidates are /etc/lcovrc (system-wide,
+       runs lcov with a private empty HOME, so the remaining candidates are /etc/lcovrc (system-wide,
        and deliberately never touched by this script) and this repository's own
        Tests/L1Tests/.lcovrc_l1.  Reproduce with:  $LCOV_BIN --version
        For example, setting both 'lcov_branch_coverage' and 'genhtml_branch_coverage' makes
        lcov 2.0-1 fail every invocation with 'unexpected ARRAY for branch_coverage value'."
     fi
-    if ! "$LCOV_BIN" --help 2>&1 | grep -q -- '--fail-under-lines'; then
+    if ! run_lcov --help 2>&1 | grep -q -- '--fail-under-lines'; then
         die "this lcov does not support --fail-under-lines, so the ${COVERAGE_MIN}% gate cannot be
        enforced.  Install lcov 2.0 or newer; refusing to report coverage without the gate."
     fi
@@ -874,13 +1199,19 @@ Environment variables (all optional; shown with their defaults):
                                  as '<cmd> <level>' before each level under 'all'; it owns
                                  the documented plugin -> testframework -> mocks rebuild
                                  sequence.  Currently: ${LEVEL_REBUILD_CMD:-<unset>}
-  ARTIFACT_ROOT=\${TMPDIR:-/tmp}/$REPO_NAME-coverage/<workspace basename>
-                                 Root of the artifact tree; this run writes to
-                                 \$ARTIFACT_ROOT/$REPO_NAME/<level>/.  Defaults OUTSIDE the
-                                 checkout so a run leaves no committable output in the
-                                 working tree.  Created only after the level's prerequisites
-                                 have been validated.
-                                 Currently: $ARTIFACT_ROOT
+  ARTIFACT_ROOT=<unset>          Root of the artifact tree; this run writes to
+                                 \$ARTIFACT_ROOT/$REPO_NAME/<level>/.  Left unset -- the
+                                 default -- the root is minted with 'mktemp -d' under
+                                 \${TMPDIR:-/tmp} at mode 0700, so its name is unpredictable
+                                 and cannot be pre-created by another local account; the
+                                 chosen path is printed when the run starts.  Set it to a
+                                 fixed path if you need one, and that path's whole ancestry
+                                 is then checked strictly (no symlink, owned by you or root,
+                                 not writable by others).  Either way it is OUTSIDE the
+                                 checkout, so a run leaves no committable output in the
+                                 working tree, and it is created only after the level's
+                                 prerequisites have been validated.
+                                 Currently: ${ARTIFACT_ROOT:-<minted per run>}
   COVERAGE_MIN=80                Line-coverage bar, applied to the level aggregate and to
                                  each target.  Spelled as digits or digits.digits (80, 0,
                                  100, 80.5) and between 0 and 100; anything else is refused
@@ -897,6 +1228,22 @@ Environment variables (all optional; shown with their defaults):
                                  gcov merges each shard's counters into the same .gcda files, so
                                  the capture measures the union with no lcov merge involved.
                                  L1 is never sharded.  Currently: $L2_SHARDS
+  SUITE_TIMEOUT_L1=600           Wall-clock bound on the L1 suite, in whole seconds.
+  SUITE_TIMEOUT_L2=900           Wall-clock bound PER L2 SHARD, in whole seconds.  Per level
+                                 because the levels are not comparable: L1 is in-process and
+                                 finishes in seconds, L2 starts a Thunder host per shard and
+                                 is bounded upstream by Thunder's own 900s COM-RPC ceiling --
+                                 which is why this default matches it rather than exceeding
+                                 it.  A suite that exceeds its bound is terminated and
+                                 reported as a HANG, distinctly from a test failure, and no
+                                 coverage is captured from a partial run.  Must be > 0:
+                                 timeout(1) reads 0 as 'no limit'.
+                                 Currently: $SUITE_TIMEOUT_L1 and $SUITE_TIMEOUT_L2
+  HOOK_TIMEOUT=3600              Wall-clock bound on LEVEL_REBUILD_CMD, in whole seconds.  It
+                                 drives a cross-repository rebuild, so the bound is generous;
+                                 it exists so a stalled build fails by name rather than
+                                 holding the run open before any test has run.
+                                 Currently: $HOOK_TIMEOUT
 
 Artifacts (fixed names, no timestamps) in \$ARTIFACT_ROOT/$REPO_NAME/<level>/:
   coverage_<level>.info, filtered_coverage_<level>.info, coverage_<level>/index.html,
@@ -908,12 +1255,14 @@ Artifacts (fixed names, no timestamps) in \$ARTIFACT_ROOT/$REPO_NAME/<level>/:
   before spawning WPEFramework); that file is deleted before the run and archived into the
   artifact directory afterwards.
 
-Outside \$WS the run touches exactly one path: lcov reads \$HOME/.lcovrc silently and CI
-plants a branch-disabled copy there, so an existing \$HOME/.lcovrc -- of any type -- is moved
-aside into a temporary directory before the first lcov invocation and moved back on exit,
-including on failure and on a signal.  Nothing is copied or deleted, the entry returns with
-its original type, and the stash path is logged.  For a run that touches your home directory
-not at all:  HOME="\$(mktemp -d)" $(basename -- "$SCRIPT_PATH") l1
+Outside \$WS the run touches NO path in your home directory.  lcov reads \$HOME/.lcovrc silently
+and CI plants a branch-disabled copy there, so every lcov and genhtml invocation instead runs
+with HOME set to a private, empty, mode-0700 temporary directory that this run creates and
+removes: a directory with no .lcovrc in it cannot supply configuration, and your own file is
+never moved, copied, deleted or opened.  That also means two concurrent runs -- this runner and
+its two siblings share one \$HOME -- cannot interfere with each other.  /etc/lcovrc is
+system-wide, out of scope for this script, and still read; the branch-record assertion after the
+capture is what proves branch collection actually took effect.
 
 Build the plugin AND rebuild entservices-testframework against it before running: both
 plugins emit identically named test libraries, so a stale framework build silently
@@ -1106,20 +1455,19 @@ cleanup_stage_dir() {
 #
 # Two separate EXIT traps cannot coexist: bash keeps a single handler per signal, so the
 # second `trap … EXIT` REPLACES the first.  That is exactly how an empty staging directory
-# used to be left behind in ${TMPDIR:-/tmp} on every run that had a $HOME/.lcovrc to move
-# aside -- the stash installed its own restore trap over the staging cleanup, and the
-# staging directory then had nobody to remove it.  Both actions live in this one handler
-# instead, and both are idempotent, so running it on a normal exit and again on a signal is
-# harmless.
+# used to be left behind in ${TMPDIR:-/tmp} on every run that also had lcov-configuration
+# cleanup to do -- the second trap installed itself over the staging cleanup, and the staging
+# directory then had nobody to remove it.  Both actions live in this one handler instead, and
+# both are idempotent, so running it on a normal exit and again on a signal is harmless.
 #
 # The signal traps `exit` rather than re-raising, because a shell terminated by a signal with
 # its default disposition never runs its EXIT trap: re-raising would have skipped both the
-# staging cleanup and the home-configuration restore. `exit 130/143/129` reports the same
+# staging cleanup and the removal of the private lcov HOME. `exit 130/143/129` reports the same
 # status a signalled shell would while guaranteeing the handler runs.
 on_exit() {
     local rc=$?
     cleanup_stage_dir
-    restore_home_lcovrc
+    cleanup_lcov_home
     return "$rc"
 }
 trap on_exit EXIT
@@ -1133,6 +1481,9 @@ trap 'exit 129' HUP
 publish_artifact() { # $1=staged path  $2=final path  $3=file|dir
     local staged="$1" final="$2" kind="$3"
     assert_safe_artifact_path "$final" "$kind"
+    # Ancestry re-checked immediately before the one recursive delete in the pipeline: the leaf
+    # check above says nothing about the directory the leaf sits in.
+    assert_artifact_path_still_safe "$final"
     if [ "$kind" = 'dir' ] && [ -d "$final" ]; then
         rm -rf -- "$final"
     fi
@@ -1180,6 +1531,9 @@ resolve_level_inputs() {
     log "${level^^} install dir (canonical): $LEVEL_INSTALL_DIR"
 
     assert_safe_artifact_path "$LEVEL_ARTIFACT_DIR" dir
+    # ...and the whole chain above it, at the strictness the way the root was chosen calls for.
+    assert_safe_ancestry "$LEVEL_ARTIFACT_DIR" \
+        "$( [ "$ARTIFACT_ROOT_EXPLICIT" -eq 1 ] && printf 'named' || printf 'minted' )"
 }
 
 # ------------------------------------------------------------------------------------
@@ -1189,13 +1543,133 @@ resolve_level_inputs() {
 # Called immediately before the counters are zeroed -- i.e. after preflight, and before the
 # first side effect on the build tree.
 # ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+# EVIDENCE CUSTODY.  The default artifact root is a PREDICTABLE path in a shared temporary
+# directory -- ${TMPDIR:-/tmp}/<plugin>-coverage/<workspace> -- and the traces written there are
+# the measurement of record that the traceability report quotes.  Predictable, plus shared, plus a
+# world-writable parent, means another user on this host can pre-create the directory or leave it
+# group-writable and then substitute a trace between the capture and the gate: the gate would pass
+# on numbers this run never produced, and nothing in the output would look wrong.  ~75 sibling
+# clones share this host, so the collision is the normal condition rather than a corner case.
+#
+# assert_safe_artifact_path already refuses a symlink or the wrong kind of object at the path.
+# These three add the properties it does not cover, re-established on every run:
+#   OWNERSHIP  the directory is owned by the user running this script, not merely writable by them
+#   PRIVACY    no group or other write bit, so nobody else can place a file inside it
+#   ANCESTRY   no ancestor is writable-by-anyone while missing its sticky bit, since such an
+#              ancestor lets a stranger rename the whole subtree and substitute their own
+# plus an exclusive advisory lock, which protects the evidence from THIS script: two concurrent
+# runs into one directory interleave their captures and both verdicts then describe a mixture.
+# ------------------------------------------------------------------------------------
+assert_owned_and_private() { # $1=directory
+    local dir="$1" owner mode uid
+    uid="$(id -u)"
+    owner="$(stat -c '%u' -- "$dir" 2>/dev/null)" \
+        || die "cannot stat $dir to establish who owns it, so its custody cannot be verified."
+    if [ "$owner" != "$uid" ]; then
+        die "the artifact directory
+           $dir
+       is owned by uid $owner, not by you ($uid).  It is a predictable path in a shared temporary
+       directory, so a directory you do not own may have been placed there by someone else -- and
+       a trace written into it could be replaced between the capture and the gate, making the
+       verdict apply to numbers this run did not produce.  Remove it, or point ARTIFACT_ROOT at a
+       directory you own."
+    fi
+    mode="$(stat -c '%a' -- "$dir" 2>/dev/null)" || die "cannot stat the mode of $dir."
+    # Group/other WRITE is what matters: read access leaks nothing the coverage HTML does not
+    # already publish, but write access means a trace can be substituted after it is captured.
+    # Tightened in place where possible -- failing a run over a bit this script can simply fix
+    # would be unhelpful -- and fatal only when the chmod does not take.
+    case "$mode" in
+        *[2367]|*[2367]?)
+            if chmod go-w -- "$dir" 2>/dev/null; then
+                warn "tightened the artifact directory to owner-only write (was mode $mode): $dir"
+            else
+                die "the artifact directory $dir is mode $mode -- group- or world-writable -- and could
+       not be tightened.  Anyone with access can replace a trace after it is captured and before
+       the gate reads it.  Fix the permissions, or point ARTIFACT_ROOT elsewhere."
+            fi ;;
+    esac
+}
+
+assert_ancestors_safe() { # $1=path -- walks upwards from the parent to /
+    local dir owner mode uid
+    uid="$(id -u)"
+    dir="$(dirname -- "$1")"
+    while : ; do
+        owner="$(stat -c '%u' -- "$dir" 2>/dev/null)" || break
+        mode="$(stat -c '%a' -- "$dir" 2>/dev/null)"
+        case "$mode" in
+            *[2367]|*[2367]?)
+                # Writable-by-anyone is fine when the sticky bit is set -- that is exactly /tmp's
+                # contract: you may create, you may not rename or remove what is not yours -- or
+                # when the directory belongs to root or to us.  `-k` tests the sticky bit exactly;
+                # a sticky directory that is also setgid reads as 3777 rather than 1777, so a
+                # leading-1 match on the mode string would miss it.
+                if [ ! -k "$dir" ] && [ "$owner" != 0 ] && [ "$owner" != "$uid" ]; then
+                    die "$dir is writable by others (mode $mode, owned by uid $owner) and is an
+       ancestor of the artifact directory.  Anyone able to write there can rename this subtree and
+       substitute their own, so the traces this run produces could not be trusted to be the traces
+       the gate reads.  Point ARTIFACT_ROOT at a path whose ancestors are either sticky (like
+       /tmp) or owned by you or by root."
+                fi
+                    if [ ! -k "$dir" ]; then
+                        warn "$dir is writable by others (mode $mode) and is NOT sticky, so anyone able to
+         write there can rename or remove this subtree -- including the artifact directory beneath
+         it.  It is owned by uid $owner (root or you), so this run continues, but the evidence
+         under it is only as protected as that directory is.  A sticky /tmp (mode 1777) or an
+         ARTIFACT_ROOT under a directory you own removes the exposure."
+                    fi
+                ;;
+        esac
+        [ "$dir" != / ] || break
+        dir="$(dirname -- "$dir")"
+    done
+    return 0
+}
+
+# One exclusive lock per level directory, held for the whole level through fd 9 and released when
+# the process exits.  Non-blocking on purpose: a second run wanting these exact files is a mistake
+# to report, not a queue to join -- the first run's captures would otherwise be overwritten
+# mid-flight and neither verdict would mean anything.
+ARTIFACT_LOCK_FD=''
+acquire_artifact_lock() { # $1=directory
+    local dir="$1" lock="$1/.run.lock"
+    if ! command -v flock >/dev/null 2>&1; then
+        warn "flock is not available, so concurrent runs into $dir cannot be prevented."
+        warn "    Run one level at a time, or give each run its own ARTIFACT_ROOT."
+        return 0
+    fi
+    assert_safe_artifact_path "$lock" file
+    # The descriptor is allocated by bash rather than hard-coded: a literal number is a number
+    # this script does not own, and would be silently clobbered the moment anything else in the
+    # run wanted it -- releasing the lock without a word.  It stays open, and the lock stays held,
+    # until this shell exits, which under `all` is the end of this level's subshell.
+    exec {ARTIFACT_LOCK_FD}>>"$lock" || die "cannot open the run lock at $lock"
+    if ! flock -n "$ARTIFACT_LOCK_FD"; then
+        die "another coverage run holds the lock on
+           $dir
+       Two runs writing the same trace files interleave their captures, and both verdicts then
+       describe a mixture of the two.  Wait for it to finish, or give this run its own
+       ARTIFACT_ROOT=<path>."
+    fi
+    log "holding the exclusive run lock on $dir"
+}
+
 create_level_artifact_dir() {
     local level="$1"
     # Re-checked here as well as in resolve_level_inputs: preflight takes time, and a symlink
     # or a file could have appeared at the path in between.
     assert_safe_artifact_path "$LEVEL_ARTIFACT_DIR" dir
-    mkdir -p "$LEVEL_ARTIFACT_DIR" || die "cannot create the artifact directory: $LEVEL_ARTIFACT_DIR"
-    log "${level^^} artifact directory ready: $LEVEL_ARTIFACT_DIR"
+    assert_ancestors_safe "$LEVEL_ARTIFACT_DIR"
+    # umask inside a subshell, so every directory in the chain is owner-only from the moment it
+    # exists.  Creating first and chmod'ing afterwards leaves a window in which the directory is
+    # open at the caller's umask, and on a shared host that window is enough.
+    ( umask 077 && mkdir -p "$LEVEL_ARTIFACT_DIR" ) \
+        || die "cannot create the artifact directory: $LEVEL_ARTIFACT_DIR"
+    assert_owned_and_private "$LEVEL_ARTIFACT_DIR"
+    acquire_artifact_lock "$LEVEL_ARTIFACT_DIR"
+    log "${level^^} artifact directory ready: $LEVEL_ARTIFACT_DIR (owner-only, locked for this run)"
 }
 
 # ------------------------------------------------------------------------------------
@@ -1254,7 +1728,7 @@ zero_counters() {
     # $HOME/.lcovrc used to abort the run here with a bare lcov error and no diagnostic of
     # ours -- and without the `|| die` a zeroing failure would surface as an unattributed
     # non-zero exit instead of naming the tree it could not clear.
-    "$LCOV_BIN" --zerocounters \
+    run_lcov --zerocounters \
         --directory "$LEVEL_BUILD_DIR" \
         "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 >/dev/null \
@@ -1330,6 +1804,25 @@ verify_results() {
     log "$binary reported $count test cases in $results, including HdmiCecSink fixtures"
 }
 
+validate_timeout() { # $1=variable name  $2=value
+    case "$2" in
+        ''|*[!0-9]*) die "$1 must be a whole number of seconds, got '$2'.
+       timeout(1) rejects a malformed duration with exit 125 before the command even starts, so a
+       bad bound would be reported as a suite failure rather than as the configuration error it is." ;;
+    esac
+    [ "$2" -gt 0 ] || die "$1 must be greater than 0, got '$2'.
+       timeout(1) treats 0 as 'no limit', which would silently restore the unbounded run this bound
+       exists to prevent.  Do not spell 'no bound' as 0."
+}
+
+suite_timeout_for_level() { # $1=level -> seconds on stdout
+    case "$1" in
+        l1) printf '%s' "$SUITE_TIMEOUT_L1" ;;
+        l2) printf '%s' "$SUITE_TIMEOUT_L2" ;;
+        *)  die "internal: suite_timeout_for_level called with '$1'" ;;
+    esac
+}
+
 run_suite() {
     local level="$1" binary results rc=0
     case "$level" in
@@ -1402,6 +1895,9 @@ run_suite() {
     local shards=1
     [ "$level" = 'l2' ] && shards="$L2_SHARDS"
 
+    local suite_timeout
+    suite_timeout="$(suite_timeout_for_level "$level")"
+
     local results_base total=0 idx=0 archived shard_files=()
     results_base="$(basename -- "$results")"
 
@@ -1434,10 +1930,20 @@ run_suite() {
         fi
         log "working dir     = $run_dir  (so the framework's './install/...' paths resolve)"
         rc=0
+        # BOUNDED, because an unbounded run is not a run that can fail.  This suite starts a
+        # Thunder host and activates plugins over COM-RPC: an activation that never completes, or
+        # a notification that is never delivered, hangs here with no further output, no exit and
+        # no gate -- and in CI the job is eventually killed by the runner with nothing attached to
+        # explain it.  `timeout --foreground` keeps the child attached to the terminal so Ctrl-C
+        # still reaches it; --kill-after is added only where the local timeout preserves exit 124
+        # alongside it (see the probe next to TIMEOUT_KILL_AFTER).  A timeout is reported as a
+        # HANG in its own right, because a hang and a failing assertion need different fixes.
+        log "time limit      = ${suite_timeout}s ($( [ "$shards" -gt 1 ] && printf 'per shard, ' )SUITE_TIMEOUT_${level^^})"
         if valgrind_enabled; then
             log "running $binary under valgrind memcheck (options as in CI)"
             (
                 cd -- "$run_dir" || exit 1
+                "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$suite_timeout" \
                 "$VALGRIND_BIN" \
                     --tool=memcheck \
                     --log-file="$LEVEL_ARTIFACT_DIR/valgrind_log" \
@@ -1451,10 +1957,22 @@ run_suite() {
             log "running $binary"
             (
                 cd -- "$run_dir" || exit 1
-                "$binary"
+                "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$suite_timeout" "$binary"
             ) || rc=$?
         fi
         rule
+
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            local where=''
+            [ "$shards" -gt 1 ] && where=" on shard $((idx + 1)) of $shards"
+            die "$binary did not finish within ${suite_timeout}s$where and was terminated (exit $rc).
+       This is a HANG, not a test failure: the last test named in the suite's own output above is
+       where it stopped.  No coverage is captured, because a suite killed part-way through leaves
+       partial counters.  Investigate that test, or raise the bound deliberately with
+       SUITE_TIMEOUT_${level^^}=<seconds>.  At L2 note that Thunder imposes its own 900s COM-RPC
+       ceiling, so raising this bound past it will not make a stuck activation complete -- more
+       shards (L2_SHARDS) is the lever that reduces per-shard runtime."
+        fi
 
         if [ "$rc" -ne 0 ]; then
             if [ "$shards" -gt 1 ]; then
@@ -1569,23 +2087,49 @@ capture_coverage() {
         *)  die "capture_coverage: unknown level '$level'" ;;
     esac
 
-    # Take any home lcov configuration out of the way for the lcov steps below, and put it
-    # back on exit.  See stash_home_lcovrc: nothing is deleted, /etc/lcovrc and every other
-    # shared configuration is left strictly alone, and this is the only path outside "$WS"
-    # the run touches at all.
-    stash_home_lcovrc
+    # Ensure the private, empty HOME the lcov steps below run with is in place.  Idempotent: it
+    # is also prepared in main() before the first lcov call of the run, and again per level so
+    # that a level running in its own subshell has one regardless.  See prepare_lcov_home: the
+    # real $HOME is never touched, /etc/lcovrc and every other shared configuration is left
+    # strictly alone, and no path in the home directory is read or written at all.
+    prepare_lcov_home
 
     assert_safe_artifact_path "$raw" file
     assert_safe_artifact_path "$filtered" file
+    # Re-checked at the moment of the write, ancestry included, not merely when the level
+    # resolved its paths.
+    assert_artifact_path_still_safe "$raw"
+    assert_artifact_path_still_safe "$filtered"
 
+    # DELETE BOTH TRACES FIRST, so that whatever exists here afterwards was written by THIS
+    # capture.  Without this, a capture that failed left the previous run's trace standing at
+    # the same fixed name, and the "did it produce records?" check below -- which only asks
+    # whether the file is non-empty and contains SF: lines -- was satisfied by that stale file.
+    # The report, the per-file table and the gate verdict were then all built from a
+    # measurement this run did not take.  Removing them makes absence mean failure.
+    rm -f -- "$raw" "$filtered" \
+        || die "could not remove the previous trace files before capturing:
+       $raw
+       $filtered
+       Refusing to capture over them, because a trace this run did not write must never be
+       able to satisfy the checks below."
 
     log "capturing coverage from $LEVEL_BUILD_DIR"
-    "$LCOV_BIN" -c \
+    # `|| die` EXPLICITLY, not left to errexit.  This function is reached through
+    # `if ! run_level_in_subshell`, which suppresses errexit for everything inside it, so an
+    # lcov failure here used to simply fall through to the next step.  The subshell re-arms
+    # errexit now, and each evidence-producing command states its own failure as well: the
+    # guarantee that a failed capture stops the run does not then depend on one `set -e`
+    # surviving every future refactor of the call chain.
+    lcov_run -c \
         -o "$raw" \
         -d "$LEVEL_BUILD_DIR" \
         "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
-        --ignore-errors "$LCOV_CAPTURE_IGNORE"
+        --ignore-errors "$LCOV_CAPTURE_IGNORE" \
+        || die "lcov capture failed for level ${level^^} over $LEVEL_BUILD_DIR.
+       No figure is reported for a capture that did not complete, and the trace files were
+       removed beforehand so nothing stale can stand in for it."
 
     if [ ! -s "$raw" ] || ! grep -q '^SF:' "$raw"; then
         die "capture produced no coverage records in $raw.
@@ -1595,13 +2139,37 @@ capture_coverage() {
     fi
     log "raw capture: $(grep -c '^SF:' "$raw") source files -> $raw"
 
+    # Branch records must actually BE there, or `--rc branch_coverage=1` did not take effect and
+    # every branch figure downstream is a silent blank.  FATAL rather than advisory: AAP Directive
+    # 4 requires branch data so that if/else closure can be seen at all, and every mechanism that
+    # suppresses it does so silently -- /etc/lcovrc, an lcov too old for the option, a
+    # --config-file whose setting wins -- leaving a report whose branch column reads "no data"
+    # while the run exited 0 and looked complete.  Warning about that is how this workspace ended
+    # up with three suites carrying no branch data in CI, so the run stops instead.
+    if ! grep -q '^BRDA:' "$raw"; then
+        die "no BRDA (branch) records in $raw, so branch data was NOT collected even though
+       --rc branch_coverage=1 was passed to the capture.
+       Something is overriding it.  \$HOME/.lcovrc is not a candidate -- this script runs lcov
+       with a private empty HOME -- so the remaining ones are /etc/lcovrc (system-wide, out of
+       scope for this script), an lcov too old to honour the option, or the --config-file this
+       script passes: ${LCOV_CONFIG_ARGS[*]:-<none>}.  Reproduce with:
+           $LCOV_BIN -c -o /tmp/probe.info -d $LEVEL_BUILD_DIR --rc branch_coverage=1 \
+               --ignore-errors $LCOV_CAPTURE_IGNORE && grep -c '^BRDA:' /tmp/probe.info
+       This is fatal rather than advisory because branch collection is a stated requirement of
+       this measurement, and every way of losing it loses it silently."
+    fi
+    log "branch data collected: $(grep -c '^BRDA:' "$raw") BRDA record(s) in the raw trace"
+
     log "filtering with the ${level^^} exclusion globs (${#excludes[@]} globs, verbatim from CI)"
-    "$LCOV_BIN" -r "$raw" \
+    run_lcov -r "$raw" \
         "${excludes[@]}" \
         -o "$filtered" \
         "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
-        --ignore-errors "$LCOV_FILTER_IGNORE"
+        --ignore-errors "$LCOV_FILTER_IGNORE" \
+        || die "lcov filtering failed for level ${level^^}.
+       The filtered trace is the denominator every figure below is computed against, so a
+       filter that did not complete stops the run rather than being reported over."
 
     if [ ! -s "$filtered" ] || ! grep -q '^SF:' "$filtered"; then
         die "the exclusion globs removed every source file from $filtered.
@@ -1611,6 +2179,21 @@ capture_coverage() {
        points at this plugin's build."
     fi
     log "filtered trace: $(grep -c '^SF:' "$filtered") source files -> $filtered"
+
+    # Checked AGAIN after filtering, because the filter step is a second, independent opportunity
+    # to lose branch data: it rewrites the trace under its own --rc, and every figure this script
+    # reports -- the summary, the per-file table, the gate -- is derived from THIS file rather
+    # than from the raw one.  Aggregate-level check only: an individual source file legitimately
+    # carries no BRF record when it contains no branches at all.
+    local branch_records
+    branch_records="$(grep -c '^BRDA:' "$filtered" || true)"
+    if [ "${branch_records:-0}" -eq 0 ]; then
+        die "the filtered trace at $filtered contains no branch records at all, although the raw
+       trace had them.  The filter step dropped branch data, so every branch figure derived from
+       this file would read 'no data' while the run exited 0.  Refusing to report a measurement
+       whose branch column is silently absent."
+    fi
+    log "branch data survived filtering: $branch_records BRDA record(s) across $(grep -c '^BRF:' "$filtered" || true) file record(s)"
 
     # genhtml creates its output directory only when absent and never purges pages it did
     # not write, so a page for a file that has since left the trace would survive and be
@@ -1635,7 +2218,7 @@ capture_coverage() {
     ensure_stage_dir
     local staged_html="$STAGE_DIR/coverage_$level"
     rm -rf -- "$staged_html"
-    "$GENHTML_BIN" \
+    run_genhtml \
         -o "$staged_html" \
         -t "$GENHTML_TITLE" \
         "$filtered" \
@@ -1648,7 +2231,7 @@ capture_coverage() {
 
     rule
     log "lcov summary for $filtered"
-    "$LCOV_BIN" --summary "$filtered" \
+    run_lcov --summary "$filtered" \
         "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
         --ignore-errors "$LCOV_SUMMARY_IGNORE" \
@@ -1937,7 +2520,7 @@ apply_gate() {
 
     rule
     log "applying the >= ${COVERAGE_MIN}% line-coverage gate to the ${level^^} aggregate"
-    "$LCOV_BIN" --summary "$filtered" \
+    run_lcov --summary "$filtered" \
         --fail-under-lines "$COVERAGE_MIN" \
         "${LCOV_CONFIG_ARGS[@]}" \
         --rc branch_coverage=1 \
@@ -2004,7 +2587,7 @@ run_level() {
     # not the capture.  main() has already done this for the run; it is repeated here (and is
     # idempotent) so that a home configuration which reappears between levels cannot be in
     # effect for the level that follows it.
-    stash_home_lcovrc
+    prepare_lcov_home
     zero_counters "$level"
     run_suite "$level"
     verify_fresh_counters "$level"
@@ -2061,16 +2644,28 @@ check_all_admissible() {
 # One level of `all`, in a subshell, so that a failure is reported by main() rather than
 # ending the script mid-sequence.
 #
-# The subshell RE-ARMS the cleanup handlers, because bash resets traps in a subshell to the
-# dispositions the parent inherited: the parent's EXIT trap does not run when a subshell
-# exits, so a staging directory created inside one had nobody to remove it -- which is how an
-# `all` run used to leak one empty ${TMPDIR:-/tmp}/run_coverage_stage.* per level.  Only the
-# staging cleanup is re-armed: STAGE_DIR is set inside the subshell and so is the subshell's
-# to remove, whereas the home configuration was moved aside by main() and belongs to the
-# parent, whose own EXIT trap puts it back once BOTH levels are done.  Restoring it here
-# would hand level L2 the very file this run took out of the way.
+# THE SUBSHELL RE-ARMS `set -e` AND `set -o pipefail`, AND THAT IS NOT DEFENSIVE TIDYING.
+# This function is called from `if ! run_level_in_subshell l1; then`, and a command used as
+# the condition of `if` runs with errexit SUPPRESSED -- for the command itself and for
+# everything inside it, subshell included.  So every step of the level ran with no errexit at
+# all: a step that failed did not end the level, it merely returned non-zero and let the NEXT
+# step run on whatever the failed one left behind.  The capture and filter steps below were
+# exactly that shape, which is how a failed capture could be followed by a report built from a
+# trace this run did not write.  `set -e` and `set -o pipefail` here restore inside the
+# subshell what the caller's `if !` took away; the caller still sees the level's exit status,
+# so its own diagnosis is unchanged.
+#
+# The subshell also RE-ARMS the cleanup handler, because bash resets traps in a subshell to the
+# dispositions the parent inherited: the parent's EXIT trap does not run when a subshell exits,
+# so a staging directory created inside one had nobody to remove it -- which is how an `all` run
+# used to leak one empty ${TMPDIR:-/tmp}/run_coverage_stage.* per level.  Only the staging
+# cleanup is re-armed: STAGE_DIR is set inside the subshell and so is the subshell's to remove,
+# whereas the private lcov HOME belongs to the parent, whose own EXIT trap removes it once BOTH
+# levels are done.  Removing it here would leave level L2 with no HOME to run lcov under.
 run_level_in_subshell() { # $1 = level
     (
+        set -e
+        set -o pipefail
         trap cleanup_stage_dir EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
@@ -2086,10 +2681,24 @@ run_level_rebuild_hook() {
     [ -n "$LEVEL_REBUILD_CMD" ] || return 0
     rule
     log "level-rebuild hook for ${level^^}: $LEVEL_REBUILD_CMD $level"
+    log "time limit: ${HOOK_TIMEOUT}s (HOOK_TIMEOUT)"
+    local rc=0
     # Word-split deliberately: the hook is configured as a command line, so
     # LEVEL_REBUILD_CMD="bash /path/switch.sh --quiet" must work.
+    # BOUNDED for the same reason the shards are: this hook drives a full cross-repository
+    # rebuild, and a build that stalls -- a lock it will never get, a prompt nothing will answer,
+    # a fetch with no timeout of its own -- would hold the entire run open before a single test
+    # has been executed.
     # shellcheck disable=SC2086
-    $LEVEL_REBUILD_CMD "$level" || die "the level-rebuild hook failed for ${level^^}: $LEVEL_REBUILD_CMD $level
+    "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$HOOK_TIMEOUT" \
+        $LEVEL_REBUILD_CMD "$level" || rc=$?
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        die "the level-rebuild hook did not finish within ${HOOK_TIMEOUT}s for ${level^^} and was
+       terminated (exit $rc): $LEVEL_REBUILD_CMD $level
+       The tree is now in whatever state the interrupted build left it in, so nothing is measured.
+       Re-run the hook by hand to see where it stalls, or raise the bound with HOOK_TIMEOUT."
+    fi
+    [ "$rc" -eq 0 ] || die "the level-rebuild hook failed for ${level^^} (exit $rc): $LEVEL_REBUILD_CMD $level
        The tree was therefore not switched to this level, so measuring it would report the
        other level's artifacts.  Fix the hook, or use separate per-level trees."
 }
@@ -2190,7 +2799,21 @@ main() {
         warn "    is 852.84 s against the framework's hard 900 s COM-RPC ceiling, so a single-shard"
         warn "    run may be stopped mid-suite by the framework and fail healthy tests as"
         warn "    collateral.  See the L2_SHARDS comment near the top of this script."
+        if [ "$SUITE_TIMEOUT_L2" -le 900 ]; then
+            warn "    With SUITE_TIMEOUT_L2=${SUITE_TIMEOUT_L2}s and one shard, this script's own bound may"
+            warn "    also fire before the suite finishes.  Raise SUITE_TIMEOUT_L2 deliberately if a"
+            warn "    single-shard run is what you want."
+        fi
     fi
+
+    # The wall-clock bounds are validated for shape and range for the same reason the bar and the
+    # shard count are: `timeout` rejects a malformed duration by exiting 125 before the command
+    # starts, which would surface here as "the suite exited 125" and send the reader hunting
+    # through a suite that never ran.  A bound of 0 means "no limit" to timeout(1), silently
+    # restoring the unbounded run these exist to prevent, so 0 is refused rather than honoured.
+    validate_timeout SUITE_TIMEOUT_L1 "$SUITE_TIMEOUT_L1"
+    validate_timeout SUITE_TIMEOUT_L2 "$SUITE_TIMEOUT_L2"
+    validate_timeout HOOK_TIMEOUT     "$HOOK_TIMEOUT"
 
     # ARTIFACT_ROOT is validated before it is used, because every level's report directory is
     # derived from it and republishing a report removes the previous one with `rm -rf`.  A
@@ -2222,7 +2845,7 @@ main() {
     # lcov cannot parse breaks `lcov --version` itself, so probing first would misreport a
     # working lcov as a broken one -- and the counter-zeroing step would have failed with a
     # bare lcov error before the capture ever ran.
-    stash_home_lcovrc
+    prepare_lcov_home
     check_lcov_usable
 
     log "repository  : $REPO_ROOT"

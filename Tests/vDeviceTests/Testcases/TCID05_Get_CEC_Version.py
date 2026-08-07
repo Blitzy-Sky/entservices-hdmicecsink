@@ -50,16 +50,25 @@
  *    carries an "error" member and no "result" member, and no CECVersion value comes back.
  *
  * @pass_criteria
- *  - The reply carries a JSON-RPC "error" object and no "result" member, result.success is
- *    therefore not True, no result.CECVersion string is returned, and run_test() returns True.
+ *  - The reply is a JSON-RPC 2.0 envelope answering the id this case sent, carries an "error"
+ *    object and no "result" member, and that error's code is one of exactly two values:
+ *    -32601, or 22. Those are the two renderings of a single framework status,
+ *    Core::ERROR_UNKNOWN_KEY - the status Thunder's dispatcher returns when no registered
+ *    handler matches the method name - so together they are the dispatcher saying the method
+ *    does not exist, and no third code says it.
  *  - Should the method ever be published, these criteria invert to result.success being True
  *    and result.CECVersion being a non-empty string; the tripwire branch in run_test() says so
  *    in its diagnostic rather than leaving the next reader to work it out.
  *
  * @failure_criteria
  *  - A CECVersion payload is returned (the published surface changed), the command was not
- *    dispatched, no response arrived, a JSON parsing error occurred, or run_test() returns
- *    False.
+ *    dispatched, no response arrived, a JSON parsing error occurred, the reply is not a
+ *    JSON-RPC 2.0 envelope, the reply answers a different request id, the error member carries
+ *    no integer code, or the code is ANY value other than -32601 or 22. That last clause is
+ *    what keeps a different fault from being read as this one: -32603 (internal error), -32602
+ *    (invalid parameters), -32604 (privileged), -32000 (timeout) and 2 (ERROR_UNAVAILABLE - the
+ *    service absent, which is this case's precondition rather than its subject) are all
+ *    refusals, and none of them is evidence that the METHOD is unpublished.
  */
 """
 
@@ -76,6 +85,8 @@ import json
 # the tension is recorded here rather than resolved silently in either direction.
 from utils import (
     send_curl_command,
+    expected_request_id,
+    sanitise_for_log,
     log_info,
     log_success,
     log_error,
@@ -110,10 +121,54 @@ def run_test():
         return False
 
     log_success("✔ curl command sent")
-    log_warning(f"Response: {curl_response}")
+    log_warning(f"Response: {sanitise_for_log(curl_response, max_chars=2048)}")
 
     try:
         parsed = json.loads(curl_response)
+
+        # ENVELOPE AND CORRELATION, CHECKED HERE AND NOT ONLY UPSTREAM. utils.send_curl_command
+        # already requires curl to have exited zero, the HTTP status to have been 2xx, the body
+        # to have been exactly one syntactically valid JSON-RPC envelope, and the id to match
+        # the one sent - so a caller that only needs a reply is safe without this block. This
+        # case needs more than a reply: its verdict is the assertion "the dispatcher rejected
+        # THIS call because the method does not exist", and an error object belonging to some
+        # other request, or arriving in something that is not a JSON-RPC envelope at all, would
+        # satisfy the code check below while saying nothing about this method. So the two
+        # properties the verdict rests on are asserted where the verdict is formed.
+        if not isinstance(parsed, dict):
+            log_error(
+                "✖ the reply is valid JSON but not a JSON-RPC envelope "
+                f"({type(parsed).__name__}), so no error member can be attributed to this call"
+            )
+            log_error("TCID05_Get_CEC_Version Failed ❌")
+            return False
+
+        if parsed.get("jsonrpc") != "2.0":
+            log_error(
+                "✖ the reply does not declare jsonrpc 2.0 "
+                f"(jsonrpc={sanitise_for_log(parsed.get('jsonrpc'), max_chars=32)}), so it is "
+                "not a response this case can read a rejection out of"
+            )
+            log_error("TCID05_Get_CEC_Version Failed ❌")
+            return False
+
+        sent_id = expected_request_id(HdmiCecSinkApis.get_cec_version_unregistered)
+        if sent_id is None:
+            log_error(
+                "✖ get_cec_version_unregistered carries no readable JSON-RPC id, so the reply "
+                "cannot be correlated to the call this case makes"
+            )
+            log_error("TCID05_Get_CEC_Version Failed ❌")
+            return False
+        if str(parsed.get("id")) != str(sent_id):
+            log_error(
+                f"✖ the reply answers request id "
+                f"{sanitise_for_log(parsed.get('id'), max_chars=32)}, not the {sent_id} this "
+                "case sent, so its error member describes a different call"
+            )
+            log_error("TCID05_Get_CEC_Version Failed ❌")
+            return False
+
         result = parsed.get("result", {})
         error = parsed.get("error")
 
@@ -144,21 +199,53 @@ def run_test():
         rejected = isinstance(error, dict) and not answered_with_result
 
         if rejected:
-            # Thunder maps Core::ERROR_UNKNOWN_KEY to the canonical JSON-RPC -32601 "Method not
-            # found" (Thunder/Source/core/JSONRPC.h:93) and passes any other framework status
-            # through its default branch unchanged, which is why an unpublished method can be
-            # reported as either -32601 or 22 (Core::ERROR_UNKNOWN_METHOD - the value measured
-            # at L1). Both are the dispatcher saying the method does not exist, so both are
-            # treated as canonical; any other code is still a rejection, but it is logged so it
-            # cannot pass by unnoticed.
+            # THE ACCEPTED CODES ARE THE TWO RENDERINGS OF ONE FRAMEWORK STATUS, AND NOTHING
+            # ELSE. Thunder's plugin dispatcher initialises its result to Core::ERROR_UNKNOWN_KEY
+            # and returns it when no registered handler matches the method name
+            # (Thunder/Source/plugins/JSONRPC.h:605), and Core::JSONRPC::Error::Info::SetError
+            # maps that status to the canonical JSON-RPC -32601 "Method not found"
+            # (Thunder/Source/core/JSONRPC.h, the ERROR_UNKNOWN_KEY case of the switch). The
+            # value of ERROR_UNKNOWN_KEY is 22 (Thunder/Source/core/Portability.h:850), which is
+            # the raw status the L1 measurement recorded from an in-process invocation where no
+            # SetError mapping is applied. So -32601 and 22 are the same statement made on two
+            # surfaces, and no third code says it.
+            #
+            # (The symbol in the earlier note here was wrong and is corrected: Thunder has no
+            # Core::ERROR_UNKNOWN_METHOD - grep of the vendored tree finds none - and 22 is
+            # ERROR_UNKNOWN_KEY.)
+            #
+            # ANY OTHER CODE IS A DIFFERENT FAULT AND FAILS. -32603 is an internal error, -32602
+            # invalid parameters, -32604 a privilege refusal, -32000 a timeout, and 2
+            # (ERROR_UNAVAILABLE) is the service not being there at all - which is the
+            # precondition of this case rather than its subject. Treating those as "the method
+            # does not exist" is how a deactivated plugin, a malformed request or an unreachable
+            # service would report this case as passing, so each of them ends it as a failure
+            # naming the code that was actually returned.
             method_not_found_codes = (-32601, 22)
             error_code = error.get("code")
-            if error_code not in method_not_found_codes:
-                log_warning(
-                    f"JSON-RPC error code {error_code} is not one of "
-                    f"{method_not_found_codes}; the method is still reported as unavailable, "
-                    "which is the contract under test"
+            if not isinstance(error_code, int) or isinstance(error_code, bool):
+                log_error(
+                    "✖ the reply's error member carries no integer code "
+                    f"(code={sanitise_for_log(error_code, max_chars=64)}), so the dispatcher's "
+                    "reason for refusing cannot be established"
                 )
+                log_error("TCID05_Get_CEC_Version Failed ❌")
+                return False
+            if error_code not in method_not_found_codes:
+                log_error(
+                    f"✖ JSON-RPC error code {error_code} is not one of "
+                    f"{method_not_found_codes}, the two renderings of ERROR_UNKNOWN_KEY. The "
+                    "call was refused for some other reason - a deactivated plugin, an invalid "
+                    "request or an unavailable service - and this case asserts specifically "
+                    "that the METHOD is unpublished, so that is not the contract under test. "
+                    f"Error text: {sanitise_for_log(error.get('message'), max_chars=256)}"
+                )
+                log_error("TCID05_Get_CEC_Version Failed ❌")
+                return False
+
+            log_success(
+                f"✔ the dispatcher reported the method as unknown (code {error_code})"
+            )
             elapsed_time = time.perf_counter() - start_time
             msg = "TCID05_Get_CEC_Version Passed ✅"
             if os.environ.get("HDMICEC_TIMING_ENABLED"):

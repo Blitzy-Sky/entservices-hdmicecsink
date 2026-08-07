@@ -1,8 +1,12 @@
 HdmiCec:
   command: "cec_message"
-  description: "Trigger process(SetOSDName) from LG (LA=10) - OSD name 'LG'"
+  description: "Trigger process(SetOSDName) from LG (LA=2) - OSD name 'LG'"
   message:
     user_defined: true
-    # Header 0xA0: initiator=10 (0xA, LG), destination=0 (sink DUT, directed)
-    # Opcode 0x47: SetOSDName  "LG" = 0x4C 0x47
-    payload: ["0xA0", "0x47", "0x4C", "0x47"]
+    # 0x20  header: initiator 2 (LG), destination 0 - the sink television. This one is
+    #        DIRECTED: process(SetOSDName) discards broadcasts (HdmiCecSinkImplementation.cpp:307)
+    #        exactly where process(ReportPhysicalAddress) and process(DeviceVendorID) discard
+    #        directed frames, so the three payloads for one peer are not addressed alike.
+    # 0x47  opcode <Set OSD Name>.
+    # 0x4C, 0x47  "LG" in ASCII.
+    payload: ["0x20", "0x47", "0x4C", "0x47"]

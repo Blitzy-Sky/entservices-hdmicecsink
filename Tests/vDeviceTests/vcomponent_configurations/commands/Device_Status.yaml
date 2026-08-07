@@ -25,12 +25,13 @@
 # in the suite this one was modelled on.
 #
 # The device name is a cross-document contract rather than a label.
-# Device_Add.yaml adds this peer, Device_Config_Add_Network.yaml declares it as
-# the PlaybackDevice beneath CECAdapter, and the matched Device_Remove.yaml
-# takes it away again, so all of them and this document have to name
-# "GameConsole" together. Change it in one place only and the update addresses a
-# device the topology never declared - which is not rejected, it simply has no
-# effect.
+# Device_Add.yaml adds this peer beneath the YAMAHA audio system, and the matched
+# Device_Remove.yaml takes it away again, so both of them and this document have
+# to name "GameConsole" together. Change it in one place only and the update
+# addresses a device that is not in the map - which is not rejected, it simply
+# has no effect. Note that the peer is NOT declared in
+# Device_Config_Add_Network.yaml: it exists only between the add and the remove,
+# so this document is only meaningful in that window.
 #
 # No role inversion was needed. The document this was modelled on already
 # targets a source-role peer, so the name carries over unchanged, and no
@@ -49,8 +50,8 @@
 # active_source elsewhere in the tree is written false/true. Neither may be
 # normalised into the other's form. The power change and the fault are also
 # deliberately a single post: nothing here clears the fault, because the fixture
-# that clears one is Device_Setapi_Open_Pass.yaml and it targets VAUDIO, a
-# different device.
+# that clears one is Device_Setapi_Open_Pass.yaml and it targets VTV, the
+# emulated device under test rather than a peer.
 #
 # The filename is part of the contract too. utils.HDMICEC_CMD_BASE resolves to
 # this directory and a consumer posts the literal "Device_Status.yaml" joined
@@ -59,10 +60,15 @@
 # show for it. The document is self-contained for the same reason - one YAML
 # document, no anchors, aliases or includes - because send_vcomponent_command()
 # posts these bytes verbatim and the vComponent parses them on their own.
+# THE PEER NAMED BELOW IS THE TEST-ONLY PEER Device_Add.yaml CREATES, not the baseline
+# GameConsole. An earlier revision named "GameConsole", which collides with the PlaybackDevice
+# declared beneath CECAdapter in Device_Config_Add_Network.yaml, so this document mutated a
+# BASELINE peer and left it faulted for every later case. The name must change in Device_Add.yaml,
+# this document and Device_Remove.yaml together.
 HdmiCec:
   command: update_device_status
   description: Updates the status of an HDMI CEC device
   device:
-    name: "GameConsole"
+    name: "L3TestPeer"
     power_status: "off"
     fault: yes

@@ -12,9 +12,20 @@
  *
  *          The OnKeyPressEvent notification the resulting frame provokes is NOT observed
  *          here and nothing is asserted about it: this level reaches the plugin over plain
- *          curl, which cannot subscribe to a Thunder notification channel, so an event
- *          assertion at L3 would be unfounded. That notification stays uncovered, and is
- *          reported as uncovered rather than implied to be tested.
+ *          one-shot curl, which cannot subscribe to a Thunder notification channel, so an
+ *          event assertion at L3 would be unfounded. That is a limit of THIS level, not a
+ *          coverage gap - the notification is asserted by the sink's own suites, and this
+ *          module deliberately does not duplicate them: L1
+ *          onKeyPressEvent_SubscribedClient_ReceivesAddressAndKeyCode,
+ *          onKeyPressEvent_BoundaryOperands_AreForwardedVerbatim and
+ *          onKeyPressEvent_NoSubscriber_ProducesNoClientNotification, and L2
+ *          InjectUserControlPressedFrameAndVerifyEvent with its minimum, maximum-named and
+ *          out-of-range key-code variants. Where the coverage register still lists
+ *          OnKeyPressEvent as uncovered, that entry is its PRE-CHANGE BASELINE.
+ *
+ *          WHAT WOULD MAKE THIS A FUNCTIONAL EVENT CASE, reported rather than made under AAP
+ *          Directive 6: an event channel reachable without an HTTP listener, or a vComponent
+ *          endpoint reporting the frames the device emitted.
  *
  *          Adjacent coverage, deliberately not duplicated here: the pressed and released
  *          pair with the minimum and boundary key codes belong to
@@ -39,22 +50,23 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - The plugin acknowledges the request with {"success": true}. The notification the key
- *    press produces is not observable at this level and is therefore not asserted.
+ *  - The plugin acknowledges the request with {"success": true} and the CEC device inventory is
+ *    identical before and after the call. The notification the key press produces is not observable
+ *    at this level and is therefore not asserted.
  *
  * @pass_criteria
- *  - The reply equals {"jsonrpc":"2.0","id":42,"result":{"success":true}} and run_test()
- *    returns True.
+ *  - The reply equals {"jsonrpc":"2.0","id":42,"result":{"success":true}}, the device inventory
+ *    reads identically before and after, and run_test() returns True.
  *
  * @failure_criteria
- *  - A response mismatch, a JSON parsing failure, an unreachable endpoint or an
- *    unavailable device-level prerequisite; run_test() then returns False.
+ *  - A response mismatch, a JSON parsing failure, an unreachable endpoint, an unreadable device
+ *    inventory on either side of the call, an inventory that changed across it, or an unavailable
+ *    device-level prerequisite; run_test() then returns False.
  */
 """
 
 
 import time
-import os
 
 
 import json
@@ -68,15 +80,13 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# log_with_timing belongs to the shared import contract every case in this suite is written
-# against; it is kept for parity even though this case formats its own timing line below.
-
 
 def run_test():
     '''Dispatch one sendKeyPressEvent call and verify the success acknowledgement.
     Returns:
-        True when the plugin answers with the expected success envelope; False on a
-        transport failure, a response mismatch or a body that is not valid JSON.
+        True when the plugin answers with the expected success envelope AND the CEC device inventory
+        is identical across the call; False on a transport failure, a response mismatch, an
+        unreadable or changed inventory, or a body that is not valid JSON.
     '''
     start_time = time.perf_counter()
 
@@ -87,6 +97,10 @@ def run_test():
             "success": True
         }
     }
+
+    # Inventory snapshot BEFORE the call, so the invariant below compares two real observations.
+    inventory_readable, before_count, before_addresses = _device_inventory()
+    log_info(f"Device inventory before: {before_count} devices at {before_addresses}")
 
     log_info("Executing the curl command send key press event")
 
@@ -111,20 +125,46 @@ def run_test():
     log_success("✔ curl command sent")
     log_warning(f"Response: {curl_response}")
 
-    # A key press is transient and leaves no persistent plugin state behind, so this case
-    # needs none of the restore clauses the suite's stateful write-side cases carry.
+    # A key press is transient and leaves no persistent plugin state behind - SendKeyPressEvent
+    # pushes the key onto m_SendKeyQueue and notifies the worker thread
+    # (HdmiCecSinkImplementation.cpp:3243-3257) - so this case needs none of the restore clauses the
+    # suite's stateful write-side cases carry, and publishes no cleanup() hook.
     try:
-        if json.loads(curl_response) == expected_output_response:
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID16_Send_Key_Press_Event Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
-        else:
+        if json.loads(curl_response) != expected_output_response:
             log_error("TCID16_Send_Key_Press_Event Failed ❌")
             return False
+
+        # THE INVARIANT THIS CASE CAN ACTUALLY OBSERVE. The queued key press must not disturb the
+        # CEC device inventory: the addressed peer is already known, and queueing a user-control
+        # frame neither registers nor drops a device. Asserting that is a real regression guard - an
+        # implementation that touched the device list from the send path would fail it while still
+        # answering success - and it is the strongest consequence reachable here, since the frame
+        # itself is outbound and this suite cannot read outbound frames.
+        if not inventory_readable:
+            log_error("✖ the device inventory could not be read, so no invariant can be asserted")
+            log_error("TCID16_Send_Key_Press_Event Failed ❌")
+            return False
+
+        after_readable, after_count, after_addresses = _device_inventory()
+        if not after_readable:
+            log_error("✖ the device inventory became unreadable after the key press")
+            log_error("TCID16_Send_Key_Press_Event Failed ❌")
+            return False
+        if (after_count, after_addresses) != (before_count, before_addresses):
+            log_error(
+                f"✖ the key press disturbed the device inventory: "
+                f"{before_count}/{before_addresses} -> {after_count}/{after_addresses}"
+            )
+            log_error("TCID16_Send_Key_Press_Event Failed ❌")
+            return False
+        log_success(
+            f"✔ device inventory unchanged across the key press: {after_count} devices at "
+            f"{after_addresses}"
+        )
+
+        elapsed_time = time.perf_counter() - start_time
+        log_success(log_with_timing("TCID16_Send_Key_Press_Event Passed ✅", elapsed_time))
+        return True
     except json.JSONDecodeError:
         log_error("Invalid JSON response")
         log_error("TCID16_Send_Key_Press_Event Failed ❌")

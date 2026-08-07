@@ -49,7 +49,6 @@
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -60,11 +59,6 @@ from utils import (
     log_with_timing
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
-
-# log_with_timing is imported and deliberately not called. Every case in this suite draws the
-# same six symbol set from utils.py so that the import band is uniform across the Testcases
-# directory, and the pass path below inlines the HDMICEC_TIMING_ENABLED decision so it can
-# choose the log level it routes the message through - log_with_timing only returns text.
 
 
 def run_test():
@@ -95,7 +89,17 @@ def run_test():
 
     try:
         actual_output_response = json.loads(curl_response)
-        result = actual_output_response.get("result", {})
+
+        # A payload that parses as JSON but is not an object, and a "result" member that is not
+        # an object, are response MISMATCHES that must fail through the predicates below rather
+        # than escape from here as an AttributeError - run_test() owes its caller a bool on
+        # every path, and a scalar or a list reaches exactly the same .get() call as an object
+        # does. The empty mapping substituted here leaves the real payload intact for the
+        # failure dump, so the substitution hides nothing.
+        envelope = actual_output_response if isinstance(actual_output_response, dict) else {}
+        result = envelope.get("result", {})
+        if not isinstance(result, dict):
+            result = {}
 
         has_success = result.get("success") is True
         has_available = isinstance(result.get("available"), bool)
@@ -136,11 +140,7 @@ def run_test():
 
         if has_success and has_available and details_valid:
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID06_Get_Active_Source Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID06_Get_Active_Source Passed ✅", elapsed_time))
             return True
 
         log_warning(

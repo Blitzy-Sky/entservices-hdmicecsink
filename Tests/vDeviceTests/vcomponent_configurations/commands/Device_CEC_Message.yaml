@@ -18,62 +18,62 @@
 # * limitations under the License.
 # *
 #* ******************************************************************************
-# A single CEC frame exchanged between two emulated peers, described SYMBOLICALLY.
+# A single CEC frame injected onto the emulated bus: a <CEC Version> reply from the SAMSUNG tuner
+# to the television that is the device under test.
 #
-# THIS IS THE ONLY SYMBOLIC FIXTURE IN THIS DIRECTORY, and that exception is the whole
-# point of the document. Every other cec_message fixture here marks itself user-defined and
-# hands the vComponent raw hex bytes - Device_Give_OSD_Name.yaml posts a two-element byte
-# list whose first element is the header addressing logical address 5, the emulated audio
-# system, to logical address 0, the television that is the device under test, and whose
-# second element is the opcode. This document instead clears that flag and NAMES the frame's
-# parts, leaving the emulator to synthesize the bytes from the topology it already holds. Do
-# not convert it to the raw-byte form: Device_CEC_Message_Userdef.yaml is the separate
-# fixture that covers that shape, and collapsing the two would leave the symbolic path of
-# the vComponent's command parser untested by this suite.
+# THIS DOCUMENT USED TO BE THE ONE SYMBOLIC FIXTURE IN THIS DIRECTORY, and it was converted to raw
+# bytes because the symbolic form could not carry the operand the frame requires. The reasoning is
+# recorded here rather than lost, because the earlier form was deliberate and the conversion has to
+# be defensible.
 #
-# BECAUSE IT IS SYMBOLIC, IT IS ALSO THE COUPLING POINT between this directory and
-# ../hdmicec/hdmicec_vcomponent_cec_responses.yaml, which owns the opcode, type and payload
-# vocabulary. The emulator resolves the opcode string through its own token table and any
-# string absent from that table becomes CEC_OPCODE_UNKNOWN, so the frame silently never
-# matches an exchange - no error, no failure, just a step that quietly does nothing.
-# "CecVersion" and the "cec_version" operand placeholder are both defined in that document
-# (as the request the emulated peer absorbs, and as the operand of the reply it sends to
-# <Give CEC Version>), so this frame has a counterpart there. Cross-check the two documents
-# together whenever either is edited; neither can be trusted alone.
+# The symbolic form named an opcode and let the emulator synthesise the bytes. Its command parser
+# synthesises operands for exactly three opcodes - CEC_ACTIVE_SOURCE and CEC_INACTIVE_SOURCE, from
+# the initiator's own allocated physical address, and CEC_SET_OSD_NAME, from an osd_name field in
+# the document (rdk-halif-test-hdmi_cec/vcomponent/src/vcHdmiCec.c ParseCommand). <CEC Version> is
+# not among them, so the document's "cec_version" payload entry was never serialised and the frame
+# went out as a bare header and opcode. A <CEC Version> without its version byte is not a weaker
+# test; CECVersion's operand is the whole content of the message, so the frame carried nothing and
+# process(CECVersion) had nothing to record.
 #
-# ENDPOINTS ARE SOURCE-ROLE ON BOTH SIDES, which is the one substantive difference from the
-# HdmiCecSource template this file was modelled on. That template sends from a mapped child
-# to an emulated television, because its device under test is a playback device. Here the
-# device under test IS the television: HdmiCecSinkImplementation::allocateLAforTV() takes
-# LogicalAddress::TV for the sink itself and records it in m_logicalAddressAllocated, so no
-# emulated peer may hold that role and no television exists in this tree to address. The
-# direction of the reference frame is preserved - a mapped child sending to the emulated
-# device - with the endpoints re-pointed onto peers that exist here:
+# Two further problems came with the same form, and both were silent. The parser reads the
+# initiator from a field named "initiator" and this document supplied "source", so the initiator
+# never resolved. And it addressed "VAUDIO", a device that only existed while the map was wrongly
+# rooted at an audio system; an endpoint absent from the device map does not raise, it just stops
+# the parse. Either fault alone left the post returning HTTP 200 with nothing on the bus.
 #
-#   source      "SAMSUNG"  a mapped child of the root peer, device_type Tuner on port 1
-#   destination "VAUDIO"   the emulated device itself, an AudioSystem at logical address 5
+# Nothing was lost by converting. The symbolic path is not reachable from any document in this tree
+# on the vendored emulator at all: ParseCommand resolves the opcode from the "hdmicec/command"
+# field, every document here sets that field to "cec_message", and "cec_message" is not a token in
+# the emulator's opcode table (vcCommand.c gOpCodeStrVal), so the symbolic branch rejects the
+# opcode before it reaches the operand code. Raw bytes are also the only form that cannot omit an
+# operand by accident, whichever emulator generation is in front of them.
 #
-# Both names are resolved by the emulator against the topology declared in
-# Device_Config_Add_Network.yaml, and "VAUDIO" is additionally the identity pinned by
-# config.emulated_device there and by ../hdmicec/hdmicec_vcomponent_configuration.yaml. An
-# endpoint that is not in the device map cannot be resolved, and an unresolved endpoint is
-# the same silent no-op as an unknown opcode - so a peer renamed in the topology must be
-# renamed here in the same change.
+# NOT A DUPLICATE OF Device_CEC_Version.yaml. That document is the audio system's reply, from
+# logical address 5. This one is the tuner's, from logical address 3, which preserves the SAMSUNG
+# source the symbolic form named and keeps a second peer's version exercisable. process(CECVersion)
+# (HdmiCecSinkImplementation.cpp:229-241) calls addDevice(header.from) and then
+# deviceList[3].update(msg.version), so the two documents drive the same handler for two different
+# entries in the device list.
 #
-# Two peers exchanging a frame is NOT role inversion: nothing here reconfigures the device
-# under test to stand in for its own peer. The sink remains the television throughout.
+# Payload, byte by byte:
+#   0x30  header = (initiator << 4) | destination = (TUNER1 3 << 4) | TV 0. SAMSUNG is logical
+#         address 3 at physical address 1.0.0.0 in Device_Config_Add_Network.yaml, and the
+#         television answers on LogicalAddress::TV == 0, claimed by allocateLAforTV(). Directed
+#         rather than broadcast because <CEC Version> is the reply to a <Get CEC Version> request
+#         addressed to a device; process(CECVersion) is the one handler in this family that guards
+#         neither direction, which is why the addressing has to be right in the document.
+#   0x9E  CEC_VERSION.
+#   0x05  Version::V_1_4 (Operands.hpp Version). Version::toString renders it "Version 1.4", which
+#         is the value getDeviceList reports as this peer's cecVersion, and it agrees with the
+#         cec_version: "1.4" that Device_Config_Add_Network.yaml declares for SAMSUNG.
 #
-# The filename is part of the contract. utils.HDMICEC_CMD_BASE resolves to this directory,
-# so a test case posts the bare name "Device_CEC_Message.yaml" against it; note the
-# upper-case CEC and the distinction from Device_CEC_Message_Userdef.yaml. A mismatch
-# returns not-found and disables that step of the case without failing it.
+# The filename is part of the contract. utils.HDMICEC_CMD_BASE resolves to this directory, so a
+# test case posts the bare name "Device_CEC_Message.yaml" against it; note the upper-case CEC and
+# the distinction from Device_CEC_Message_Userdef.yaml, which injects an <Active Source>. A
+# mismatch returns not-found and disables that step of the case without failing it.
 HdmiCec:
   command: cec_message
-  description: Send a CEC message
+  description: Inject CECVersion (CEC opcode 0x9E) - SAMSUNG (LA=3) reports CEC 1.4 to the sink
   message:
-    user_defined: false
-    source: "SAMSUNG"
-    destination: "VAUDIO"
-    opcode: "CecVersion"
-    type: "Direct"
-    payload: ["cec_version"] # Optional parameters for the CEC message
+    user_defined: true
+    payload: ["0x30", "0x9E", "0x05"]

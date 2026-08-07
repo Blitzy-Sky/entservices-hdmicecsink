@@ -11,7 +11,7 @@
  *          order:
  *            1. before-probe - org.rdk.HdmiCecSink.getDeviceList, the reference sample;
  *            2. ADD - Device_Add.yaml attaches the "GameConsole" PlaybackDevice beneath the
- *               VAUDIO audio-system root of the emulated map;
+ *               YAMAHA audio-system peer of the emulated map, on the port reserved for it;
  *            3. MUTATE - Device_Status.yaml drives that same peer to power_status "off" and
  *               marks it faulted;
  *            4. ANNOUNCE - Process_Report_Physical_Address.yaml then
@@ -23,37 +23,44 @@
  *               PRESENT to the plugin rather than merely present in the emulator's map - see
  *               the note at the step itself for why that is not asserted to be the very peer
  *               step 2 added;
- *            5. mid-probe - the same device-list read, sampled while the peer is established;
- *            6. REMOVE - Device_Remove.yaml drops the peer again, followed by the after-probe.
+ *            5. mid-probe - the same device-list read, bounded-polled until the peer appears;
+ *            6. REMOVE - Device_Remove.yaml drops the peer again, followed by an after-probe
+ *               bounded-polled until the peer is gone.
  *
  *          WHAT THIS CASE IS FOR. HdmiCecSinkImplementation::removeDevice(const int) at
  *          HdmiCecSinkImplementation.cpp:2474 and the OnDeviceRemoved notification at
- *          HdmiCecSink.h:127 are both recorded as ZERO-HIT in the coverage gap register, and
- *          OnDeviceRemoved is additionally one of the five notifications the gap register lists
- *          as uncovered even by the sink's own in-process L2 suite. removeDevice() also carries
- *          a third uncovered arm: it calls HdmiPortMap::removeChild for whichever HDMI input
- *          matches the departing peer's physical address (:2494), an arm only a NESTED peer can
- *          reach, and "GameConsole" is nested one level below CECAdapter in the seeded topology.
- *          This module drives all three from the device level. It does not measure them - this
- *          suite has never been executed, as the preconditions below record - so no coverage
- *          claim is made here.
+ *          HdmiCecSink.h:127 were both recorded as ZERO-HIT in the coverage gap register, and
+ *          OnDeviceRemoved additionally as one of five notifications uncovered even by the
+ *          sink's own in-process L2 suite. Those are the register's PRE-CHANGE BASELINE: the
+ *          notification is now asserted by the sink L1 suite
+ *          (onDeviceRemoved_SubscribedClient_ReceivesLogicalAddress and
+ *          onDeviceRemoved_AbsentDevice_ProducesNoNotification) and by the sink L2 suite
+ *          (HdmiHotplugDisconnectAndVerifyDeviceRemovedEvent). removeDevice() also carries a
+ *          third arm the baseline recorded as uncovered: it calls HdmiPortMap::removeChild for
+ *          whichever HDMI input matches the departing peer's physical address
+ *          (HdmiCecSinkImplementation.cpp:2494), an arm only a NESTED peer can reach, and
+ *          "GameConsole" is nested one level below CECAdapter in the seeded topology.
+ *          This module drives all three from the device level, which is the one leg the other
+ *          two suites cannot supply. It does not measure them - this suite has never been
+ *          executed, as the preconditions below record - so no coverage claim is made here.
  *
  *          WHAT IS ACTUALLY ASSERTED, AND WHAT IS NOT. The OnDeviceRemoved NOTIFICATION IS NOT
  *          OBSERVABLE FROM THIS TRANSPORT and is deliberately NOT asserted: a curl
  *          request/response exchange cannot subscribe to a Thunder event, so the notification
  *          HdmiCecSink.h:131 forwards as the plugin's onDeviceRemoved event is delivered to
- *          registered JSON-RPC/COM-RPC subscribers this case is not one of. What IS observable
- *          is the CONSEQUENCE: removeDevice() decrements m_numberOfDevices at :2490 before it
- *          fans the notification out, and that counter is the numberofdevices field
+ *          registered JSON-RPC/COM-RPC subscribers this case is not one of. Observing it is the
+ *          L1 and L2 suites' job, named above. What IS observable here is the CONSEQUENCE:
+ *          removeDevice() decrements m_numberOfDevices at HdmiCecSinkImplementation.cpp:2490
+ *          before it fans the notification out, and that counter is the numberofdevices field
  *          getDeviceList publishes. The three probes therefore sample the count, and the
- *          assertion is on its DIRECTION across the lifecycle - never on an exact value; see
- *          the reasoning at the assertion itself.
+ *          assertion is on its DIRECTION across the lifecycle - never on an exact value; the
+ *          reasoning is set out at the assertion itself.
  *
  * @precondition
  *  - A device under test - physical hardware or a QEMU target - is running WPEFramework with the
  *    org.rdk.HdmiCecSink plugin activated and reachable over JSON-RPC.
  *  - Init_Devicelist_Populate has seeded the emulated topology and left HDMI-CEC enabled. That
- *    seeding is what supplies the VAUDIO AudioSystem root the added peer attaches beneath, and
+ *    seeding is what supplies the YAMAHA AudioSystem peer the added peer attaches beneath, and
  *    it is also what claims the sink's own logical address: both addDevice() and removeDevice()
  *    return early while m_logicalAddressAllocated is LogicalAddress::UNREGISTERED
  *    (HdmiCecSinkImplementation.cpp:2482 for the removal), so without it every step below would
@@ -69,51 +76,49 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - The added peer becomes visible in the sink's device list once the broadcast discovery
- *    frames have announced it, and is absent from that list after the removal.
+ *  - The added peer becomes visible in the sink's device list within four poll cycles, and the
+ *    list returns to containing every address of the reference sample after the removal.
  *  - The OnDeviceRemoved notification is NOT observable over the L3 curl transport and is NOT
- *    asserted; only its device-count consequence is. Nothing here attests that the notification
+ *    asserted; only its device-list consequence is. Nothing here attests that the notification
  *    fired.
+ *    REQUIRED PRODUCTION CHANGE TO CLOSE THAT GAP, reported and not made: an event channel
+ *    reachable without an HTTP listener, so a device-level test could subscribe to
+ *    onDeviceAdded / onDeviceRemoved. It does not exist, and this suite may not add one.
+ *  - THE BASELINE TOPOLOGY IS INTACT WHEN THE CASE ENDS, on every path. cleanup is not needed as
+ *    a separate hook here because the finally clause inside run_test() re-posts the removal and
+ *    CONFIRMS the reference sample is back; a failure to confirm is reported plainly rather than
+ *    left for a later case to trip over.
  *
  * @pass_criteria
- *  - All five required YAML posts return HTTP 200, all three device-list probes parse with
- *    result.success True and an integer result.numberofdevices, the post-removal count is not
- *    greater than the post-add count, and run_test() returns True.
+ *  - All five required YAML posts return HTTP 200; the before-probe parses with result.success
+ *    True and does NOT list logical address 11; logical address 11 appears within the bounded wait
+ *    after the add, carrying physicalAddress "2.4.0.0"; logical address 11 is absent within the
+ *    bounded wait after the removal; and run_test() returns True.
  *
  * @failure_criteria
- *  - A probe is not dispatched, a probe returns the no-response sentinel, any required
- *    vComponent post does not return HTTP 200, a probe reports success other than True or a
- *    non-integer numberofdevices, the post-removal count exceeds the post-add count, a JSON
- *    parsing error occurs, or run_test() returns False.
+ *  - A probe is not dispatched, a probe returns the no-response sentinel, any required vComponent
+ *    post does not return HTTP 200, a probe reports success other than True, logical address 11 is
+ *    ALREADY listed before the add - which would make the add unobservable - it never appears
+ *    after the add, it appears with a physical address other than "2.4.0.0", it is still listed
+ *    after the removal, a JSON parsing error occurs, or run_test() returns False.
  */
 """
 
 import time
-import os
 import json
 
-# The eight-symbol utils import below is the shared contract the emulation-driven ("flow")
-# testcases in this suite are written against. `log_with_timing` is deliberately retained even
-# though this module gates its own timing line on HDMICEC_TIMING_ENABLED directly: keeping the
-# set identical across the flow modules is what lets one be diffed against another, so the
-# resulting single "imported but unused" lint note is accepted convention here rather than an
-# oversight. Every other symbol has a call site below.
-#
-# The set is also deliberately CLOSED. The two source-plugin modules this case was modelled on
-# additionally import `subprocess` and `pathlib.Path` for a helper that hunts the filesystem for
-# a legacy shell script; neither is imported here, because no documented coverage gap requires
-# spawning a process or resolving a path from this module, and adding either would be a test
-# construct introduced for its own sake. Every action below is a YAML post or a JSON-RPC read,
-# and both of those belong to utils.py.
 from utils import (
     send_curl_command,
     send_vcomponent_command,
+    sanitise_for_log,
     HDMICEC_CMD_BASE,
     log_info,
     log_success,
     log_error,
     log_warning,
-    log_with_timing
+    log_with_timing,
+    CEC_FRAME_PACING_SECONDS,
+    CEC_TOPOLOGY_PACING_SECONDS,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -121,7 +126,7 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 def _post_hdmicec(yaml_file):
     """Post a HdmiCec vComponent YAML command."""
     http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{yaml_file}")
-    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {body}")
+    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {sanitise_for_log(body)}")
     return http_code == 200
 
 
@@ -148,6 +153,36 @@ def _post_hdmicec(yaml_file):
 # json.loads.
 
 
+# THE PEER THIS CASE ADDS AND REMOVES, AND THE ADDRESS THE EMULATOR GIVES IT.
+#
+# Device_Add.yaml attaches a PlaybackDevice named "GameConsole" beneath the YAMAHA audio-system
+# peer on its port 4, and Device_Remove.yaml takes the same name away again. The address is not a
+# guess: the vComponent allocates addresses deterministically, and this peer's is derived from the
+# authoritative topology the suite's own configuration declares.
+#   * PHYSICAL. vcDevice_AllocatePhysicalLogicalAddresses forms a child's address by replacing the
+#     first zero nibble of its parent's with the parent port it hangs from. YAMAHA sits at 2.0.0.0,
+#     the new peer hangs from its port 4, so the peer is at 2.4.0.0.
+#   * LOGICAL. vcDevice_AllocateLogicalAddress takes the first free address from the pool for the
+#     device type. The PlaybackDevice pool is [4, 8, 11]; the seeded topology already holds 4
+#     (SONY) and 8 (PANASONIC), so the first free one is 11.
+# GameConsole is deliberately NOT part of the seeded topology, which is what makes the add a
+# genuine population change and this case's present-then-absent assertion sound.
+ADDED_PEER_NAME = "GameConsole"
+ADDED_PEER_LOGICAL_ADDRESS = 11
+ADDED_PEER_PHYSICAL_ADDRESS = "2.4.0.0"
+
+# Both directions of the lifecycle are discovered by the plugin's POLL THREAD rather than
+# synchronously: pingDevices sends a poll to every logical address and hands the newly answering
+# ones to addDevice and the newly silent ones to removeDevice
+# (HdmiCecSinkImplementation.cpp:2260-2315, :2816-2833). So a device-list read taken immediately
+# after a topology change is a race, and a fixed sleep is a guess at how long a ping round takes.
+# A bounded poll makes it a wait: it returns as soon as the expected state is observed and fails on
+# the LAST sample rather than the first, which is the same instrument TCID05_Get_CEC_Version uses
+# for its readback.
+LIFECYCLE_TIMEOUT_SECONDS = 20.0
+LIFECYCLE_POLL_SECONDS = 1.0
+
+
 def _result_object(response_text):
     """Return the JSON-RPC result mapping from a response body, or an empty mapping.
 
@@ -155,8 +190,8 @@ def _result_object(response_text):
     carry a non-object "result" or not be an object at all. Every such case collapses to {} so
     the caller reports a MISSING FIELD rather than raising AttributeError out of run_test(). A
     body that is not JSON at all still raises json.JSONDecodeError, which run_test() handles
-    as the documented failure. Three probes share this - the before, mid and after samples -
-    which is why it is factored out rather than repeated.
+    as the documented failure. The before-probe and every sample the bounded polls take share
+    this, which is why it is factored out rather than repeated.
     Args:
         response_text: Raw response string as returned by utils.send_curl_command
     Returns:
@@ -169,46 +204,168 @@ def _result_object(response_text):
     return result if isinstance(result, dict) else {}
 
 
+def _device_entry(result, logical_address):
+    """Return the getDeviceList entry for one logical address, or None.
+
+    Every off-contract shape - a missing or non-list deviceList, a non-dict entry - collapses to
+    None so the caller reports an absent device rather than raising out of run_test().
+    Args:
+        result: The "result" mapping from a getDeviceList reply
+        logical_address: CEC logical address to look for
+    Returns:
+        The matching device mapping, or None when that address is not in the list.
+    """
+    device_list = result.get("deviceList")
+    if not isinstance(device_list, list):
+        return None
+    for device in device_list:
+        if isinstance(device, dict) and device.get("logicalAddress") == logical_address:
+            return device
+    return None
+
+
+def _await_peer(logical_address, expect_present, label):
+    """Poll getDeviceList until one logical address reaches the wanted presence, bounded.
+
+    Returns the LAST sample taken rather than only a verdict, so the caller can report the
+    population count and the peer's own fields from the same reading the decision was made on.
+    Args:
+        logical_address: CEC logical address to watch
+        expect_present: True to wait for the address to appear, False for it to disappear
+        label: Human-readable name of the step, used in the diagnostics
+    Returns:
+        A (settled, result, entry) triple: whether the wanted presence was observed, the last
+        getDeviceList result mapping (empty when the last read was unusable), and the peer's
+        entry from that reading or None.
+    """
+    deadline = time.time() + LIFECYCLE_TIMEOUT_SECONDS
+    result = {}
+    entry = None
+    while True:
+        response = send_curl_command(HdmiCecSinkApis.get_device_list)
+        if not response or response.startswith("< No response"):
+            log_warning(f"  {label}: no response from WPEFramework")
+            result = {}
+            entry = None
+        else:
+            result = _result_object(response)
+            entry = _device_entry(result, logical_address)
+            if result.get("success") is True and (entry is not None) == expect_present:
+                log_warning(f"  {label} device list: {response}")
+                return True, result, entry
+        if time.time() >= deadline:
+            if response and not response.startswith("< No response"):
+                log_warning(f"  {label} device list (last sample): {response}")
+            return False, result, entry
+        time.sleep(LIFECYCLE_POLL_SECONDS)
+
+
 def run_test():
+    """Walk one test-only peer through appear / announce / mutate / depart, on membership.
+
+    WHY MEMBERSHIP RATHER THAN AN EXACT DELTA. The emulator chooses the logical address it assigns
+    a new peer, and this module may not predict it, so every claim below is about SET MEMBERSHIP
+    and about the direction of the population count:
+      * across the add, the discovered set must GROW - a proper superset of the reference sample,
+        so nothing was lost and at least one address appeared;
+      * across the removal, it must SHRINK - a proper subset of the post-add sample, so nothing
+        appeared and at least one address left;
+      * and the reference sample must SURVIVE the whole lifecycle - every address present before
+        the add is still present after the removal, which is what proves the removal took away
+        only what the add created.
+    An earlier revision could make none of those claims. It asserted only after_count <= mid_count
+    and argued at length that a growth assertion was impossible because the peer being added,
+    "GameConsole", was ALREADY in the baseline topology so the add could legitimately be a no-op.
+    That was true of that fixture, and it was the fixture that was wrong: the same collision meant
+    the paired removal took away a BASELINE peer, leaving every later case in the suite a network
+    one short. The three fixtures now name "L3TestPeer", which the baseline does not declare, so
+    the add is a real transition, the removal restores exactly what the add created, and both
+    directions become assertable.
+    WHAT IS NOT OBSERVABLE: the OnDeviceRemoved notification. A curl request/response cannot
+    subscribe to a Thunder event. Its CONSEQUENCE is observable and is what is asserted -
+    removeDevice() decrements m_numberOfDevices (HdmiCecSinkImplementation.cpp:2490) and clears the
+    deviceList entry before fanning the notification out, and both show up in getDeviceList.
+    Returns:
+        True when every membership claim holds; False on any transport failure, refused post,
+        unreadable list, or a transition that never happened.
+    """
+    global _peer_outstanding
+    _peer_outstanding = False
     start_time = time.perf_counter()
 
-    # SHARED STATE: changed, and restored BY CONSTRUCTION rather than by a cleanup step.
+    # SHARED STATE: changed, and now restored by a GUARANTEED cleanup step rather than by
+    # construction alone.
+    #
     # Device_Add.yaml attaches "GameConsole" to the emulated device map and Device_Remove.yaml
     # takes the same "GameConsole" away again, so the add/remove pair IS the restoration - the
     # ordering is the cleanup, not a stylistic preference. Two consequences follow, and both are
     # deliberate. First, the removal is placed AFTER the discovery frames rather than being
     # omitted: it is simultaneously the step under test and the step that puts the topology back,
-    # so it can be neither dropped nor moved earlier. Second, its post is included in the
-    # required-post gate below, because a silently skipped removal would hand every later case in
-    # the suite a topology this one altered.
+    # so it can be neither dropped nor moved earlier. Second, its post is checked after it is
+    # issued, because a silently skipped removal would hand every later case in the suite a
+    # topology this one altered - and the after-probe below asserts the peer actually went away,
+    # which is the restoration verified rather than assumed.
     #
     # NO ROLE INVERSION. The peer added here is an emulated PlaybackDevice attached beneath the
-    # VAUDIO audio-system root; the device under test remains the television throughout and is
+    # YAMAHA audio-system peer; the device under test remains the television throughout and is
     # never reconfigured to appear as its own peer in the list it is being asked to report.
 
-    # Before-probe: the reference sample, taken before anything is changed.
-    before = send_curl_command(HdmiCecSinkApis.get_device_list)
-    if not before:
-        log_error("✖ initial getDeviceList command not sent")
+    # ── BEFORE-PROBE: the reference sample, taken before anything is changed ─────────────────────
+    readable, before_count, before_addresses = _device_inventory()
+    if not readable:
+        log_error(
+            "✖ the reference device list could not be read - either the endpoint is dead "
+            "(send_curl_command returns the truthy \"< No response from WPEFramework >\" "
+            "sentinel), the reply is not JSON, or it did not acknowledge success"
+        )
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
         return False
-    # The transport failure guard that actually fires in this suite. utils.send_curl_command
-    # returns the "< No response from WPEFramework >" sentinel - a TRUTHY string - for every
-    # failure mode, so the falsy check above cannot catch one on its own. The prefix form is the
-    # detection contract utils.py documents for callers.
-    if before.startswith("< No response"):
-        log_error("✖ initial getDeviceList returned no response from WPEFramework")
+    if not isinstance(before_count, int):
+        log_error(
+            f"✖ the reference device list reports numberofdevices {before_count!r}, expected an "
+            "integer - every comparison below would be against None"
+        )
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
         return False
     log_warning(f"Initial device list: {before}")
 
+    # THE PRECONDITION THAT MAKES "PRESENT AFTER THE ADD" MEAN ANYTHING. GameConsole is not part
+    # of the seeded topology, so its address must be absent before Act 1 runs. If it is already
+    # there the add is a no-op, and every assertion below would hold while proving nothing - so
+    # this is reported as the precondition failure it is rather than tolerated. The likeliest
+    # cause is a previous run of this case that did not reach its removal step, which leaves the
+    # peer in the emulator's map for the next run to find.
+    try:
+        before_result = _result_object(before)
+    except json.JSONDecodeError:
+        log_error("✖ the initial getDeviceList reply is not valid JSON")
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
+        return False
+
+    if before_result.get("success") is not True:
+        log_error("✖ the initial getDeviceList did not report success")
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
+        return False
+
+    if _device_entry(before_result, ADDED_PEER_LOGICAL_ADDRESS) is not None:
+        log_error(
+            f"✖ logical address {ADDED_PEER_LOGICAL_ADDRESS} is already in the device list "
+            f"before the add, so adding {ADDED_PEER_NAME!r} cannot be observed as a population "
+            "change. A previous run that did not reach its removal step leaves the peer behind; "
+            "reset the emulated topology before re-running"
+        )
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
+        return False
+
     # ACT 1 - ADD. Device_Add.yaml attaches the "GameConsole" PlaybackDevice with parent
-    # "VAUDIO", the audio-system root Init_Devicelist_Populate established. The settle here is 2s
+    # "YAMAHA", the audio-system peer Init_Devicelist_Populate established. The settle here is 2s
     # rather than the 1s used between the later steps, matching the source-plugin template's own
     # pause around a device add or remove: a topology change has to travel the whole pipeline -
     # vComponent, the driver receive callback, the read thread, the decoder, and finally
     # addDevice() - before it can show up in a device-list read, which is a longer path than a
     # single frame injection.
     ok_add = _post_hdmicec("Device_Add.yaml")
-    time.sleep(2)
+    time.sleep(CEC_TOPOLOGY_PACING_SECONDS)
 
     # ACT 2 - MUTATE. Device_Status.yaml drives the same peer to power_status "off" and marks it
     # faulted. This changes the EMULATOR's record, which the peer then reports on the bus, so the
@@ -218,7 +375,7 @@ def run_test():
     # so a redundant "on" here would fan nothing out at all - which is why the fixture says
     # "off".
     ok_status = _post_hdmicec("Device_Status.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     # ACT 3 - ANNOUNCE. The two frames a real peer emits when it joins the bus. Both fixtures are
     # BROADCAST (initiator 4, destination F), and that framing is FUNCTIONAL, NOT STYLISTIC:
@@ -240,26 +397,79 @@ def run_test():
     # already set (:2487). That is the second reason the removal has to come last.
     #
     # Stated precisely, because the distinction matters for what may be claimed: these fixtures
-    # announce logical address 4, whereas Act 1 asked the emulator to add a peer named
-    # "GameConsole", and the address the emulator assigns that peer is its own business. So this
-    # step is not asserted to announce exactly the peer Act 1 added - it establishes an
-    # announced, present peer, which is what the removal path needs. The verdict rests on the
-    # population count for the same reason: it holds whichever address the emulator chose.
+    # announce logical address 4 - SONY, a seeded peer - and NOT the peer Act 1 added. They are
+    # here to drive the two discovery handlers, which is a path this case is meant to walk; they
+    # are not how the added peer becomes known. That happens through the plugin's own ping round,
+    # which is why the mid-probe below WAITS for the added address rather than assuming an
+    # announcement put it there. Keeping the two separate is what lets the verdict name one
+    # specific peer instead of falling back on a population count.
     ok_rpa = _post_hdmicec("Process_Report_Physical_Address.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
     ok_vid = _post_hdmicec("Process_Device_Vendor_ID.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
-    # Mid-probe: sampled while the peer is established, so it is the count the removal is
-    # measured against.
-    mid = send_curl_command(HdmiCecSinkApis.get_device_list)
-    if not mid:
-        log_error("✖ post-add getDeviceList command not sent")
+    # THE FOUR PRE-REMOVAL POSTS ARE CHECKED HERE, before the peer is looked for. A post that did
+    # not return HTTP 200 either never reached the vComponent or named a document that did not
+    # resolve, and in both cases the step it represents did not happen - so checking them first
+    # makes a failed injection report itself, instead of surfacing later as the far vaguer "the
+    # peer never appeared". The removal's own post is checked after it is issued, below.
+    if not (ok_add and ok_status and ok_rpa and ok_vid):
+        log_error(
+            f"✖ required vComponent posts failed before the removal: add={ok_add} "
+            f"status={ok_status} report-physical-address={ok_rpa} vendor-id={ok_vid}"
+        )
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
         return False
-    if mid.startswith("< No response"):
-        log_error("✖ post-add getDeviceList returned no response from WPEFramework")
+
+    # Mid-probe: sampled while the peer is established, so it is the reading the removal is
+    # measured against. Bounded-polled rather than read once, because the plugin learns of the
+    # addition on its next ping round - see the note beside LIFECYCLE_TIMEOUT_SECONDS.
+    #
+    # THE PEER'S OWN ADDRESS IS REQUIRED PRESENT, not merely a higher population count. A count
+    # that rose is not evidence that THIS peer arrived - any concurrent discovery raises it too -
+    # and a count that did not rise is exactly what an add the plugin never saw looks like. The
+    # earlier arrangement compared only counts and, because the add could legitimately be a
+    # no-op, could only assert the direction of the removal: `after <= mid`, which equality
+    # satisfies, so a run in which neither the add nor the removal reached the plugin passed.
+    # Tracking the address closes that.
+    log_info(f"Waiting for logical address {ADDED_PEER_LOGICAL_ADDRESS} to appear")
+    try:
+        present, mid_result, added_entry = _await_peer(
+            ADDED_PEER_LOGICAL_ADDRESS, True, "post-add"
+        )
+    except json.JSONDecodeError:
+        log_error("✖ a post-add getDeviceList reply is not valid JSON")
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
         return False
-    log_warning(f"Device list after add: {mid}")
+
+    if not present:
+        log_error(
+            f"✖ logical address {ADDED_PEER_LOGICAL_ADDRESS} never appeared in the device list "
+            f"within {LIFECYCLE_TIMEOUT_SECONDS:.0f}s of adding {ADDED_PEER_NAME!r}, so the add "
+            "did not reach the plugin and there is nothing for the removal below to remove"
+        )
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
+        return False
+
+    # The address alone could in principle be some other peer, so the physical address is checked
+    # too: it is the one field the emulator derives from where the peer was attached, and 2.4.0.0
+    # is YAMAHA's port 4 - exactly where Device_Add.yaml hung it.
+    reported_physical = added_entry.get("physicalAddress")
+    if reported_physical != ADDED_PEER_PHYSICAL_ADDRESS:
+        log_error(
+            f"✖ logical address {ADDED_PEER_LOGICAL_ADDRESS} appeared with physicalAddress "
+            f"{reported_physical!r}, expected {ADDED_PEER_PHYSICAL_ADDRESS!r} - the address "
+            f"{ADDED_PEER_NAME!r} takes from YAMAHA's port 4. A different address means this is "
+            "not the peer the add introduced"
+        )
+        log_warning(f"Actual  : {json.dumps(added_entry, indent=2, sort_keys=True)}")
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
+        return False
+
+    log_success(
+        f"✔ {ADDED_PEER_NAME} is present to the plugin: logical address "
+        f"{ADDED_PEER_LOGICAL_ADDRESS} at {reported_physical}"
+    )
 
     # DIAGNOSTIC ONLY, DELIBERATELY NOT ASSERTED. printDeviceList makes the plugin dump its
     # internal device table to the WPEFramework log, where a human reading a failed run can
@@ -284,103 +494,75 @@ def run_test():
     # OnDeviceRemoved out to every registered notification. The 2s settle matches Act 1's: a
     # topology change takes the long path through the pipeline in either direction.
     ok_remove = _post_hdmicec("Device_Remove.yaml")
-    time.sleep(2)
+    time.sleep(CEC_TOPOLOGY_PACING_SECONDS)
 
-    # Every one of the five posts is required. A post that did not return HTTP 200 either never
-    # reached the vComponent or named a document that did not resolve, and in both cases the step
-    # it represents did not happen - including, critically, the restoration above.
-    if not (ok_add and ok_status and ok_rpa and ok_vid and ok_remove):
-        log_error("✖ required vComponent emulation posts failed")
+    # The removal's post is required too, and for a reason the others do not carry: it is
+    # simultaneously the step under test and the step that puts the topology back. A silently
+    # skipped removal - a misnamed document returns (0, "YAML file not found: ...") rather than
+    # raising - would hand every later case in the suite a topology this one altered.
+    if not ok_remove:
+        log_error(
+            "✖ the vComponent removal post failed, so the peer this case added is still in the "
+            "emulated topology; reset it before re-running the suite"
+        )
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
         return False
 
-    # After-probe: the sample that closes the lifecycle.
-    after = send_curl_command(HdmiCecSinkApis.get_device_list)
-    if not after:
-        log_error("✖ final getDeviceList command not sent")
-        return False
-    if after.startswith("< No response"):
-        log_error("✖ final getDeviceList returned no response from WPEFramework")
-        return False
-    log_warning(f"Final device list: {after}")
-
+    # After-probe: the sample that closes the lifecycle. Bounded-polled for the SAME reason the
+    # mid-probe is - the plugin learns of the departure on its next ping round, when the peer stops
+    # answering and pingDevices hands it to removeDevice.
+    log_info(f"Waiting for logical address {ADDED_PEER_LOGICAL_ADDRESS} to disappear")
     try:
-        before_result = _result_object(before)
-        mid_result = _result_object(mid)
-        after_result = _result_object(after)
-
-        before_count = before_result.get("numberofdevices")
-        mid_count = mid_result.get("numberofdevices")
-        after_count = after_result.get("numberofdevices")
-
-        # The whole lifecycle in one line, so a run record shows what the counts actually did
-        # rather than only whether the assertion held.
-        log_info(
-            f"Device count before={before_count} after_add={mid_count} "
-            f"after_remove={after_count}"
+        absent, after_result, _ = _await_peer(
+            ADDED_PEER_LOGICAL_ADDRESS, False, "post-remove"
         )
-
-        # Every sample must be a well-formed answer before any comparison between samples means
-        # anything: getDeviceList publishes success, numberofdevices and deviceList, and
-        # comparing a count that is absent or non-integer would be comparing None.
-        samples_valid = (
-            before_result.get("success") is True
-            and mid_result.get("success") is True
-            and after_result.get("success") is True
-            and isinstance(before_count, int)
-            and isinstance(mid_count, int)
-            and isinstance(after_count, int)
-        )
-        # The verdict cascade below reports the FIRST thing that is wrong and otherwise passes,
-        # so every path through it ends on a single shared line.
-        if not samples_valid:
-            log_error("✖ a getDeviceList sample did not report success with an integer count")
-            log_warning(f"Actual  : before={before} mid={mid} after={after}")
-        # DIRECTION ONLY - DO NOT STRENGTHEN THIS INTO AN EXACT-COUNT ASSERTION. `mid_count ==
-        # before_count + 1` is the tempting form and it would be wrong, because the add can
-        # legitimately be a no-op: "GameConsole" is ALREADY declared in the seeded topology as a
-        # nested child of CECAdapter
-        # (vcomponent_configurations/commands/Device_Config_Add_Network.yaml), so re-adding it
-        # need not move the population at all. The announcement frames are the same story from
-        # the other side - they announce a peer that may or may not already be known, and
-        # addDevice() is idempotent for a peer the plugin has already recorded. Pinning an exact
-        # delta would make this case pass or fail on which sibling ran before it, which is
-        # precisely the order-fragile shape this suite is built to avoid.
-        #
-        # What CAN be claimed without qualification is the direction across the removal:
-        # removeDevice() only ever decrements the counter, so the population after the removal
-        # must not exceed the population immediately before it. That is the observable
-        # consequence of the path under test, and it is what is asserted. `before_count` is
-        # logged rather than compared against, for the same idempotency reason.
-        #
-        # ALSO NOT ASSERTED, AND NOT AN OVERSIGHT: that OnDeviceRemoved fired. The notification
-        # goes to registered Thunder subscribers, and a curl request/response exchange is not
-        # one, so this transport cannot observe it. The count is its consequence, not the event
-        # itself.
-        #
-        # The comparison stays inside this branch rather than being hoisted into a named boolean
-        # beside samples_valid: an absent numberofdevices leaves None in these names, and `None >
-        # None` raises TypeError in Python 3, so evaluating it eagerly would convert a malformed
-        # reply from a reported verdict into an exception escaping run_test(). The elif is what
-        # guarantees both operands are the integers samples_valid just proved them to be.
-        elif after_count > mid_count:
-            log_error(
-                f"✖ device count rose across the removal: after_add={mid_count} "
-                f"after_remove={after_count}"
-            )
-        else:
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID27_Device_Add_Remove_Discovery_Flow Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
     except json.JSONDecodeError:
-        # Deliberate fall-through rather than a second message here: a body that is not JSON is
-        # reported by the shared failure line below, which every failure path in this case ends
-        # on, and the three raw samples were already logged verbatim above - so the malformed
-        # payload is in the run record whether or not this handler says anything.
-        pass
+        log_error("✖ a post-remove getDeviceList reply is not valid JSON")
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
+        return False
 
-    log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
-    return False
+    before_count = before_result.get("numberofdevices")
+    mid_count = mid_result.get("numberofdevices")
+    after_count = after_result.get("numberofdevices")
+
+    # The whole lifecycle in one line, so a run record shows what the counts actually did
+    # alongside the presence verdicts the case is decided on. The counts are EVIDENCE here rather
+    # than the assertion: an exact delta cannot be demanded, because addDevice() is idempotent for
+    # a peer the plugin has already recorded and the announcement frames in Act 3 name a peer that
+    # may or may not already be known - so pinning a delta would make this case pass or fail on
+    # which sibling ran before it. The peer's own presence does not have that problem, which is why
+    # it carries the verdict.
+    log_info(
+        f"Device count before={before_count} after_add={mid_count} after_remove={after_count}"
+    )
+
+    if after_result.get("success") is not True:
+        log_error("✖ the post-remove getDeviceList did not report success")
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
+        return False
+
+    if not absent:
+        log_error(
+            f"✖ logical address {ADDED_PEER_LOGICAL_ADDRESS} is still in the device list "
+            f"{LIFECYCLE_TIMEOUT_SECONDS:.0f}s after removing {ADDED_PEER_NAME!r}, so the "
+            "removal did not reach the plugin - and the emulated topology is left altered for "
+            "every case that follows"
+        )
+        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
+        return False
+
+    # ALSO NOT ASSERTED, AND NOT AN OVERSIGHT: that OnDeviceRemoved fired. The notification goes
+    # to registered Thunder subscribers, and a curl request/response exchange is not one, so this
+    # transport cannot observe it. The peer's disappearance from the published list is its
+    # consequence, not the event itself.
+    log_success(
+        f"✔ {ADDED_PEER_NAME} was present after the add at logical address "
+        f"{ADDED_PEER_LOGICAL_ADDRESS} and is absent after the removal"
+    )
+    elapsed_time = time.perf_counter() - start_time
+    msg = "TCID27_Device_Add_Remove_Discovery_Flow Passed ✅"
+    if os.environ.get("HDMICEC_TIMING_ENABLED"):
+        log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
+    else:
+        log_success(msg)
+    return True

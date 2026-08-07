@@ -58,10 +58,6 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# The six names above are the pinned helper contract every case in this directory imports as
-# one set. log_with_timing belongs to it and returns a decorated message rather than printing
-# one; this case applies the same HDMICEC_TIMING_ENABLED decoration inline on its pass path.
-
 
 def run_test():
     start_time = time.perf_counter()

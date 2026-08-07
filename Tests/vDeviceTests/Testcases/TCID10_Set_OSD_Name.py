@@ -9,10 +9,13 @@
  *          value straight back with org.rdk.HdmiCecSink.getOSDName. The pre-existing name is
  *          captured and logged before anything is written, so the run record shows the
  *          transition rather than only the end state. A reply that merely reports success is
- *          not accepted as proof on its own; the read-back is what makes this an assertion.
+ *          not accepted as proof on its own; the read-back is what makes this an assertion, and
+ *          the read-back is compared for EQUALITY against the value the request sent rather
+ *          than merely for being a non-empty string - an OSD name is a persistent device
+ *          setting, so a non-empty reading is also what a discarded write would leave behind.
  *
  *          RESIDUAL STATE IS DELIBERATE AND DOCUMENTED. This case leaves the OSD name at the
- *          deterministic value the HdmiCECSink_Curl.set_osd_name constant encodes instead of
+ *          deterministic value HdmiCECSink_Curl.SET_OSD_NAME_VALUE holds instead of
  *          writing the captured baseline back, because that module publishes exactly one
  *          set_osd_name constant carrying one fixed name and no inverse, and because
  *          hand-building a JSON-RPC payload here to synthesise a restore is refused. The
@@ -36,16 +39,19 @@
  *
  * @expected_result
  *  - setOSDName answers {"jsonrpc":"2.0","id":42,"result":{"success":true}} and the following
- *    getOSDName reports success together with a non-empty OSD name string.
+ *    getOSDName reports success together with an OSD name EQUAL to the value the request
+ *    carried - HdmiCECSink_Curl.SET_OSD_NAME_VALUE, imported rather than restated here.
  *
  * @pass_criteria
  *  - The setOSDName reply equals the expected
- *    {"jsonrpc":"2.0","id":42,"result":{"success":true}} payload, the read-back reports a
- *    matching string, and run_test() returns True.
+ *    {"jsonrpc":"2.0","id":42,"result":{"success":true}} payload, the read-back reports success
+ *    with name == HdmiCECSink_Curl.SET_OSD_NAME_VALUE exactly, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, an unreachable endpoint, a read-back carrying
- *    success false or an empty name, JSON parsing error, or run_test() returns False.
+ *  - Response mismatch, command failure, an unreachable endpoint, a read-back carrying success
+ *    false, an absent or empty name, or ANY name other than the one written - a stale name a
+ *    previous run left behind is a failure, not a pass - JSON parsing error, or run_test()
+ *    returns False.
  */
 """
 
@@ -99,9 +105,10 @@ def run_test():
 
     Returns:
         True only when setOSDName answered with the expected success envelope AND the
-        subsequent getOSDName reported success together with a non-empty name string. False
-        on a command that could not be sent, an unreachable endpoint, an unexpected reply, an
-        unusable read-back, or a JSON parsing error.
+        subsequent getOSDName reported success with a name equal to
+        HdmiCECSink_Curl.SET_OSD_NAME_VALUE, the value the request carried. False on a command
+        that could not be sent, an unreachable endpoint, an unexpected reply, an unusable
+        read-back, a name other than the one written, or a JSON parsing error.
     '''
     start_time = time.perf_counter()
 
@@ -193,13 +200,34 @@ def run_test():
             log_error("TCID10_Set_OSD_Name Failed ❌")
             return False
 
-        # The read-back asserts SHAPE - success true and a non-empty name string - not a pinned
-        # name literal. That literal is encoded in the sibling HdmiCECSink_Curl.set_osd_name
-        # constant; repeating it here would couple two deliberately decoupled modules and would
-        # fail this case on a constant change that is not a plugin defect.
+        # THE READ-BACK MUST EQUAL WHAT THIS CASE WROTE, EXACTLY.
+        #
+        # A non-empty-string check is not a verification of this case's write: the OSD name is
+        # a persistent device setting, so whatever a previous run or a previous case left
+        # behind is also a non-empty string, and so is a name the plugin never changed. The
+        # check would pass with the write silently discarded, which is the one outcome this
+        # case exists to detect.
+        #
+        # The literal is NOT repeated here. HdmiCECSink_Curl.SET_OSD_NAME_VALUE is the value the
+        # request above sends, exported by the module that sends it, and imported here - so the
+        # write and the expectation are two uses of one constant rather than two copies of one
+        # string. That is what makes the comparison safe against a constant change: change the
+        # name there and this case demands the new name, in one edit. Coupling the two modules
+        # on the VALUE is the point; the alternative was decoupling them into disagreement.
+        #
+        # Compared verbatim rather than normalised, because the plugin returns it verbatim:
+        # OSDName::toString() in hdmicec/ccec/include/ccec/Operands.hpp returns the stored
+        # string unchanged, and this name is 6 characters against an OSDName MAX_LEN of 14, so
+        # nothing is truncated on the way through.
         final_name = readback_result.get("name")
-        if not isinstance(final_name, str) or not final_name.strip():
-            log_error(f"✖ read-back carries no usable OSD name: {final_name!r}")
+        if final_name != HdmiCecSinkApis.SET_OSD_NAME_VALUE:
+            log_error(
+                f"✖ read-back reports OSD name {final_name!r}, expected "
+                f"{HdmiCecSinkApis.SET_OSD_NAME_VALUE!r} - the value setOSDName was asked to "
+                "write. An absent or empty value means the write was not applied; a different "
+                "string means the device kept an earlier name or truncated this one"
+            )
+            log_warning(f"Actual  : {json.dumps(readback_result, indent=2, sort_keys=True)}")
             log_error("TCID10_Set_OSD_Name Failed ❌")
             return False
 

@@ -58,11 +58,6 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# The six-symbol import set above is this suite's shared convention, so log_with_timing is
-# imported even though this case formats its timing line inline; keeping the set uniform means a
-# case that later needs the helper changes no import block. Nothing else belongs here: this
-# module inspects no log, so it needs no process-spawning or file-reading import.
-
 
 def run_test():
     start_time = time.perf_counter()

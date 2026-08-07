@@ -63,14 +63,6 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# The block above is the six-symbol contract every case in this suite is written against, kept
-# intact rather than pruned per case so that every module here presents an identical import
-# block and an added or dropped helper shows up in a diff. log_with_timing has no call site
-# because the pass path applies the HDMICEC_TIMING_ENABLED gate inline - the same gate that
-# helper implements - keeping the decoration visible where the message is emitted. That unused
-# symbol is the module's only static-analysis finding, and this comment is the record of it
-# rather than a suppression pragma.
-
 
 def run_test():
     '''Read the sink's vendor identifier and validate the shape of the response.

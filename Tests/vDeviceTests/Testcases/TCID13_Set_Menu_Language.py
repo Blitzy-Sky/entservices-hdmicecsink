@@ -19,10 +19,24 @@
  *          on the INBOUND user-settings path, and setMenuLanguage forwards its parameter
  *          verbatim without traversing it.
  *
- *          THERE IS NO READ-BACK. The sink interface publishes setMenuLanguage with no
- *          matching getter at any transport, so the applied value cannot be re-read at this
- *          level and no verification of it is claimed. The case asserts exactly what the
- *          transport can observe: the acknowledgement envelope.
+ *          CLASSIFICATION: TRANSPORT-ACCEPTANCE PLUS A NO-SIDE-EFFECT INVARIANT, NOT A
+ *          WRITE/READ-BACK CASE. The applied language cannot be verified at this level and this
+ *          module does not claim otherwise. setCurrentLanguage() stores the value on the sink's own
+ *          device entry (HdmiCecSinkImplementation.cpp:2083) and no published JSON-RPC method
+ *          exposes it; the <Set Menu Language> broadcast that follows is an OUTBOUND frame, and
+ *          this suite's transports cannot read outbound frames - the vComponent API is POST-only,
+ *          with no endpoint that reports what the device under test emitted - nor can they receive
+ *          plugin events, since a Thunder event subscription needs an HTTP listener that a curl
+ *          transport does not have. So two things are asserted, and nothing more is implied: the
+ *          acknowledgement envelope, and that the call left the CEC device inventory untouched.
+ *          The second is a real regression guard rather than a formality - an implementation that
+ *          perturbed the device list while encoding the language would fail it while still
+ *          answering success.
+ *
+ *          WHAT WOULD MAKE THIS A FUNCTIONAL READ-BACK CASE, reported rather than made under AAP
+ *          Directive 6: a published getter for the current menu language on
+ *          Exchange::IHdmiCecSink, or a vComponent endpoint that reports the frames the device
+ *          emitted. Either would let the encoded operand be compared against the request.
  *
  * @precondition
  *  - A device under test - physical hardware or a QEMU target - is reachable and hosts an
@@ -41,21 +55,22 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - The plugin acknowledges the request with {"success": true}. The applied value is not
- *    read back, because the sink exposes no getter for the menu language.
+ *  - The plugin acknowledges the request with {"success": true} and the CEC device inventory is
+ *    identical before and after the call. The applied value is not read back, because the sink
+ *    exposes no getter for the menu language.
  *
  * @pass_criteria
- *  - The reply equals {"jsonrpc":"2.0","id":42,"result":{"success":true}} and run_test()
- *    returns True.
+ *  - The reply equals {"jsonrpc":"2.0","id":42,"result":{"success":true}}, the device inventory
+ *    reads identically before and after, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Response mismatch, command failure, an unreadable device inventory on either side of the
+ *    call, an inventory that changed across it, JSON parsing error, or testcase returns False.
  */
 """
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -66,12 +81,6 @@ from utils import (
     log_with_timing
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
-
-# log_with_timing is imported but not called, which is deliberate rather than an oversight:
-# the timing decoration below is applied inline, exactly as the device-level cases of the
-# companion HDMI-CEC suite apply it - 28 of its 33 cases carry this symbol and none calls it.
-# These six are the shared Testcases import contract, so the symbol is kept for consistency
-# with the sibling cases rather than trimmed to silence one linter finding.
 
 
 def run_test():
@@ -84,6 +93,11 @@ def run_test():
             "success": True
         }
     }
+
+    # Inventory snapshot BEFORE the write, so the invariant below compares two real observations
+    # rather than one observation against an assumption.
+    inventory_readable, before_count, before_addresses = _device_inventory()
+    log_info(f"Device inventory before: {before_count} devices at {before_addresses}")
 
     log_info("Executing the curl command set menu language")
 
@@ -109,25 +123,48 @@ def run_test():
     log_success("✔ curl command sent")
     log_warning(f"Response: {curl_response}")
 
-    # RESIDUAL STATE, DELIBERATELY NOT RESTORED - this is where a finally-block restore would
-    # sit, and its absence is a decision rather than an omission. The menu language is left at
-    # the value the HdmiCECSink_Curl.set_menu_language constant encodes, so the residual is
-    # deterministic: the same value after every run. It is also inert - no other case in this
-    # suite reads the menu language, and the sink publishes no getter through which one could.
-    # Restoring it would mean writing a second language chosen here, and request payloads
-    # belong to the sibling curl module rather than to a test case.
+    # RESIDUAL STATE, REPORTED BECAUSE IT CANNOT BE CONFIRMED AWAY. The menu language is left at
+    # the value HdmiCECSink_Curl.set_menu_language encodes, so the residual is deterministic: the
+    # same value after every run. It is not restored because it cannot be READ - setCurrentLanguage
+    # stores it on the sink's own device entry (HdmiCecSinkImplementation.cpp:2083) and no published
+    # method exposes it - so a restore could neither pick up the previous value nor confirm that it
+    # landed. Writing some other language back would replace one unverifiable residual with another.
+    # The gap and the change it needs are recorded in the classification note in the file docstring.
     try:
-        if json.loads(curl_response) == expected_output_response:
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID13_Set_Menu_Language Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
-        else:
+        if json.loads(curl_response) != expected_output_response:
             log_error("TCID13_Set_Menu_Language Failed ❌")
             return False
+
+        # THE INVARIANT THIS CASE CAN ACTUALLY OBSERVE. setMenuLanguage encodes and broadcasts a
+        # frame; it must not disturb the CEC device inventory doing so. Asserting that is not a
+        # tautology: an implementation that perturbed the device list while encoding the language -
+        # a stray addDevice, a dropped entry, a reset of the poll state - would break it, and the
+        # acknowledgement alone would still read green.
+        if not inventory_readable:
+            log_error("✖ the device inventory could not be read, so no invariant can be asserted")
+            log_error("TCID13_Set_Menu_Language Failed ❌")
+            return False
+
+        after_readable, after_count, after_addresses = _device_inventory()
+        if not after_readable:
+            log_error("✖ the device inventory became unreadable after setMenuLanguage")
+            log_error("TCID13_Set_Menu_Language Failed ❌")
+            return False
+        if (after_count, after_addresses) != (before_count, before_addresses):
+            log_error(
+                f"✖ setMenuLanguage disturbed the device inventory: "
+                f"{before_count}/{before_addresses} -> {after_count}/{after_addresses}"
+            )
+            log_error("TCID13_Set_Menu_Language Failed ❌")
+            return False
+        log_success(
+            f"✔ device inventory unchanged across the call: {after_count} devices at "
+            f"{after_addresses}"
+        )
+
+        elapsed_time = time.perf_counter() - start_time
+        log_success(log_with_timing("TCID13_Set_Menu_Language Passed ✅", elapsed_time))
+        return True
     except json.JSONDecodeError:
         log_error("Invalid JSON response")
         log_error("TCID13_Set_Menu_Language Failed ❌")

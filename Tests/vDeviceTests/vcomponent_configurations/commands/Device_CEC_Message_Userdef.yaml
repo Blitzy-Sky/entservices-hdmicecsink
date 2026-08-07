@@ -59,9 +59,16 @@
 #         LogicalAddress::BROADCAST is an alias of UNREGISTERED == 15.
 #   0x82  ACTIVE_SOURCE. Not 0x9D, which is INACTIVE_SOURCE and takes the
 #         opposite guard.
-#   0x10  A PhysicalAddress operand: two bytes carrying two nibbles each, so
-#   0x00  the pair reads 1.0.0.0 - the peer announcing itself beneath HDMI
-#         port 1.
+#   0x20  A PhysicalAddress operand: two bytes carrying two nibbles each, so
+#   0x00  the pair reads 2.0.0.0 - the initiator's OWN address, as
+#         Device_Config_Add_Network.yaml allocates it to the audio system on
+#         HDMI input 1. The operand is not decorative: process(ActiveSource)
+#         forwards it to updateActiveSource, which writes it into
+#         deviceList[5].m_physicalAddr. An operand naming any other address
+#         therefore MOVES the audio system, and moving it off the ARC port's
+#         address disables process(InitiateArc) altogether (cpp:508-534). Keep
+#         this pair equal to the operand in
+#         DeviceListConfig/Payload_Report_Physical_Address_AudioSystem.yaml.
 #
 # The filename is part of the contract. utils.HDMICEC_CMD_BASE resolves to this
 # directory and a test case joins this exact basename onto it, while
@@ -75,4 +82,4 @@ HdmiCec:
   description: Inject ActiveSource (CEC opcode 0x82) - user-defined CEC message / active source announcement
   message:
     user_defined: true
-    payload: ["0x5F", "0x82", "0x10", "0x00"]
+    payload: ["0x5F", "0x82", "0x20", "0x00"]

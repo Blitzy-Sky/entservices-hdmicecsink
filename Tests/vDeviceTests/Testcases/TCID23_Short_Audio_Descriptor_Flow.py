@@ -8,8 +8,14 @@
  *          what separates this module from the read-only cases earlier in the suite: the
  *          JSON-RPC call makes the sink ASK, and the injected fixture supplies the audio
  *          system's REPLY. Four steps, in this order:
- *            1. before-probe - org.rdk.HdmiCecSink.getAudioDeviceConnectedStatus, read for
- *               context and logged beside the after-probe rather than asserted;
+ *            1. BEFORE-PROBE, ALL THREE PARTS ASSERTED - org.rdk.HdmiCecSink.getEnabled must
+ *               read enabled True, org.rdk.HdmiCecSink.getDeviceList must report the audio
+ *               system at CEC logical address 5, and
+ *               org.rdk.HdmiCecSink.getAudioDeviceConnectedStatus must read connected True.
+ *               All three are preconditions rather than context: with CEC disabled
+ *               requestShortaudioDescriptor returns without putting anything on the bus
+ *               (HdmiCecSinkImplementation.cpp:2170-2175), and with no peer at address 5 the
+ *               solicitation has no recipient and the injected reply no legitimate origin;
  *            2. OUTBOUND SOLICITATION - org.rdk.HdmiCecSink.requestShortAudioDescriptor, which
  *               encodes <Request Short Audio Descriptor> and directs it at CEC logical address
  *               5 (HdmiCecSinkImplementation.cpp:2204 sends to LogicalAddress::AUDIO_SYSTEM);
@@ -17,7 +23,11 @@
  *               system's <Report Short Audio Descriptor> answer, reaching
  *               HdmiCecSinkProcessor::process(const ReportShortAudioDescriptor&, const Header&)
  *               at HdmiCecSinkImplementation.cpp:545;
- *            4. after-probe - the same connected-status read, logged beside the first.
+ *            4. AFTER-PROBE, ASSERTED - CEC must still be enabled, the audio system must still
+ *               read connected, and getDeviceList must report the same device count and the same
+ *               set of logical addresses as step 1. A descriptor exchange carries capability
+ *               information; it must not disable HDMI-CEC, undiscover the peer or alter the
+ *               topology.
  *
  *          THE ORDER OF STEPS 2 AND 3 IS FUNCTIONAL, NOT COSMETIC, and must not be swapped: a
  *          reply injected before its request is an unsolicited report, not half of an exchange.
@@ -43,35 +53,53 @@
  * @expected_result
  *  - requestShortAudioDescriptor acknowledges the solicitation, and the descriptor reply is
  *    injected and accepted by the emulator.
- *  - The DECODED DESCRIPTOR CONTENTS ARE NOT ASSERTED, because they are not observable from
- *    this transport: RequestShortAudioDescriptor publishes only a success flag
- *    (IHdmiCecSink.h:251), no getter on the interface returns the received descriptors, and the
- *    shortAudiodescriptorEvent notification that does carry them (IHdmiCecSink.h:149-152) is
- *    delivered to registered COM-RPC/JSON-RPC subscribers, not to a curl request/response.
+ *  - THE DECODED DESCRIPTOR CONTENTS ARE NOT ASSERTED, AND THIS CASE IS CLASSIFIED
+ *    ACCORDINGLY: it is an INJECTION-AND-INVARIANT case, not an effect-observing one.
+ *    RequestShortAudioDescriptor publishes only a success flag (IHdmiCecSink.h:251), no getter
+ *    on the interface returns the received descriptors, and Process_ShortAudioDescriptor_msg
+ *    stores nothing at all - it decodes the operands straight into a JsonArray and hands them to
+ *    Send_ShortAudioDescriptor_Event (HdmiCecSinkImplementation.cpp:1078-1100, event at :1062),
+ *    a Thunder notification that reaches registered COM-RPC/JSON-RPC subscribers rather than a
+ *    one-shot curl request/response. There is consequently no state anywhere for this transport
+ *    to read back, which is a stronger statement than "not asserted here".
+ *    REQUIRED PRODUCTION CHANGE TO CLOSE THIS GAP, reported and not made: either a
+ *    GetShortAudioDescriptors getter on Exchange::IHdmiCecSink that returns the last descriptors
+ *    received, or a vComponent endpoint reporting frames the device under test EMITTED so the
+ *    outbound <Request Short Audio Descriptor> of step 2 could be observed. Neither exists, and
+ *    this suite may not add either.
+ *  - WHAT IS ASSERTED INSTEAD IS NOT LIVENESS. getEnabled reading True before step 2 is the
+ *    published fact that the solicitation was actually dispatched: RequestShortAudioDescriptor
+ *    sets success = true unconditionally (:2178-2183), whereas requestShortaudioDescriptor()
+ *    returns WITHOUT SENDING when cecEnableStatus is not true (:2170-2175), and getEnabled
+ *    publishes exactly that flag (:1310). One caveat is recorded rather than glossed: that
+ *    routine has a third gate, m_logicalAddressAllocated == UNREGISTERED (:2198-2201), and no
+ *    getter publishes the allocated address - GetDeviceList deliberately OMITS the sink's own
+ *    entry (:1393). A populated peer inventory is evidence that discovery ran and therefore that
+ *    an address was allocated, but it is evidence and not proof, and closing that last gap needs
+ *    the same production change named above.
  *
  * @pass_criteria
- *  - The required YAML post returns HTTP 200, requestShortAudioDescriptor acknowledges
- *    result.success as True, the after-probe parses with result.success True and a boolean
- *    result.connected, and run_test() returns True.
+ *  - The before-probe reports enabled True, the audio system at logical address 5 and connected
+ *    True; requestShortAudioDescriptor acknowledges result.success as True; the required YAML
+ *    post returns HTTP 200; the after-probe reports enabled True, connected True and the step-1
+ *    device count and logical-address set unchanged; and run_test() returns True.
  *
  * @failure_criteria
- *  - A request is not dispatched, a response is the no-response sentinel, the required
- *    vComponent post does not return HTTP 200, the solicitation does not acknowledge success,
- *    the after-probe reports success other than True or a non-boolean connected, a JSON parsing
- *    error occurs, or run_test() returns False.
+ *  - CEC reads disabled before or after the exchange, the device inventory cannot be read, the
+ *    audio system is absent from it, connected reads anything but True before or after, a request
+ *    is not dispatched, a response is the no-response sentinel, the required vComponent post does
+ *    not return HTTP 200, the solicitation does not acknowledge success, the inventory changes
+ *    across the exchange, a JSON parsing error occurs, or run_test() returns False.
  */
 """
 
 import time
-import os
 import json
 
 # The eight-symbol utils import below is the shared contract the emulation-driven ("flow")
-# testcases in this suite are written against. `log_with_timing` is deliberately retained even
-# though this module gates its own timing line on HDMICEC_TIMING_ENABLED directly: keeping the
-# set identical across the flow modules is what lets one be diffed against another, so the
-# resulting single "imported but unused" lint note is accepted convention here rather than an
-# oversight. Every other symbol has a call site below.
+# testcases in this suite are written against, and every symbol in it now has a call site:
+# log_with_timing applies the HDMICEC_TIMING_ENABLED decoration and the pass path routes its
+# message through it, which is what retired this module's own local copy of that gate.
 from utils import (
     send_curl_command,
     send_vcomponent_command,
@@ -112,111 +140,245 @@ def _result_object(response_text):
     return result if isinstance(result, dict) else {}
 
 
+# The CEC logical address of an audio system: the destination requestShortaudioDescriptor()
+# directs its solicitation at (HdmiCecSinkImplementation.cpp:2204) and the origin the injected
+# reply claims. Init_Devicelist_Populate seeds that peer as a precondition of the whole suite.
+AUDIO_SYSTEM_LOGICAL_ADDRESS = 5
+
+# Bounded budget for the reachable observations - a poll ceiling, never a duration anything waits
+# out. Every wait below returns as soon as the state it is watching agrees.
+OBSERVE_TIMEOUT_S = 8.0
+OBSERVE_POLL_S = 0.25
+
+
+def _device_inventory():
+    """Return (readable, count, sorted_logical_addresses) from the published getDeviceList method.
+
+    Returns:
+        (False, None, None) when the reply cannot be read or does not acknowledge success, so a
+        caller reports "unreadable" rather than mistaking it for an empty topology.
+    """
+    response = send_curl_command(HdmiCecSinkApis.get_device_list)
+    if not response or response.startswith("< No response"):
+        return False, None, None
+    try:
+        result = _result_object(response)
+    except json.JSONDecodeError:
+        return False, None, None
+    if result.get("success") is not True:
+        return False, None, None
+    device_list = result.get("deviceList")
+    if not isinstance(device_list, list):
+        return False, None, None
+    addresses = sorted(
+        device["logicalAddress"]
+        for device in device_list
+        if isinstance(device, dict) and isinstance(device.get("logicalAddress"), int)
+    )
+    return True, result.get("numberofdevices"), addresses
+
+
+def _read_flag(argv, field):
+    """Read one boolean field out of a published getter, or None when it cannot be read."""
+    response = send_curl_command(argv)
+    if not response or response.startswith("< No response"):
+        return None
+    try:
+        result = _result_object(response)
+    except json.JSONDecodeError:
+        return None
+    if result.get("success") is not True:
+        return None
+    value = result.get(field)
+    return value if isinstance(value, bool) else None
+
+
+def _wait_for_flag(argv, field, expected):
+    """Poll one boolean getter until it reads `expected`; returns (matched, last_observation).
+
+    Bounded by OBSERVE_TIMEOUT_S on a monotonic clock, and it RETURNS THE LAST READING so the
+    caller can distinguish "never became true" from "could not be read at all" - the two have
+    different causes and deserve different messages.
+    """
+    deadline = time.monotonic() + OBSERVE_TIMEOUT_S
+    while True:
+        observed = _read_flag(argv, field)
+        if observed is expected:
+            return True, observed
+        if time.monotonic() >= deadline:
+            return False, observed
+        time.sleep(OBSERVE_POLL_S)
+
+
 def run_test():
+    """Drive one Short Audio Descriptor exchange and assert everything this transport can observe.
+
+    WHAT IS AND IS NOT REACHABLE HERE, stated once because it governs every assertion below. The
+    handler stores nothing: Process_ShortAudioDescriptor_msg decodes the operands into a JsonArray
+    and hands them straight to Send_ShortAudioDescriptor_Event, a Thunder notification a curl
+    transport cannot subscribe to, and no getter returns the received descriptors. So the
+    descriptor CONTENTS are not merely unasserted here - there is no state for any transport to
+    read them back from. @expected_result names the production change that would close that.
+    WHAT IS ASSERTED, and why each item is a real claim rather than liveness:
+      * getEnabled reads True before the solicitation. RequestShortAudioDescriptor sets
+        success = true unconditionally (:2178-2183) while requestShortaudioDescriptor() returns
+        WITHOUT SENDING when cecEnableStatus is not true (:2170-2175), so `success` alone cannot
+        distinguish "request dispatched" from "request silently dropped"; getEnabled publishes
+        exactly that flag (:1310).
+      * The audio system is present at logical address 5 and connected reads True - the recipient
+        of the solicitation and the claimed origin of the reply.
+      * The reply injection is required to be delivered.
+      * Afterwards CEC is still enabled, the audio system is still connected and the inventory is
+        unchanged.
+    Returns:
+        True when every assertion above holds; False on any transport failure, refused post,
+        unreadable reply or disturbed invariant.
+    """
     start_time = time.perf_counter()
 
-    # SHARED STATE: none. A descriptor exchange makes the sink record the audio system's
-    # capability information; it changes no user-visible setting, and the interface publishes no
-    # inverse API that could undo it. The absence of a restore step here is therefore deliberate
-    # rather than forgotten, and no later testcase depends on this module having reverted
-    # anything.
+    # SHARED STATE: none. A descriptor exchange makes the sink report the audio system's
+    # capability information to its subscribers; it writes no member, changes no user-visible
+    # setting, and the interface publishes no inverse API that could undo it. The absence of a
+    # restore step and of a cleanup() hook is therefore deliberate rather than forgotten, and no
+    # later testcase depends on this module having reverted anything.
 
-    # Before-probe: context for the exchange, logged rather than asserted.
-    before = send_curl_command(HdmiCecSinkApis.get_audio_device_connected_status)
-    if not before:
-        log_error("✖ initial getAudioDeviceConnectedStatus command not sent")
+    # ── BEFORE: three asserted preconditions, not context ───────────────────────────────────────
+    enabled_before = _read_flag(HdmiCecSinkApis.get_enabled, "enabled")
+    if enabled_before is not True:
+        log_error(
+            f"✖ getEnabled reads {enabled_before!r}, expected True. With CEC disabled "
+            "requestShortaudioDescriptor() returns without putting the solicitation on the bus "
+            "(HdmiCecSinkImplementation.cpp:2170-2175), so this case would exercise nothing"
+        )
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
         return False
-    # The transport failure guard that actually fires in this suite. utils.send_curl_command
-    # returns the "< No response from WPEFramework >" sentinel - a TRUTHY string - for every
-    # failure mode, so the falsy check above cannot catch one on its own. The prefix form is the
-    # detection contract utils.py documents for callers.
-    if before.startswith("< No response"):
-        log_error("✖ initial getAudioDeviceConnectedStatus returned no response")
-        return False
-    log_warning(f"Initial audio connection: {before}")
 
-    # ACT 1 - OUTBOUND SOLICITATION. The sink asks the audio system for its descriptors. This
-    # must precede the injection below; see @details.
+    inventory_readable, before_count, before_addresses = _device_inventory()
+    if not inventory_readable:
+        log_error("✖ the device inventory could not be read before the exchange")
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
+    if AUDIO_SYSTEM_LOGICAL_ADDRESS not in before_addresses:
+        log_error(
+            f"✖ no audio system at logical address {AUDIO_SYSTEM_LOGICAL_ADDRESS} in "
+            f"{before_addresses} - the solicitation would have no recipient and the injected "
+            "reply no legitimate origin"
+        )
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
+
+    # VALUE ASSERTION ON `connected`, NOT A TYPE ASSERTION. An earlier revision checked only
+    # isinstance(connected, bool), reasoning from the sink's own L2 suite, which asserts
+    # EXPECT_FALSE(connected) (../../L2Tests/tests/HdmiCecSink_L2Test.cpp:1827 over COM-RPC, :2539
+    # over JSON-RPC). THAT CITATION DOES NOT TRANSFER: the L2 host discovers no audio system at
+    # all, which is why False is correct there, whereas this suite REQUIRES the VAUDIO peer at
+    # logical address 5 as a @precondition and addDevice() sets hdmiCecAudioDeviceConnected
+    # unconditionally for that address (:2457-2459), with nothing on any path this module drives
+    # clearing it. True is therefore the measured expectation for THIS environment, and a
+    # type-only check would have accepted the peer silently vanishing mid-exchange.
+    connected_before = _read_flag(HdmiCecSinkApis.get_audio_device_connected_status, "connected")
+    if connected_before is not True:
+        log_error(
+            f"✖ audio device connected reads {connected_before!r} before the exchange, expected "
+            f"True with the peer present at logical address {AUDIO_SYSTEM_LOGICAL_ADDRESS}"
+        )
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
+    log_info(
+        f"Before: CEC enabled, {before_count} devices at {before_addresses}, audio connected=True"
+    )
+
+    # ── ACT 1 - OUTBOUND SOLICITATION ──────────────────────────────────────────────────────────
+    # The sink asks the audio system for its descriptors. This must precede the injection below;
+    # see @details.
     curl_response = send_curl_command(HdmiCecSinkApis.request_short_audio_descriptor)
     if not curl_response:
         log_error("✖ requestShortAudioDescriptor command not sent")
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
         return False
+    # The transport failure guard that actually fires in this suite. utils.send_curl_command
+    # returns the "< No response from WPEFramework >" sentinel - a TRUTHY string - for every
+    # failure mode, so a falsy check cannot catch one on its own. The prefix form is the detection
+    # contract utils.py documents for callers.
     if curl_response.startswith("< No response"):
         log_error("✖ requestShortAudioDescriptor returned no response from WPEFramework")
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
         return False
-    log_success("✔ curl command sent")
     log_warning(f"Response: {curl_response}")
-    time.sleep(1)
+    try:
+        if _result_object(curl_response).get("success") is not True:
+            log_error("✖ requestShortAudioDescriptor did not acknowledge success")
+            log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+            return False
+    except json.JSONDecodeError:
+        log_error("✖ requestShortAudioDescriptor reply is not valid JSON")
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
+    log_success("✔ requestShortAudioDescriptor acknowledged, and CEC was enabled when it ran")
 
-    # ACT 2 - INBOUND REPLY. Device_Report_Short_Audio_Descriptor.yaml carries payload
-    # ["0x50","0xA3","0x01","0x00","0x00"]: directed from logical address 5 to 0, opcode 0xA3
-    # (<Report Short Audio Descriptor>), then EXACTLY THREE operand bytes forming one descriptor.
-    # That width is load-bearing, not arbitrary - ShortAudioDescriptor is a fixed three-byte
-    # operand (Operands.hpp:695, MAX_LEN = 3) and the decoding constructor derives its count by
-    # INTEGER division, numberofdescriptor = frame.length() / 3 (Messages.hpp:538), reading each
+    # ── ACT 2 - INBOUND REPLY, REQUIRED ────────────────────────────────────────────────────────
+    # Device_Report_Short_Audio_Descriptor.yaml carries payload ["0x50","0xA3","0x01","0x00",
+    # "0x00"]: directed from logical address 5 to 0, opcode 0xA3 (<Report Short Audio
+    # Descriptor>), then EXACTLY THREE operand bytes forming one descriptor. That width is
+    # load-bearing, not arbitrary - ShortAudioDescriptor is a fixed three-byte operand
+    # (Operands.hpp:695, MAX_LEN = 3) and the decoding constructor derives its count by INTEGER
+    # division, numberofdescriptor = frame.length() / 3 (Messages.hpp:538), reading each
     # descriptor at startPos + i*3. Trimming a byte truncates that count to zero and the handler
     # then observes an empty list, so do not add or remove operand bytes and do not substitute a
     # broadcast fixture. This is also the ONLY fixture for opcode 0xA3 under
-    # vcomponent_configurations/commands/ - there is deliberately no Process_-prefixed variant,
-    # and naming a file that does not exist would make send_vcomponent_command return
-    # (0, "YAML file not found: ..."), which is why the post's result is required below.
-    ok_reply = _post_hdmicec("Device_Report_Short_Audio_Descriptor.yaml")
-    time.sleep(1)
-
-    if not ok_reply:
-        log_error("✖ required vComponent descriptor reply post failed")
-        return False
-
-    # After-probe: the same read as the before-probe, so the pair can be compared in the log.
-    after = send_curl_command(HdmiCecSinkApis.get_audio_device_connected_status)
-    if not after:
-        log_error("✖ final getAudioDeviceConnectedStatus command not sent")
-        return False
-    if after.startswith("< No response"):
-        log_error("✖ final getAudioDeviceConnectedStatus returned no response")
-        return False
-    log_warning(f"Final audio connection: {after}")
-
-    try:
-        # Act 1's acknowledgement. requestShortAudioDescriptor publishes exactly one field -
-        # success (IHdmiCecSink.h:251) - so this is the only claim the solicitation itself
-        # supports. Nothing is asserted about the descriptor contents; see @expected_result.
-        if _result_object(curl_response).get("success") is not True:
-            log_error("✖ requestShortAudioDescriptor did not acknowledge success")
-            return False
-
-        before_result = _result_object(before)
-        after_result = _result_object(after)
-        connected_before = before_result.get("connected")
-        connected_after = after_result.get("connected")
-        log_info(
-            "Observed audio device connected state: "
-            f"before={connected_before} after={connected_after}"
+    # vcomponent_configurations/commands/ - there is deliberately no Process_-prefixed variant -
+    # and naming a file that does not exist makes send_vcomponent_command return
+    # (0, "YAML file not found: ..."), which is why the post's result is required.
+    if not _post_hdmicec("Device_Report_Short_Audio_Descriptor.yaml"):
+        log_error(
+            "✖ required injection refused - the audio system's descriptor reply was never "
+            "delivered (Device_Report_Short_Audio_Descriptor.yaml)"
         )
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
+    log_success("✔ delivered the audio system's <Report Short Audio Descriptor> reply")
 
-        # TYPE-ONLY ASSERTION ON `connected` - DO NOT STRENGTHEN THIS INTO A VALUE CHECK.
-        # Neither True nor False is a claim this testcase can honestly make, and a descriptor
-        # exchange is not what sets the flag anyway: it mirrors
-        # HdmiCecSinkImplementation::hdmiCecAudioDeviceConnected, set only when a peer is
-        # discovered at logical address 5. The sink's own L2 suite asserts the counter-intuitive
-        # value for exactly this reason - EXPECT_FALSE(connected) at
-        # ../../L2Tests/tests/HdmiCecSink_L2Test.cpp:1827 over COM-RPC and
-        # EXPECT_FALSE(result["connected"].Boolean()) at :2539 over JSON-RPC - because no audio
-        # system is ever discovered in that in-process host. This suite has never been executed,
-        # so pinning the value would fail in one valid environment or the other. `success` is
-        # different: the implementation sets it unconditionally, so requiring True is measured.
-        if after_result.get("success") is True and isinstance(connected_after, bool):
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID23_Short_Audio_Descriptor_Flow Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
+    # ── AFTER: the invariants the exchange must preserve ────────────────────────────────────────
+    # Regression guards with teeth rather than formalities: a capability exchange must not disable
+    # HDMI-CEC, undiscover the audio system or disturb the topology. Each is polled on a bounded
+    # monotonic budget so a slow handler is waited for and a broken one is still reported.
+    enabled_ok, enabled_after = _wait_for_flag(HdmiCecSinkApis.get_enabled, "enabled", True)
+    if not enabled_ok:
+        log_error(
+            f"✖ getEnabled reads {enabled_after!r} after the exchange, expected True - a "
+            "descriptor exchange must not disable HDMI-CEC"
+        )
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
 
-        log_warning(f"Actual  : {after}")
-    except json.JSONDecodeError:
-        log_error("Invalid JSON response")
+    connected_ok, connected_after = _wait_for_flag(
+        HdmiCecSinkApis.get_audio_device_connected_status, "connected", True
+    )
+    if not connected_ok:
+        log_error(
+            f"✖ audio device connected reads {connected_after!r} after the exchange, expected "
+            "True - a descriptor exchange must not undiscover the audio system"
+        )
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
 
-    log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
-    return False
+    after_readable, after_count, after_addresses = _device_inventory()
+    if not after_readable:
+        log_error("✖ the device inventory became unreadable after the exchange")
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
+    if (after_count, after_addresses) != (before_count, before_addresses):
+        log_error(
+            f"✖ the exchange disturbed the device inventory: "
+            f"{before_count}/{before_addresses} -> {after_count}/{after_addresses}"
+        )
+        log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
+        return False
+    log_success(
+        f"✔ invariants hold: CEC enabled, {after_count} devices at {after_addresses}, "
+        "audio connected=True"
+    )
+
+    elapsed_time = time.perf_counter() - start_time
+    log_success(log_with_timing("TCID23_Short_Audio_Descriptor_Flow Passed ✅", elapsed_time))
+    return True

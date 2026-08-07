@@ -1,9 +1,24 @@
 HdmiCec:
   command: "cec_message"
-  description: "Trigger process(ReportPhysicalAddress) from PANASONIC (LA=11, Tuner, sink HDMI port 6)"
+  description: "process(ReportPhysicalAddress) from PANASONIC (LA=8, Playback Device) at 2.2.0.0"
   message:
     user_defined: true
-    # Header 0xBF: initiator=11 (0xB, PANASONIC), destination=0xF (broadcast)
-    # Opcode 0x84: ReportPhysicalAddress
-    # Physical 6.0.0.0 -> 0x60,0x00, device_type Tuner=0x03
-    payload: ["0xBF", "0x84", "0x60", "0x00", "0x03"]
+    # Raw frame, injected byte for byte. The vComponent synthesises operands only for
+    # <Active Source>, <Inactive Source> and <Set OSD Name> (vcHdmiCec.c ParseCommand), so a
+    # <Report Physical Address> has to spell its own out.
+    #
+    # 0x8F  header: initiator 8 (PANASONIC), destination 0xF (broadcast).
+    #       process(ReportPhysicalAddress) discards directed frames outright
+    #       (HdmiCecSinkImplementation.cpp:351-353), so broadcast is not a stylistic choice.
+    # 0x84  opcode <Report Physical Address>.
+    # 0x22, 0x00  physical address 2.2.0.0, which is what ../Device_Config_Add_Network.yaml
+    #       allocates to this peer. Two wire bytes of four nibbles - byte 0 is n0<<4|n1, byte 1 is
+    #       n2<<4|n3 (Operands.hpp PhysicalAddress). Port 2 of the audio system. The second
+    #       playback peer, so a route change has somewhere to go, and a two-hop chain for
+    #       HdmiPortMap::getRoute to walk rather than a flat one.
+    # 0x04  device type Playback Device, the family logical address 8 belongs to
+    #       (Operands.hpp LogicalAddress::getType). process(ReportPhysicalAddress) stores this byte
+    #       verbatim into deviceList[8].m_deviceType (cpp:367) and getDeviceList reports it, so an
+    #       address paired with a device type it cannot hold is observable through the published
+    #       API.
+    payload: ["0x8F", "0x84", "0x22", "0x00", "0x04"]

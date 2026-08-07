@@ -25,8 +25,18 @@
  *          own console output rather than implying more. No claim whatsoever is made about
  *          OnKeyPressEvent, OnKeyReleaseEvent, ReportFeatureAbortEvent, OnDeviceRemoved or
  *          OnImageViewOnMsg: L3 reaches the plugin over request/response curl and cannot
- *          subscribe to a Thunder notification at all, so those five - the same events the
- *          sink's own L2 suite leaves uncovered - are outside what any module here can observe.
+ *          subscribe to a Thunder notification at all, so all five are outside what any module
+ *          here can observe. That is a property of this TRANSPORT and not a coverage verdict.
+ *          Four of the five are asserted at both L1 and L2 - the key press/release pair, image
+ *          view on, and device removed. ReportFeatureAbortEvent is asserted at L1 only
+ *          (reportFeatureAbortEvent_SubscribedClient_ReceivesAllThreeOperands,
+ *          _EachAbortReason_IsNotified, _BoundaryOperands_AreNotified); at L2 only the
+ *          broadcast-drop guard arm is asserted, because the directed arm is documented BLOCKED
+ *          there - the shared CEC mock's AbortReason int constructor leaves its public `impl`
+ *          delegate uninitialised, so a frame-parsed directed Feature Abort takes SIGSEGV
+ *          (HdmiCecSink_L2Test.cpp:4495 onward states the analysis and the one-line mock change
+ *          that would unblock it). Where the coverage register lists these five as uncovered,
+ *          that is its PRE-CHANGE BASELINE.
  *
  *          This is the breadth half of the sink's missing device-level (E2E) coverage
  *          (COVERAGE_GAPS.md, gap-plugin-sink-vdevicetests), where every sink JSON-RPC method
@@ -81,95 +91,459 @@ from pathlib import Path
 from utils import (
     send_curl_command,
     send_vcomponent_command,
+    sanitise_for_log,
     HDMICEC_CMD_BASE,
     log_info,
     log_success,
     log_warning,
     log_error,
-    log_with_timing
+    log_with_timing,
+    CEC_FRAME_PACING_SECONDS,
+    CEC_PIPELINE_PACING_SECONDS,
+    CEC_SHORT_PACING_SECONDS,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# log_with_timing is imported and never called, knowingly rather than by oversight: it is the
-# one pyflakes finding this file carries ("imported but unused"), and the same single finding
-# every sibling case module in this directory carries. The block above is the import contract
-# they share, while the timing decoration is written INLINE at the point where the verdict is
-# reported, so a diff between two cases shows only the behaviour under test.
+# Every name in the utils import above has a call site, log_with_timing included: it applies the
+# HDMICEC_TIMING_ENABLED decoration and the pass path routes its message through it, which retired
+# this module's own inline copy of that gate.
 #
-# pathlib is this module's alone. Every other case posts a FIXED list of document names, so no
-# path is ever walked; this one derives its work from the directory, which is what makes it the
-# breadth pass rather than another flow case.
+# pathlib is this module's alone. Every other case posts a FIXED list of document names, so no path
+# is ever walked; this one derives its work from the directory, which is what makes it the breadth
+# pass rather than another flow case. `re` reads a fixture's payload so a membership expectation can
+# be DERIVED from the frame's own initiator nibble instead of restated here - the same technique
+# Init_Devicelist_Populate.verify_seed_payload_consistency() uses on the seed payloads.
+
+# ── THE INVENTORY THIS SWEEP IS REQUIRED TO FIND ─────────────────────────────────────────────────
+# An earlier revision accepted ANY non-empty discovery, so a fixture deleted from the tree, renamed,
+# or added without a thought about what it should do was invisible: the sweep simply got shorter or
+# longer and still passed. Declaring the inventory is what makes a change to it a test failure that
+# names the difference. This list is deliberately WRITTEN OUT rather than derived - deriving it from
+# the directory would reproduce exactly the blindness being fixed.
+EXPECTED_PROCESS_FIXTURES = frozenset({
+    "Process_Abort.yaml",
+    "Process_Active_Source.yaml",
+    "Process_CEC_Version.yaml",
+    "Process_Device_Vendor_ID.yaml",
+    "Process_Feature_Abort.yaml",
+    "Process_Get_CEC_Version.yaml",
+    "Process_Give_Device_Power_Status.yaml",
+    "Process_Give_Device_Vendor_ID.yaml",
+    "Process_Give_Features.yaml",
+    "Process_Give_OSD_Name.yaml",
+    "Process_Give_Physical_Address.yaml",
+    "Process_In_Active_Source.yaml",
+    "Process_Polling.yaml",
+    "Process_Report_Physical_Address.yaml",
+    "Process_Report_Power_Status.yaml",
+    "Process_Request_Active_Source.yaml",
+    "Process_Request_Current_Latency.yaml",
+    "Process_Routing_Change.yaml",
+    "Process_Routing_Information.yaml",
+    "Process_Set_OSD_Name.yaml",
+    "Process_Set_Stream_Path.yaml",
+    "Process_Standby.yaml",
+    "Process_User_Control_Pressed.yaml",
+    "Process_User_Control_Released.yaml",
+})
+
+# ── WHAT EACH FIXTURE IS EXPECTED TO DO, ONE ENTRY PER FIXTURE ───────────────────────────────────
+# Three expectation kinds, and every fixture carries at least one EXPLICITLY. An earlier revision
+# named two small sets and let everything else fall into an unstated default, so "no expectation was
+# written for this fixture" and "this fixture genuinely has no observable consequence" looked
+# identical. They are different statements and they are now written differently.
+#
+#   "registers"      the handler calls addDevice(header.from), so the frame's own initiator must
+#                    appear in getDeviceList afterwards. Derived from the payload's header nibble.
+#   "active_source"  the handler moves active-source or routing state, so getActiveSource must still
+#                    answer with success true and a boolean available afterwards. The VALUE is not
+#                    pinned: whether an active source exists depends on which flow case ran before
+#                    this one and on which fixture the sweep has just posted.
+#   "smoke"          acceptance is the ENTIRE claim, and the reason is recorded beside it. Each of
+#                    these produces an outbound CEC response or a Thunder notification and nothing a
+#                    curl read can see.
+#
+# The keys of this mapping are required to equal EXPECTED_PROCESS_FIXTURES exactly, which is what
+# makes it impossible to add a fixture to the tree without deciding what it should prove.
+FIXTURE_EXPECTATIONS = {
+    "Process_Abort.yaml": (("smoke",), "the handler only logs the abort opcode"),
+    "Process_Active_Source.yaml": (
+        ("registers", "active_source"),
+        "process(ActiveSource) registers the initiator and updates the active source",
+    ),
+    "Process_CEC_Version.yaml": (
+        ("registers",), "process(CECVersion) registers the initiator and records its version"
+    ),
+    "Process_Device_Vendor_ID.yaml": (
+        ("registers",), "process(DeviceVendorID) registers the initiator and records its vendor"
+    ),
+    "Process_Feature_Abort.yaml": (
+        ("smoke",),
+        "the handler's whole effect is the ReportFeatureAbortEvent notification, which a one-shot "
+        "curl cannot subscribe to",
+    ),
+    "Process_Get_CEC_Version.yaml": (
+        ("smoke",), "the handler answers with an outbound <CEC Version> frame, which is not readable"
+    ),
+    "Process_Give_Device_Power_Status.yaml": (
+        ("smoke",),
+        "the handler answers with an outbound <Report Power Status> frame carrying the sink's own "
+        "power state, which is not readable",
+    ),
+    "Process_Give_Device_Vendor_ID.yaml": (
+        ("smoke",), "the handler answers with an outbound <Device Vendor ID> frame"
+    ),
+    "Process_Give_Features.yaml": (
+        ("smoke",), "the handler answers with an outbound <Report Features> frame on CEC 2.0 only"
+    ),
+    "Process_Give_OSD_Name.yaml": (
+        ("smoke",), "the handler answers with an outbound <Set OSD Name> frame"
+    ),
+    "Process_Give_Physical_Address.yaml": (
+        ("smoke",), "the handler answers with an outbound <Report Physical Address> frame"
+    ),
+    "Process_In_Active_Source.yaml": (
+        ("active_source",),
+        "process(InActiveSource) clears the active source when the withdrawing address holds it",
+    ),
+    "Process_Polling.yaml": (
+        ("smoke",),
+        "a bare polling header carries no opcode; the middleware answers it at the bus layer and "
+        "the plugin records nothing",
+    ),
+    "Process_Report_Physical_Address.yaml": (
+        ("registers",),
+        "process(ReportPhysicalAddress) registers the initiator and records its physical address",
+    ),
+    "Process_Report_Power_Status.yaml": (
+        ("registers",),
+        "process(ReportPowerStatus) registers the initiator and writes the reported status into its "
+        "device record, which getDeviceList publishes as powerStatus",
+    ),
+    "Process_Request_Active_Source.yaml": (
+        ("active_source",), "the handler makes the sink announce itself as the active source"
+    ),
+    "Process_Request_Current_Latency.yaml": (
+        ("smoke",), "the handler answers with an outbound <Report Current Latency> frame"
+    ),
+    "Process_Routing_Change.yaml": (
+        ("active_source",), "the inbound routing handler is log-only, so only API health is claimed"
+    ),
+    "Process_Routing_Information.yaml": (
+        ("active_source",), "the inbound routing handler is log-only, so only API health is claimed"
+    ),
+    "Process_Set_OSD_Name.yaml": (
+        ("registers",), "process(SetOSDName) registers the initiator and records its OSD name"
+    ),
+    "Process_Set_Stream_Path.yaml": (
+        ("active_source",), "the inbound stream-path handler is log-only, so only API health is claimed"
+    ),
+    "Process_Standby.yaml": (
+        ("smoke",),
+        "the handler's whole effect is the SendStandbyMsgEvent notification; it writes no state at "
+        "all (HdmiCecSinkImplementation.cpp:203-207)",
+    ),
+    "Process_User_Control_Pressed.yaml": (
+        ("smoke",),
+        "the handler forwards straight to SendKeyPressMsgEvent and stores nothing (:295-300)",
+    ),
+    "Process_User_Control_Released.yaml": (
+        ("smoke",),
+        "the handler forwards straight to SendKeyReleaseMsgEvent and stores nothing (:301-305)",
+    ),
+}
+
+# The emulated topology document, re-posted at the start to establish a known baseline and again by
+# cleanup() so the suite ends in that same known topology.
+NETWORK_CONFIG_YAML = "Device_Config_Add_Network.yaml"
+
+# Bounded budgets. Poll ceilings, never durations anything waits out. The device-list budget is the
+# longer one because a topology or registration change travels the whole pipeline - vComponent, the
+# driver receive callback, the read queue, the read thread, the decoder, then the handler - before it
+# can show up in a read.
+HEALTH_TIMEOUT_S = 10.0
+REGISTER_TIMEOUT_S = 15.0
+POLL_INTERVAL_S = 0.25
+
+# True once the sweep has run, so cleanup() knows the topology may need re-declaring.
+_topology_disturbed = False
+
+_PAYLOAD_PATTERN = re.compile(r'payload:\s*\[(.*?)\]', re.S)
+
+
+# ── the reviewed fixture inventory ───────────────────────────────────────────
+#
+# THE 24 INBOUND-HANDLER DOCUMENTS THIS CASE POSTS, NAMED ONE BY ONE. This list is the case's
+# subject, not a convenience: every entry was read and approved, and posting a vComponent command
+# document makes the emulator inject a CEC frame into the device under test, so "whatever matches
+# Process_*.yaml on disk" is not an acceptable definition of the work.
+#
+# An earlier revision discovered the set with rglob("Process_*.yaml") and swept whatever it found.
+# Three things follow from that, and all three are defects rather than flexibility. A document
+# DELETED from the tree shrank the sweep silently, so coverage could be lost while the case went
+# on reporting a pass. A document ADDED - by a careless merge or by anything able to write into
+# the fixture tree - was posted unreviewed, which is to say arbitrary CEC frames were injected on
+# the strength of a filename. And a symlink or a directory bearing a matching name was swept in
+# and posted as though it were one of these documents.
+#
+# So the inventory is fixed here, the tree is required to match it EXACTLY in both directions, and
+# every entry is required to be a regular file rather than a link or a directory. Adding a fixture
+# is a deliberate edit to this list, reviewed alongside the document itself. Keep it sorted; the
+# verification below reports additions and omissions separately, so a rename shows up as one of
+# each rather than as a puzzle.
+APPROVED_PROCESS_FIXTURES = (
+    "Process_Abort.yaml",
+    "Process_Active_Source.yaml",
+    "Process_CEC_Version.yaml",
+    "Process_Device_Vendor_ID.yaml",
+    "Process_Feature_Abort.yaml",
+    "Process_Get_CEC_Version.yaml",
+    "Process_Give_Device_Power_Status.yaml",
+    "Process_Give_Device_Vendor_ID.yaml",
+    "Process_Give_Features.yaml",
+    "Process_Give_OSD_Name.yaml",
+    "Process_Give_Physical_Address.yaml",
+    "Process_In_Active_Source.yaml",
+    "Process_Polling.yaml",
+    "Process_Report_Physical_Address.yaml",
+    "Process_Report_Power_Status.yaml",
+    "Process_Request_Active_Source.yaml",
+    "Process_Request_Current_Latency.yaml",
+    "Process_Routing_Change.yaml",
+    "Process_Routing_Information.yaml",
+    "Process_Set_OSD_Name.yaml",
+    "Process_Set_Stream_Path.yaml",
+    "Process_Standby.yaml",
+    "Process_User_Control_Pressed.yaml",
+    "Process_User_Control_Released.yaml",
+)
+
+
+def _discovered_process_fixtures(commands_dir):
+    """Return every Process_*.yaml path present under commands_dir, as posix-relative names.
+
+    Walked with os.walk(followlinks=False) rather than Path.rglob so that a symlinked
+    SUBDIRECTORY cannot be descended into - rglob's symlink behaviour varies by Python version,
+    and a scan whose reach depends on the interpreter is not a scan an inventory check can rest
+    on. Entries are collected by NAME only, whatever their type: this function answers "what
+    claims to be a fixture", and _verify_fixture_inventory decides whether each one may be posted.
+
+    Args:
+        commands_dir: pathlib.Path of the vcomponent command-document directory.
+    Returns:
+        A set of paths relative to commands_dir, in posix form.
+    """
+    discovered = set()
+    for directory, _subdirectories, filenames in os.walk(commands_dir, followlinks=False):
+        for filename in filenames:
+            if filename.startswith("Process_") and filename.endswith(".yaml"):
+                absolute = Path(directory) / filename
+                discovered.add(absolute.relative_to(commands_dir).as_posix())
+        # os.walk lists a symlink to a directory under subdirectories, and followlinks=False
+        # stops it being descended - but a symlink to a FILE appears in filenames, so the name
+        # is collected here and rejected by type below rather than being quietly skipped.
+    return discovered
+
+
+def _verify_fixture_inventory(commands_dir):
+    """True when the fixture tree matches APPROVED_PROCESS_FIXTURES exactly, file types included.
+
+    Four independent conditions, each reported with its own diagnostic so a reader is told which
+    one failed rather than being handed a set difference:
+
+      * every approved document is present;
+      * every approved document is a REGULAR FILE - os.lstat, so a symlink is seen as a symlink
+        rather than as whatever it points at, and a directory or a FIFO bearing the name is
+        likewise refused;
+      * nothing else in the tree claims to be a Process_*.yaml, at any depth;
+      * commands_dir is itself a real directory and not a symlink to one.
+
+    Args:
+        commands_dir: pathlib.Path of the vcomponent command-document directory.
+    Returns:
+        True when all four hold; False with the reason already logged otherwise.
+    """
+    directory_info = os.lstat(str(commands_dir))
+    if not stat.S_ISDIR(directory_info.st_mode):
+        log_error(
+            f"✖ {commands_dir} is not a directory (mode {stat.filemode(directory_info.st_mode)}); "
+            "a symlink standing in for the fixture tree would redirect every post in this case"
+        )
+        return False
+
+    missing = []
+    wrong_type = []
+    for name in APPROVED_PROCESS_FIXTURES:
+        candidate = commands_dir / name
+        try:
+            info = os.lstat(str(candidate))
+        except OSError:
+            missing.append(name)
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            wrong_type.append(f"{name} ({stat.filemode(info.st_mode)})")
+
+    discovered = _discovered_process_fixtures(commands_dir)
+    unexpected = sorted(discovered - set(APPROVED_PROCESS_FIXTURES))
+
+    if missing:
+        log_error(
+            f"✖ {len(missing)} approved fixture(s) are absent from the tree: "
+            f"{', '.join(missing)}. This case posts a fixed reviewed inventory, so a missing "
+            "document is lost coverage rather than a smaller sweep"
+        )
+    if wrong_type:
+        log_error(
+            f"✖ {len(wrong_type)} approved fixture(s) are not regular files: "
+            f"{', '.join(wrong_type)}. A symlink or directory in a fixture's place would have "
+            "this case post something other than the document that was reviewed"
+        )
+    if unexpected:
+        log_error(
+            f"✖ {len(unexpected)} unapproved Process_*.yaml document(s) are present: "
+            f"{', '.join(sanitise_for_log(name, max_chars=128) for name in unexpected)}. "
+            "Posting one would inject an unreviewed CEC frame into the device under test; add it "
+            "to APPROVED_PROCESS_FIXTURES deliberately, with the document reviewed, or remove it"
+        )
+
+    if missing or wrong_type or unexpected:
+        return False
+
+    log_success(
+        f"✔ the fixture inventory matches exactly: {len(APPROVED_PROCESS_FIXTURES)} approved "
+        "Process_*.yaml documents, all regular files, none unapproved"
+    )
+    return True
+
+
+# THE INVENTORY CONTRACT.
+#
+# This frozenset is the authoritative list of inbound-handler fixtures this case posts, and it
+# is compared for EQUALITY against what the directory sweep finds - not used as a filter, and
+# not treated as a lower bound.
+#
+# Deriving the work from a directory sweep alone would make the case's scope depend on whatever
+# happens to be lying in the tree. A sweep that merely finds "at least something" accepts two
+# opposite defects in silence: a fixture that has been deleted or renamed shrinks the pass
+# without failing it, so an untested handler reads as a green run; and a stray document - a
+# nested copy under a scratch directory, a fixture staged for a different case, an editor or
+# rebase artefact whose name still ends .yaml - gets POSTED to the emulator, changing device
+# state that the assertions after the loop then measure. Both are silent today. Equality
+# against a fixed inventory turns each of them into a named failure.
+#
+# Paths are relative to vcomponent_configurations/commands and compared as POSIX strings, so a
+# nested duplicate such as "DeviceListConfig/Process_Polling.yaml" does not collide with the
+# flat "Process_Polling.yaml" - it is reported as an extra file, which is the point.
+#
+# Adding, renaming or removing a fixture is therefore a deliberate two-file change: the
+# document and this list. That is the intended cost. The 24 entries are the complete set of
+# Process_*.yaml documents in the tree, one per inbound CEC opcode this suite exercises.
+EXPECTED_PROCESS_FIXTURES = frozenset({
+    "Process_Abort.yaml",
+    "Process_Active_Source.yaml",
+    "Process_CEC_Version.yaml",
+    "Process_Device_Vendor_ID.yaml",
+    "Process_Feature_Abort.yaml",
+    "Process_Get_CEC_Version.yaml",
+    "Process_Give_Device_Power_Status.yaml",
+    "Process_Give_Device_Vendor_ID.yaml",
+    "Process_Give_Features.yaml",
+    "Process_Give_OSD_Name.yaml",
+    "Process_Give_Physical_Address.yaml",
+    "Process_In_Active_Source.yaml",
+    "Process_Polling.yaml",
+    "Process_Report_Physical_Address.yaml",
+    "Process_Report_Power_Status.yaml",
+    "Process_Request_Active_Source.yaml",
+    "Process_Request_Current_Latency.yaml",
+    "Process_Routing_Change.yaml",
+    "Process_Routing_Information.yaml",
+    "Process_Set_OSD_Name.yaml",
+    "Process_Set_Stream_Path.yaml",
+    "Process_Standby.yaml",
+    "Process_User_Control_Pressed.yaml",
+    "Process_User_Control_Released.yaml",
+})
 
 
 def _post_yaml(yaml_name):
     """Post one vComponent YAML command document and report whether it was accepted.
 
-    Only the HTTP status decides the verdict. The body is logged verbatim and NEVER parsed:
-    it carries whatever diagnostic the emulator produced, or utils.py's own explanation of a
-    refusal, and it is not JSON. A name that is not in the tree comes back as HTTP 0 with
-    "YAML file not found" rather than raising - so a typo would be reported as a product
-    failure, which is why every filename named literally in this file has been checked
-    against the directory listing.
+    Only the HTTP status decides the verdict. The body is NEVER parsed: it carries whatever
+    diagnostic the emulator produced, or utils.py's own explanation of a refusal, and it is not
+    JSON. A name that is not in the tree comes back as HTTP 0 with "YAML file not found" rather
+    than raising - so a typo would be reported as a product failure, which is why every filename
+    named literally in this file has been checked against the directory listing.
+
+    Unparsed is not the same as unprocessed. The body is remote-derived, so it is rendered
+    through utils.sanitise_for_log before it is printed: bounded, escaped and single-line. This
+    module posts every document in a directory and logs a line for each, which makes it the
+    largest single volume of emulator-authored text in the suite, and the console transcript is
+    the only evidence a device-level run leaves behind. A body carrying terminal control
+    sequences would otherwise be able to erase the lines above it or repaint a refusal as an
+    acceptance, and the escaped rendering is what makes that impossible while keeping the
+    diagnostic readable.
 
     Args:
-        yaml_name: Command-document filename relative to utils.HDMICEC_CMD_BASE, which is
-                   joined on here so that module's environment-override contract keeps working
+        yaml_name: Command-document filename relative to utils.HDMICEC_CMD_BASE, which is joined on
+                   here so that module's environment-override contract keeps working
     Returns:
         True when the vComponent answered HTTP 200, False for every other outcome.
     """
     http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{yaml_name}")
-    log_info(f"POST {yaml_name}: HTTP {http_code} {body}")
+    log_info(f"POST {yaml_name}: HTTP {http_code} {sanitise_for_log(body)}")
     return http_code == 200
 
 
-def _health_check():
-    """True when org.rdk.HdmiCecSink.getDeviceList answers with a well-formed envelope.
+def _fixture_initiator(yaml_name):
+    """Return the logical address a fixture's payload initiates from, or None with a reason.
 
-    A LIVENESS probe on the plugin's read surface, not an assertion about its contents: a
-    plugin answering with an empty device list is healthy, one that does not answer is not.
-    That distinction is the point of running it on both sides of the sweep - it separates
-    "a handler changed the state" from "the plugin stopped answering".
-
-    The sentinel test is NOT redundant with `not response`: utils.send_curl_command reports a
-    transport failure by RETURNING "< No response from WPEFramework >", which is truthy, so an
-    emptiness test alone would read a dead endpoint as a healthy one. Every read helper below
-    carries the same guard for the same reason.
-
+    DERIVED, NOT RESTATED. The "registers" expectation is that the frame's own initiator appears in
+    the device list, and that address is the high nibble of the payload's header byte. Reading it out
+    of the document means the expectation follows the fixture: a document re-addressed to a different
+    initiator changes what this module looks for, instead of leaving a stale literal here that would
+    be reported as a plugin defect.
     Returns:
-        True when the response parses as a JSON object carrying a "result" member, otherwise
-        False - including for the transport sentinel and for an unparsable body.
+        (logical_address, None) on success, or (None, reason).
     """
-    response = send_curl_command(HdmiCecSinkApis.get_device_list)
-    if not response or response.startswith("< No response"):
-        return False
-
+    path = Path(HDMICEC_CMD_BASE) / yaml_name
     try:
-        body = json.loads(response)
-        return isinstance(body, dict) and "result" in body
-    except json.JSONDecodeError:
-        return False
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"cannot read {yaml_name}: {exc}"
+    match = _PAYLOAD_PATTERN.search(text)
+    if not match:
+        return None, f"{yaml_name} declares no payload list"
+    first = match.group(1).split(",")[0].strip().strip('"').strip("'")
+    try:
+        header = int(first, 16)
+    except ValueError as exc:
+        return None, f"{yaml_name} has a non-hexadecimal header byte: {exc}"
+    return header >> 4, None
 
 
 def _get_device_snapshot():
-    """Capture the device list as {"number": int|None, "logicals": set}, or None on failure.
+    """Capture the device list as {"number": int, "logicals": set}, or None when it is not usable.
+
+    THE INTEGER IS NOW REQUIRED, WHICH IS THE POINT OF THIS REVISION. An earlier version returned
+    "number": None whenever the count was absent or not an integer, and run_test() then substituted
+    -1 for it - so a plugin that stopped reporting a count produced -1 on BOTH sides of the sweep and
+    the direction check compared -1 against -1 and passed. A snapshot that cannot be trusted is now
+    reported as no snapshot at all.
 
     The two key names are the sink's own and are deliberately inconsistent with each other:
-    getDeviceList answers with "numberofdevices" all in lower case beside "deviceList" in
-    camel case. Spelling either with the other's convention reads as an ABSENT member rather
-    than raising, which run_test() would then see as a device count of -1 - a false reading
-    with no symptom - so both are written out literally rather than derived.
-
-    An entry that omits or mistypes logicalAddress is tolerated. The address set is part of
-    the snapshot's published shape - it keeps the snapshot re-usable and identical in shape to
-    the source plugin's, so the two suites stay comparable - while the verdict in run_test()
-    compares counts only.
-
+    getDeviceList answers with "numberofdevices" all in lower case beside "deviceList" in camel case.
+    Spelling either with the other's convention reads as an ABSENT member rather than raising, which
+    is exactly the failure mode this function now refuses to paper over, so both are written out
+    literally rather than derived.
     Returns:
-        A dict with "number" (the reported device count, or None when absent or not an
-        integer) and "logicals" (the set of integer logical addresses reported), or None when
-        the response could not be obtained or parsed.
+        A dict with "number" (an int) and "logicals" (a set of int logical addresses), or None when
+        the response could not be obtained, was not a success envelope, or carried no integer count.
     """
     response = send_curl_command(HdmiCecSinkApis.get_device_list)
+    # utils.send_curl_command reports a transport failure by RETURNING the TRUTHY sentinel
+    # "< No response from WPEFramework >", so an emptiness test alone would read a dead endpoint as a
+    # healthy one. Every read helper below carries the same guard for the same reason.
     if not response or response.startswith("< No response"):
         return None
 
@@ -287,51 +661,30 @@ def run_test():
     if http_code != 200:
         log_error("TCID33_Process_Yaml_Health_Check Failed: configure command rejected")
         return False
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
-    if not _health_check():
-        log_error("TCID33_Process_Yaml_Health_Check Failed: pre-check getDeviceList is not healthy")
+    # WAITED FOR, NOT SLEPT THROUGH. An earlier revision paused a fixed second here and defended
+    # every fixed pause in this file as the reference suite's idiom. A bounded poll is strictly
+    # better on both counts: it returns as soon as the plugin answers, and it still reports when the
+    # plugin never does.
+    ready, pre_snapshot = _wait_for_snapshot(lambda snap: True, HEALTH_TIMEOUT_S)
+    if not ready:
+        log_error(
+            "TCID33_Process_Yaml_Health_Check Failed: getDeviceList never returned a usable "
+            "snapshot before the sweep - it must report success true with an integer "
+            "numberofdevices and a deviceList array"
+        )
         return False
+    log_info(
+        f"Pre-sweep: {pre_snapshot['number']} devices at {sorted(pre_snapshot['logicals'])}"
+    )
 
-    pre_snapshot = _get_device_snapshot()
-    if pre_snapshot is None:
-        log_error("TCID33_Process_Yaml_Health_Check Failed: unable to capture pre device snapshot")
-        return False
+    failures = []
 
-    failed_posts = []
-    state_check_failures = []
-
-    # WHICH FIXTURES HAVE AN OBSERVABLE EFFECT - and, just as importantly, which do not.
-    #
-    # These four reach the device list: ReportPhysicalAddress registers the peer, and CECVersion,
-    # SetOSDName and DeviceVendorID populate the entry that registration created, so a
-    # getDeviceList read straight after each of them means something.
-    should_touch_device_list = {
-        "Process_Report_Physical_Address.yaml",
-        "Process_CEC_Version.yaml",
-        "Process_Set_OSD_Name.yaml",
-        "Process_Device_Vendor_ID.yaml",
-    }
-    # These five move the active-source and routing state, so getActiveSource must still answer
-    # after each one. Process_In_Active_Source.yaml (opcode 0x9D, InactiveSource) is the
-    # sink-only member and belongs with the routing trio for the same reason: it changes which
-    # source the plugin considers active. The set is named for the sink's API - the source
-    # plugin's equivalent is named for an ActiveSourceStatus method the sink does not publish.
-    should_keep_active_source_api_healthy = {
-        "Process_Routing_Change.yaml",
-        "Process_Routing_Information.yaml",
-        "Process_Set_Stream_Path.yaml",
-        "Process_Request_Active_Source.yaml",
-        "Process_In_Active_Source.yaml",
-    }
-    # Every other fixture is UNCLASSIFIED on purpose - Process_Give_Features and
-    # Process_Request_Current_Latency among them. Each produces an outbound CEC response or a
-    # notification and nothing a curl read can see, so acceptance is the only claim available,
-    # and making it is honest only because the disclosure lines near the verdict say so plainly.
-
-    for yaml_name in yaml_files:
+    for yaml_name in discovered:
+        kinds, reason = FIXTURE_EXPECTATIONS[yaml_name]
         if not _post_yaml(yaml_name):
-            failed_posts.append(yaml_name)
+            failures.append(f"{yaml_name}: the vComponent refused the post")
             continue
 
         if yaml_name in should_touch_device_list:

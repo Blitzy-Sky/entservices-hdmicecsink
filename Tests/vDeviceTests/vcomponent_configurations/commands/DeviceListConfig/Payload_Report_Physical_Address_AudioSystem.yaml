@@ -1,9 +1,28 @@
 HdmiCec:
   command: "cec_message"
-  description: "Trigger process(ReportPhysicalAddress) from AudioSystem (LA=5)"
+  description: "Trigger process(ReportPhysicalAddress) from YAMAHA (LA=5, Audio System) at 2.0.0.0"
   message:
     user_defined: true
-    # Header byte 0x5F: initiator=5 (AudioSystem), destination=0xF (broadcast)
-    # Opcode  0x84: ReportPhysicalAddress
-    # Physical address 2.0.0.0 (sink HDMI port 2), device type 0x05 (AudioSystem)
+    # Raw frame, injected byte for byte. The vComponent synthesises operands only for
+    # <Active Source>, <Inactive Source> and <Set OSD Name> (vcHdmiCec.c ParseCommand), so a
+    # <Report Physical Address> has to spell its own out.
+    #
+    # 0x5F  header: initiator 5 (YAMAHA), destination 0xF (broadcast).
+    #       process(ReportPhysicalAddress) discards directed frames outright
+    #       (HdmiCecSinkImplementation.cpp:351-353), so broadcast is not a stylistic choice.
+    # 0x84  opcode <Report Physical Address>.
+    # 0x20, 0x00  physical address 2.0.0.0, which is what ../Device_Config_Add_Network.yaml
+    #       allocates to this peer. Two wire bytes of four nibbles - byte 0 is n0<<4|n1, byte 1 is
+    #       n2<<4|n3 (Operands.hpp PhysicalAddress). The television's SECOND HDMI input, and
+    #       not interchangeable: process(InitiateArc) derives the ARC port's address from
+    #       HdmiArcPortID (cpp:508-534) and engages the ARC path only when
+    #       deviceList[0x5].m_physicalAddr matches it. This suite's own fixtures pin that port to
+    #       HDMI input 1 - test_HdmiCecSink.cpp:853 and HdmiCecSink_L2Test.cpp:961, :1224 all stub
+    #       getHDMIARCPortId to 1, and all three report only port 1 connected - which makes
+    #       2.0.0.0 the one address at which the audio system's ARC flows can engage.
+    # 0x05  device type Audio System, the family logical address 5 belongs to
+    #       (Operands.hpp LogicalAddress::getType). process(ReportPhysicalAddress) stores this byte
+    #       verbatim into deviceList[5].m_deviceType (cpp:367) and getDeviceList reports it, so an
+    #       address paired with a device type it cannot hold is observable through the published
+    #       API.
     payload: ["0x5F", "0x84", "0x20", "0x00", "0x05"]

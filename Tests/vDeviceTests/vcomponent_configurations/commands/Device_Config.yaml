@@ -19,37 +19,65 @@
 # * limitations under the License.
 # *
 #* ******************************************************************************
-# Initial CEC device map posted to the vComponent before a sink test case runs.
+# LEGACY MINIMAL SINGLE-PEER DEVICE MAP. Nothing in this suite posts this document.
 #
-# The single emulated peer is an AudioSystem, which the vComponent allocates logical address 5
-# (its only candidate for that device type). The key-control commands in
-# ../../HdmiCECSink_Curl.py address that same logical address, and the directed exchanges in
-# ../hdmicec/hdmicec_vcomponent_cec_responses.yaml are answered by this peer. Keep the three in
-# step: adding a Playback Device peer here, for example, is what would make address 4 a
-# legitimate target.
+# It is the one-peer starting point the sink topology was grown from, kept because it is the
+# smallest configuration that brings the emulated audio system up and is therefore useful when
+# bisecting a topology problem by hand. The document the suite ACTUALLY posts is
+# Device_Config_Add_Network.yaml, in this same directory: Init_Devicelist_Populate.py sends it
+# as NETWORK_CONFIG_YAML in its Step 1, and TCID33_Process_Yaml_Health_Check re-posts it before
+# its sweep. TCID33's own discovery glob matches Process_*.yaml only, so this file is not picked
+# up there either.
+#
+# The single emulated peer here is an AudioSystem, which the vComponent allocates logical
+# address 5 (its only candidate for that device type). That much still holds for the full
+# topology: the key-control commands in ../../HdmiCECSink_Curl.py address that same logical
+# address, and the directed exchanges in ../hdmicec/hdmicec_vcomponent_cec_responses.yaml are
+# answered by that peer.
+#
+# What does NOT hold is any statement about which addresses are free. The network document
+# already seeds peers beyond the audio system - logical address 4 among them, the SONY
+# PlaybackDevice whose ReportPhysicalAddress payload lives in DeviceListConfig/ - so address 4
+# is an occupied, legitimate target in the topology the suite runs against, with nothing needing
+# to be added here first. Edit that document, not this one, to change the network under test.
 HdmiCec:
   command: configure
   description: Initialize HDMI CEC device map
   config:
     emulated_device:
-      name: "VAUDIO"
+      name: "VTV"
       language: "eng"
       cec_version: "1.4"
-      device_type: "AudioSystem"
+      device_type: "TV"
       power_status: "on"
       port_id: 0
       fault: no
-      number_of_ports: 4
+      number_of_ports: 3
       active_source: false
     device_map:
       - device:
-          name: "VAUDIO"
+          name: "VTV"
           language: "eng"
           cec_version: "1.4"
-          device_type: "AudioSystem"
+          device_type: "TV"
           power_status: "on"
           fault: no
           port_id: 0
-          number_of_ports: 4
+          number_of_ports: 3
           active_source: false
-          children: []
+          children:
+            # Audio System -> LOGICAL_ADDRESS_AUDIOSYSTEM (5), physical address 2.0.0.0 from
+            # port_id 2: the vComponent substitutes the parent's port id into the first zero
+            # nibble of the parent's address (vcDevice.c:349-365). Four ports are declared so
+            # Device_Add.yaml can attach a peer beneath this one.
+            - device:
+                name: "YAMAHA"
+                language: "eng"
+                cec_version: "1.4"
+                device_type: "AudioSystem"
+                power_status: "on"
+                fault: no
+                port_id: 2
+                number_of_ports: 4
+                active_source: false
+                children: []

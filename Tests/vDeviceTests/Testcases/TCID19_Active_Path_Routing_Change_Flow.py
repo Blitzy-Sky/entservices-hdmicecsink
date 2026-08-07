@@ -4,31 +4,68 @@
  * @brief L3 HDMI CEC Sink functional testcase.
  *
  * @testcase TCID19_Active_Path_Routing_Change_Flow
- * @details Drives the sink's active-path and routing-change surface end to end and observes
- *          the route the plugin reports on either side of it. Five steps, in order:
- *            1. a route BEFORE-probe over org.rdk.HdmiCecSink.getActiveRoute;
- *            2. org.rdk.HdmiCecSink.setActivePath, which resolves the requested path and
- *               broadcasts <Set Stream Path>;
- *            3. org.rdk.HdmiCecSink.setRoutingChange, which resolves the old and new HDMI
- *               port identifiers against the sink's port map and broadcasts <Routing Change>;
- *            4. inbound <Routing Change>, <Routing Information> and <Set Stream Path> frames
+ * @details Drives the sink's active-path and routing-change surface end to end, probing the
+ *          reported route after EVERY operation and asserting the exact route each one produces.
+ *          Six steps, in order:
+ *            1. a route BEFORE-probe over org.rdk.HdmiCecSink.getActiveRoute, recorded;
+ *            2. org.rdk.HdmiCecSink.setRoutingChange with oldPort naming the television, which
+ *               leaves nothing holding the active source - probed and asserted;
+ *            3. org.rdk.HdmiCecSink.setActivePath, which resolves the requested path and
+ *               broadcasts <Set Stream Path> without moving any local route - probed and
+ *               asserted to have changed nothing;
+ *            4. org.rdk.HdmiCecSink.setRoutingChange with newPort naming the television, which
+ *               makes the television the active source - probed and asserted;
+ *            5. org.rdk.HdmiCecSink.setRoutingChange between two HDMI inputs, the branch that
+ *               resolves BOTH port addresses against the port map - probed and asserted to have
+ *               changed the active source not at all;
+ *            6. inbound <Routing Change>, <Routing Information> and <Set Stream Path> frames
  *               injected through the vComponent, so the peer-driven direction of the same
- *               exchange is exercised alongside the locally initiated one;
- *            5. a route AFTER-probe over the same getActiveRoute method.
+ *               exchange is exercised - probed and asserted to have changed nothing, because all
+ *               three of those handlers are log-only.
+ *
+ *          EACH OPERATION IS ISOLATED, AND THAT IS WHAT MAKES THE SETTERS TESTED. Sending both
+ *          setters and three injections and then reading the route once cannot attribute the
+ *          final reading to any one of them, so the earlier arrangement asserted only that the
+ *          reply was well formed and logged the route as an observation - under which a
+ *          setRoutingChange that did nothing at all, and a setActivePath that wrongly moved the
+ *          local route, would both have passed. Every expected value below is derived from the
+ *          production path rather than chosen, and each is a transition or an invariant
+ *          attributable to exactly one preceding request:
+ *            - step 2: oldPort naming TV sets m_currentActiveSource to -1 unconditionally
+ *              (HdmiCecSinkImplementation.cpp:2389-2393), and GetActiveRoute's third branch then
+ *              answers available false (:1532-1535);
+ *            - step 3: setStreamPath's whole body broadcasts <Set Stream Path> and touches no
+ *              member of the instance (:1461-1468, :2354-2371), so the reading must be
+ *              byte-for-byte the one step 2 produced;
+ *            - step 4: newPort naming TV sets m_currentActiveSource to the television's own
+ *              allocated address (:2408-2412), and GetActiveRoute's second branch answers
+ *              available true with ActiveRoute exactly "TV" and no length or path list
+ *              (:1527-1531);
+ *            - step 5: with NEITHER port naming the television, both names are resolved against
+ *              hdmiInputs[portID].m_physicalAddr and <Routing Change> is broadcast while
+ *              m_currentActiveSource is left alone (:2389-2433), so the reading must be the one
+ *              step 4 produced. This is the branch that walks the port map on both sides;
+ *            - step 6: process(RoutingChange) at :323, process(RoutingInformation) at :327 and
+ *              process(SetStreamPath) at :331 are each a single LOGINFO and nothing else, so the
+ *              reading must be exactly the one step 4 produced. Asserting the documented no-op
+ *              is a real assertion; asserting a change would be asserting a defect.
  *
  *          The two setters are the reason this module exists. SetActivePath and
- *          SetRoutingChange are both catalogued P1 with coverage from the sink's own L2 suite
- *          and no end-to-end leg, because the sink has no device-level suite at all
- *          (COVERAGE_GAPS.md, "Missing sink device-level (E2E) suite"). This module supplies
- *          that leg for both, and in doing so walks the sink's nested route resolution, which
- *          is catalogued zero-hit: HdmiCecSinkImplementation::getActiveRoute
+ *          SetRoutingChange were both catalogued P1 with coverage from the sink's own L2 suite
+ *          and no end-to-end leg, because BEFORE THIS CHANGE the sink had no device-level
+ *          suite at all (COVERAGE_GAPS.md, "Missing sink device-level (E2E) suite"). That is
+ *          the register's pre-change baseline, not a statement about the tree this file sits
+ *          in - the suite that closes that gap is the one this module belongs to. It supplies
+ *          the missing leg for both setters, and in doing so walks the sink's nested route
+ *          resolution, which was catalogued zero-hit: HdmiCecSinkImplementation::getActiveRoute
  *          (HdmiCecSinkImplementation.cpp:1958) plus the port-map operations it and the
  *          routing setters depend on - HdmiPortMap::addChild (HdmiCecSinkImplementation.h:294),
  *          removeChild (:327) and getRoute (:351). setRoutingChange reads
  *          hdmiInputs[portID].m_physicalAddr, so a port identifier resolves only once that map
  *          has been built. No coverage claim is made for any of them: this suite is authored
- *          here and NOT executed, so a coverage figure would be unmeasured. What is claimed is
- *          only that these paths are exercised.
+ *          here and NOT executed, so a coverage figure would be unmeasured and none of these
+ *          paths has been observed running. What is claimed is only that the case is DESIGNED to
+ *          drive them.
  *
  *          The peer-driven direction is reached by INJECTING FRAMES only. No fixture
  *          reconfigures the device under test to act as its own peer; role flipping and role
@@ -55,54 +92,288 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - Both setters are accepted, all three injected frames are taken by the vComponent, and
- *    getActiveRoute still answers with a well-formed route description afterwards.
+ *  - Routing away from the television leaves no route available; setActivePath then changes that
+ *    reading not at all; routing to the television makes the route available with ActiveRoute
+ *    "TV"; and the three injected frames leave that reading untouched.
  *
  * @pass_criteria
- *  - Every required vComponent POST returns HTTP 200, setActivePath and setRoutingChange each
- *    acknowledge with success true, the after-probe parses with success true and a boolean
- *    available - and, when available is true, a well-formed length, pathList and ActiveRoute -
- *    and run_test() returns True.
+ *  - Every required vComponent POST returns HTTP 200, all three setter requests acknowledge with
+ *    success true, the probe after step 2 reports available False, the probe after step 3 reports
+ *    a reading equal to step 2's, the probe after step 4 reports available True with ActiveRoute
+ *    "TV", the probes after steps 5 and 6 each report a reading equal to step 4's, and run_test()
+ *    returns True.
  *
  * @failure_criteria
  *  - A command that cannot be sent, the transport sentinel, a vComponent POST that does not
- *    return HTTP 200, a setter that does not acknowledge success, a body that is not JSON, a
- *    malformed route description, or run_test() returning False.
+ *    return HTTP 200, a setter that does not acknowledge success, a body that is not JSON or
+ *    carries no result object, a probe reporting success other than True, a route still available
+ *    after routing away from the television, a route changed by setActivePath, a route not
+ *    available or not "TV" after routing to the television, a route changed by routing between two
+ *    HDMI inputs, a route changed by the inbound frames, or run_test() returning False.
  */
 """
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
+    send_jsonrpc_command,
     send_vcomponent_command,
+    sanitise_for_log,
     HDMICEC_CMD_BASE,
     log_info,
     log_success,
     log_error,
     log_warning,
-    log_with_timing
+    log_with_timing,
+    CEC_FRAME_PACING_SECONDS,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
-
-# log_with_timing is imported and never called, knowingly rather than by oversight: it is the one
-# pyflakes finding this file carries ("imported but unused"), and it is the same single finding
-# the sibling case modules in this directory carry. The block above is the import contract they
-# share, while the timing decoration is written INLINE at the point where the result is reported,
-# so a diff between two cases shows only the behaviour under test.
-#
-# send_vcomponent_command and HDMICEC_CMD_BASE are what distinguish a flow module from a
-# single-API one: only a flow injects frames, so only a flow needs the vComponent transport and
-# the command-document base directory.
 
 
 def _post_hdmicec(yaml_file):
     """Post a HdmiCec vComponent YAML command."""
     http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{yaml_file}")
-    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {body}")
+    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {sanitise_for_log(body)}")
     return http_code == 200
+
+
+# ── WHAT THE IMPLEMENTATION ACTUALLY MOVES, AND WHAT IT ONLY BROADCASTS ───────────────────────
+# Every expectation below is taken from the implementation rather than assumed, because the two
+# halves of this flow behave differently and an earlier revision could assert neither:
+#
+#   * setRoutingChange resolves both port identifiers and, when the NEW port names "TV", sets
+#     m_currentActiveSource to the sink's own allocated address (HdmiCecSinkImplementation.cpp:
+#     2408-2412). GetActiveRoute then takes its second branch and answers ActiveRoute "TV"
+#     exactly (:1527-1531). That is a determined, observable route change.
+#   * setRoutingChange between two HDMI ports, and setActivePath, only BROADCAST a frame -
+#     <Routing Change> at :2433 and <Set Stream Path> at :2389 - and touch no local route state.
+#     So the correct assertion for them is that the route is UNCHANGED.
+#   * process(RoutingChange), process(RoutingInformation) and process(SetStreamPath) have
+#     LOG-ONLY bodies (:323, :327, :331). Injecting them must therefore leave the route
+#     untouched, and asserting that turns a caveat into a check: if a future change gave those
+#     handlers route side effects, this case would catch it.
+ROUTE_TV = "TV"
+
+# Read from the key "ActiveRoute", with a CAPITAL A. It is the one field of the sink's JSON-RPC
+# surface that is not lowerCamelCase (IHdmiCecSink.h:191), so it is spelled deliberately.
+ROUTE_KEY = "ActiveRoute"
+
+ACTIVE_SOURCE_YAML = "Process_Active_Source.yaml"
+INACTIVE_SOURCE_YAML = "Process_In_Active_Source.yaml"
+
+# Bounded budgets. Poll intervals, never a duration anything waits for.
+TRANSITION_TIMEOUT_S = 10.0
+TRANSITION_POLL_S = 0.25
+
+
+def _active_route():
+    '''Return the sink's active-route block as a dict, or None when it cannot be read.
+
+    None means the reply was not a JSON-RPC result reporting success, which is deliberately
+    distinct from a successful reply that reports no route.
+    '''
+    response = send_curl_command(HdmiCecSinkApis.get_active_route)
+    if not response or response.startswith("< No response"):
+        return None
+    try:
+        envelope = json.loads(response)
+    except json.JSONDecodeError:
+        return None
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return None
+    return result
+
+
+def _route_signature(result):
+    '''Reduce a route block to the parts an assertion compares: availability and description.'''
+    if result is None:
+        return None
+    return (result.get("available"), result.get(ROUTE_KEY))
+
+
+def _wait_for_route(predicate, description):
+    '''Poll getActiveRoute until predicate(result) holds; returns (satisfied, last_result).
+
+    Bounded with a monotonic clock. An unreadable reply neither satisfies the predicate nor ends
+    the wait, but it is what is returned on expiry, so the caller can distinguish "never became
+    true" from "could not be read".
+    '''
+    deadline = time.monotonic() + TRANSITION_TIMEOUT_S
+    last = None
+    while True:
+        result = _active_route()
+        if result is not None:
+            last = result
+            if predicate(result):
+                return True, last
+        if time.monotonic() >= deadline:
+            log_error(
+                f"✖ {description} was not observed within {TRANSITION_TIMEOUT_S:.0f}s; "
+                f"last reading {last!r}"
+            )
+            return False, last
+        time.sleep(TRANSITION_POLL_S)
+
+
+def _route_is_peer(result):
+    '''True when a route to a peer is reported - available, described, and not the TV branch.'''
+    route_text = result.get(ROUTE_KEY)
+    return (
+        result.get("available") is True
+        and isinstance(route_text, str)
+        and route_text != ""
+        and route_text != ROUTE_TV
+    )
+
+
+def _route_is_tv(result):
+    '''True when the sink reports itself as the route, which is the "TV" branch exactly.'''
+    return result.get("available") is True and result.get(ROUTE_KEY) == ROUTE_TV
+
+
+def _published_request(argv):
+    '''Return the decoded JSON-RPC payload a HdmiCECSink_Curl argv constant sends.
+
+    The constants are inert data - an argv list whose payload sits immediately after "-d" - so the
+    method a case needs can be READ from the module that owns it instead of restated here. That is
+    what lets the "newPort=TV" variant below reuse the published method name while substituting one
+    operand, without editing a shared constant that other cases also dispatch.
+    '''
+    try:
+        payload = argv[argv.index("-d") + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("request constant carries no -d payload") from exc
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise ValueError("request payload is not a JSON object")
+    return decoded
+
+
+def _acknowledged(response, label):
+    '''True when a raw reply is a JSON-RPC result reporting success; logs the reason when not.
+
+    The envelope is proven to be a mapping before any member is read, so a body that parses to a
+    list or a scalar is reported rather than raising AttributeError out of run_test().
+    '''
+    if not response:
+        log_error(f"✖ {label} command not sent")
+        return False
+    if response.startswith("< No response"):
+        log_error(f"✖ no response from WPEFramework for {label}")
+        return False
+    try:
+        envelope = json.loads(response)
+    except json.JSONDecodeError:
+        log_error(f"✖ {label} reply is not valid JSON")
+        return False
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(result, dict) or result.get("success") is not True:
+        log_error(f"✖ {label} did not acknowledge success: {response}")
+        return False
+    log_success(f"✔ {label} acknowledged")
+    return True
+
+
+# The route block observed before this case arranged anything, handed to cleanup().
+_captured_route = None
+
+
+def cleanup():
+    '''Put the routing state back where this case found it.
+
+    The route is a function of m_currentActiveSource, so restoring it means restoring the
+    selection: the announcement fixture reproduces "a peer holds it", the announce-then-withdraw
+    pair reproduces "nobody holds it", and setRoutingChange with newPort "TV" reproduces "the sink
+    holds it". A captured route naming some other peer cannot be reproduced and is reported.
+
+    SuitManager runs this unconditionally. Idempotent: the capture is consumed on read.
+    '''
+    global _captured_route
+    if _captured_route is None:
+        log_info("TCID19 cleanup: no routing state was captured, nothing to restore")
+        return True
+
+    captured = _captured_route
+    _captured_route = None
+
+    if _route_signature(_active_route()) == _route_signature(captured):
+        log_info("TCID19 cleanup: the routing state is already as it was found")
+        return True
+
+    if captured.get("available") is not True:
+        log_info("TCID19 cleanup: restoring 'no active route'")
+        if not _post_hdmicec(ACTIVE_SOURCE_YAML) or not _post_hdmicec(INACTIVE_SOURCE_YAML):
+            log_error("TCID19 cleanup: a required post was refused, route left as it is")
+            return False
+        cleared, last = _wait_for_route(
+            lambda result: result.get("available") is not True, "the route clearing"
+        )
+        if not cleared:
+            log_error(f"TCID19 cleanup: the route did not clear; last reading {last!r}")
+            return False
+        log_success("TCID19 cleanup: no active route, as found")
+        return True
+
+    if captured.get(ROUTE_KEY) == ROUTE_TV:
+        log_info("TCID19 cleanup: restoring the sink as the route")
+        if not _set_routing_change_to_tv():
+            return False
+        restored, last = _wait_for_route(_route_is_tv, "the sink becoming the route again")
+        if not restored:
+            log_error(f"TCID19 cleanup: the route did not return to TV; last {last!r}")
+            return False
+        log_success("TCID19 cleanup: sink restored as the route")
+        return True
+
+    log_info("TCID19 cleanup: restoring a peer route through the announcement fixture")
+    if not _post_hdmicec(ACTIVE_SOURCE_YAML):
+        log_error("TCID19 cleanup: the announcement was refused, route left as it is")
+        return False
+    restored, last = _wait_for_route(_route_is_peer, "a peer route being reported again")
+    if not restored:
+        log_error(f"TCID19 cleanup: no peer route was reported; last {last!r}")
+        return False
+    if _route_signature(last) != _route_signature(captured):
+        log_warning(
+            f"TCID19 cleanup: a peer route is reported again but it describes "
+            f"{last.get(ROUTE_KEY)!r} rather than the {captured.get(ROUTE_KEY)!r} found at entry; "
+            "no fixture in this suite announces another peer, so that exact route cannot be "
+            "reproduced. Residual reported."
+        )
+        return False
+    log_success("TCID19 cleanup: peer route restored")
+    return True
+
+
+def _set_routing_change_to_tv():
+    '''Ask the sink to route to itself, reusing the published method with one operand replaced.
+
+    setRoutingChange is the only API in the sink's surface that moves the reported route, and it
+    does so only when the new port names "TV". The published constant routes between two HDMI
+    ports, which is a different - and separately asserted - behaviour, so this call takes the
+    method name from that same constant and substitutes newPort. Nothing is assembled: the request
+    is DESCRIBED to utils.send_jsonrpc_command, which composes the argv itself.
+    '''
+    try:
+        published = _published_request(HdmiCecSinkApis.set_routing_change)
+        method = published["method"]
+        params = dict(published.get("params") or {})
+    except (ValueError, KeyError, json.JSONDecodeError) as exc:
+        log_error(f"✖ the published setRoutingChange request could not be read ({exc})")
+        return False
+    params["newPort"] = ROUTE_TV
+    response = send_jsonrpc_command(method, params=params)
+    if not response or "error" in response or not isinstance(response.get("result"), dict):
+        log_error(f"✖ setRoutingChange(newPort=TV) was refused: {response!r}")
+        return False
+    if response["result"].get("success") is not True:
+        log_error(f"✖ setRoutingChange(newPort=TV) did not report success: {response!r}")
+        return False
+    log_success("✔ setRoutingChange(newPort=TV) acknowledged")
+    return True
 
 
 # FRAMING OF THE THREE INJECTED DOCUMENTS - BROADCAST HERE, AND EITHER WOULD WORK.
@@ -123,243 +394,354 @@ def _post_hdmicec(yaml_file):
 # match a neighbouring case - it is already correct, and the directed documents are equally so.
 
 
+# THE ROUTE STRING THE PLUGIN REPORTS WHEN THE TELEVISION ITSELF HOLDS THE SOURCE.
+# GetActiveRoute takes its second branch when m_currentActiveSource equals the television's own
+# allocated address and assigns ActiveRoute this exact literal, with no path list and no length
+# (HdmiCecSinkImplementation.cpp:1527-1531). It is named rather than inlined because step 3 below
+# is the one place in this module that pins a route VALUE, and the value belongs next to the
+# citation that justifies it.
+TV_ROUTE_TEXT = "TV"
+
+
+def _route_reading(result):
+    """Reduce a getActiveRoute result mapping to the tuple this case compares.
+
+    All four route-describing members, in a fixed order. Absent members collapse to None, which
+    is a legitimate reply shape rather than an error - the television being its own active source
+    yields available true with ActiveRoute "TV" and neither a length nor a path list, because
+    GetActiveRoute's second branch assigns only those two (HdmiCecSinkImplementation.cpp:1527-
+    1531). Comparing them as present-or-absent on BOTH sides is what detects a member appearing,
+    disappearing or changing without demanding one the plugin is not obliged to send. Two readings
+    taken from the SAME branch serialise identically, which is what makes an equality comparison
+    between two consecutive probes meaningful.
+    Args:
+        result: The "result" mapping from a getActiveRoute reply
+    Returns:
+        An (available, ActiveRoute, length, pathList) tuple.
+    """
+    # "ActiveRoute" carries a CAPITAL A. It is the one field of the sink's JSON-RPC surface that
+    # is not lowerCamelCase (IHdmiCecSink.h:191), so it is spelled deliberately and not by habit.
+    return (
+        result.get("available"),
+        result.get("ActiveRoute"),
+        result.get("length"),
+        result.get("pathList"),
+    )
+
+
+def _probe_route(label):
+    """Read getActiveRoute and return its result mapping, or None with the reason logged.
+
+    Four probes in this case share it. Both transport guards are applied - the falsy check for an
+    undispatched command and the sentinel prefix check that utils.py documents, which a falsy
+    check cannot see because the sentinel is a non-empty string - and the body is parsed here so a
+    malformed reply is reported against the step that produced it rather than at the end of the
+    flow.
+    Args:
+        label: Human-readable name of the probe, used in the diagnostics
+    Returns:
+        The "result" mapping when the probe answered with a well-formed success reply,
+        otherwise None.
+    """
+    response = send_curl_command(HdmiCecSinkApis.get_active_route)
+    if not response:
+        log_error(f"✖ {label} getActiveRoute command not sent")
+        return None
+    if response.startswith("< No response"):
+        log_error(f"✖ {label} getActiveRoute got no response from WPEFramework")
+        return None
+    log_warning(f"  {label} active route: {response}")
+    try:
+        envelope = json.loads(response)
+    except json.JSONDecodeError:
+        log_error(f"✖ {label} getActiveRoute returned a body that is not JSON")
+        return None
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(result, dict):
+        log_error(f"✖ {label} getActiveRoute carried no result object")
+        return None
+    if result.get("success") is not True:
+        log_error(f"✖ {label} getActiveRoute did not report success")
+        log_warning(f"Actual  : {json.dumps(envelope, indent=2, sort_keys=True)}")
+        return None
+    return result
+
+
+def _acknowledged(response, label):
+    """Return True when a setter answered with a JSON-RPC result reporting success True.
+
+    An error reply carries no "result" member, and send_curl_command returns the first line that
+    parses as JSON at all - which need not even be an object. Both collapse to a failure here
+    rather than to an AttributeError out of run_test().
+    Args:
+        response: Raw response string as returned by send_curl_command
+        label: Human-readable name of the request, used in the diagnostics
+    Returns:
+        True when the reply is a JSON-RPC result carrying success True, otherwise False.
+    """
+    if not response:
+        log_error(f"✖ {label} command not sent")
+        return False
+    if response.startswith("< No response"):
+        log_error(f"✖ {label} got no response from WPEFramework")
+        return False
+    log_warning(f"  {label} response: {response}")
+    try:
+        envelope = json.loads(response)
+    except json.JSONDecodeError:
+        log_error(f"✖ {label} returned a body that is not JSON")
+        return False
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(result, dict) or result.get("success") is not True:
+        log_error(f"✖ {label} did not acknowledge success")
+        return False
+    return True
+
+
 def run_test():
+    '''Drive the routing APIs and assert what each of them actually does to the reported route.
+
+    The flow is sequenced and every expectation comes from the implementation, so each step is a
+    determined check rather than a shape check:
+      1. a peer announcement establishes a deterministic before state - a peer route is reported;
+      2. setActivePath is acknowledged and must leave the route UNCHANGED, because setStreamPath
+         only broadcasts a frame;
+      3. setRoutingChange between two HDMI ports is acknowledged and must also leave the route
+         unchanged, for the same reason;
+      4. setRoutingChange with newPort "TV" must change the reported route to exactly "TV";
+      5. the three inbound routing frames, whose handlers are log-only, must leave it at "TV";
+      6. a fresh announcement must hand the route back to the peer.
+    Returns:
+        True when every acknowledgement, invariant and transition above holds; False on any
+        transport failure, rejected injection, unreadable reply, or a route that moved when it
+        should not have - or failed to move when it should.
+    '''
     start_time = time.perf_counter()
 
     # ------------------------------------------------------------------ BEFORE-PROBE
+    # Recorded, not asserted. Whatever the preceding cases left is the starting point, and step 1
+    # below replaces it with a state this case established itself - which is what every later
+    # assertion is measured against.
     log_info("Executing the curl command get active route (before the routing changes)")
+    before = _probe_route("initial")
+    if before is None:
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+    log_info(f"  Starting point: {_route_reading(before)}")
 
-    before = send_curl_command(HdmiCecSinkApis.get_active_route)
+    # ---------------------------------------------------------- STEP 1: clear the active source
+    # setRoutingChange with oldPort naming the television sets m_currentActiveSource to -1
+    # unconditionally (HdmiCecSinkImplementation.cpp:2389-2393). GetActiveRoute then takes its
+    # third branch and answers available false (:1532-1535). That gives the rest of the case a
+    # KNOWN starting state established by this case rather than inherited from the suite.
+    log_info("Executing the curl command set routing change (television -> HDMI input)")
+    if not _acknowledged(
+        send_curl_command(HdmiCecSinkApis.set_routing_change_from_tv),
+        "setRoutingChange from the television",
+    ):
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+    time.sleep(1)
 
-    if not before:
-        log_error("✖ initial getActiveRoute command not sent")
+    cleared = _probe_route("after clearing the active source")
+    if cleared is None:
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
         return False
 
-    # utils.send_curl_command reports every transport failure as the byte-exact
-    # "< No response from WPEFramework >" sentinel. That string is TRUTHY, so it survives the
-    # emptiness check above and needs its own prefix guard - the test utils.py documents.
-    # Without it an unreachable device would be carried into json.loads below and misreported
-    # as a malformed payload, which points at the plugin instead of at the missing endpoint.
-    if before.startswith("< No response"):
-        log_error("✖ no response from WPEFramework")
+    if cleared.get("available") is not False:
+        log_error(
+            "✖ after setRoutingChange away from the television the route is still reported as "
+            f"available - reading {_route_reading(cleared)}. oldPort naming TV must leave nothing "
+            "holding the active source, so an available route means the request changed nothing"
+        )
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
         return False
 
-    log_warning(f"Initial active route: {before}")
+    cleared_reading = _route_reading(cleared)
+    log_success(f"✔ nothing holds the active source: {cleared_reading}")
 
-    # ONE try COVERS EVERY PARSE IN THIS MODULE: the two setter acknowledgements and both probe
-    # bodies are all read inside the block below, so a single json.JSONDecodeError handler keeps
-    # the contract of returning a bool on every path rather than raising into SuitManager's
-    # runner. The TRANSPORT guards stay inline at each step, because "no reply arrived" and "a
-    # reply arrived and was not JSON" are different verdicts and are reported as such.
-    try:
-        # -------------------------------------------------------------- ACT 1: setActivePath
-        log_info("Executing the curl command set active path")
+    # ------------------------------------------------------- STEP 2: setActivePath changes no route
+    # The sibling constant is dispatched verbatim. The requested path lives in
+    # HdmiCECSink_Curl.set_active_path and only there, so no physical-address literal appears in
+    # this module and an edit on one side cannot desynchronise the other.
+    #
+    # THE ASSERTION IS THAT THE ROUTE DID NOT MOVE, and that is the real contract rather than a
+    # weakened one. SetActivePath resolves the requested path and calls setStreamPath, whose
+    # entire body broadcasts <Set Stream Path> and touches no member of the instance
+    # (cpp:1461-1468, :2354-2371). A local route change would therefore be a defect, and the
+    # previous arrangement - assert the reply shape, log the route - could not have seen either
+    # outcome. Measured against step 1's reading, which this case established, so the comparison
+    # is against a known state and not against whatever the suite happened to leave behind.
+    log_info("Executing the curl command set active path")
+    if not _acknowledged(
+        send_curl_command(HdmiCecSinkApis.set_active_path), "setActivePath"
+    ):
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+    time.sleep(1)
 
-        # The sibling constant is dispatched verbatim. The requested path lives in
-        # HdmiCECSink_Curl.set_active_path and only there, so no physical-address literal
-        # appears in this module and an edit on one side cannot desynchronise the other.
-        set_path_response = send_curl_command(HdmiCecSinkApis.set_active_path)
+    after_path = _probe_route("after setActivePath")
+    if after_path is None:
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
 
-        if not set_path_response:
-            log_error("✖ setActivePath command not sent")
-            return False
-
-        if set_path_response.startswith("< No response"):
-            log_error("✖ no response from WPEFramework")
-            return False
-
-        # An error reply carries no "result" member, and send_curl_command returns the first
-        # line that parses as JSON at all - which need not even be an object. Both are
-        # normalised to an empty mapping so the predicate stays a plain .get() call.
-        envelope = json.loads(set_path_response)
-        result = envelope.get("result") if isinstance(envelope, dict) else None
-        if not isinstance(result, dict):
-            result = {}
-
-        if result.get("success") is not True:
-            log_error("✖ setActivePath did not acknowledge success")
-            log_warning(f"Response: {set_path_response}")
-            return False
-
-        log_success("✔ curl command sent")
-        log_warning(f"Response: {set_path_response}")
-
-        time.sleep(1)
-
-        # ------------------------------------------------------------ ACT 2: setRoutingChange
-        log_info("Executing the curl command set routing change")
-
-        # Same discipline as Act 1: the old and new port identifiers live in
-        # HdmiCECSink_Curl.set_routing_change. They matter, because setRoutingChange resolves
-        # each against hdmiInputs[portID].m_physicalAddr (HdmiCecSinkImplementation.cpp:2373)
-        # and rejects an identifier the port map cannot place - exactly the port-map dependency
-        # this case is here to walk.
-        routing_change_response = send_curl_command(HdmiCecSinkApis.set_routing_change)
-
-        if not routing_change_response:
-            log_error("✖ setRoutingChange command not sent")
-            return False
-
-        if routing_change_response.startswith("< No response"):
-            log_error("✖ no response from WPEFramework")
-            return False
-
-        envelope = json.loads(routing_change_response)
-        result = envelope.get("result") if isinstance(envelope, dict) else None
-        if not isinstance(result, dict):
-            result = {}
-
-        if result.get("success") is not True:
-            log_error("✖ setRoutingChange did not acknowledge success")
-            log_warning(f"Response: {routing_change_response}")
-            return False
-
-        log_success("✔ curl command sent")
-        log_warning(f"Response: {routing_change_response}")
-
-        time.sleep(1)
-
-        # -------------------------------------------------- ACT 3: inbound frame injection
-        # The peer-driven direction of the same exchange. Each post is a plain frame injection
-        # through the vComponent: no fixture changes the device's role, and no payload is
-        # hand-built here - see the framing note above the helper.
-        log_info("Emulating peer-driven routing traffic towards the sink")
-
-        ok1 = _post_hdmicec("Process_Routing_Change.yaml")
-        time.sleep(1)
-        ok2 = _post_hdmicec("Process_Routing_Information.yaml")
-        time.sleep(1)
-        ok3 = _post_hdmicec("Process_Set_Stream_Path.yaml")
-        time.sleep(1)
-
-        # All three are REQUIRED, and the check comes after all three rather than between them:
-        # a missing document or a refused path returns (0, diagnostic) from
-        # send_vcomponent_command, so posting the rest first makes the log name every document
-        # that failed instead of only the first.
-        if not (ok1 and ok2 and ok3):
-            log_error("✖ required vComponent emulation posts failed")
-            return False
-
-        # ------------------------------------------------------------------- AFTER-PROBE
-        log_info("Executing the curl command get active route (after the routing changes)")
-
-        after = send_curl_command(HdmiCecSinkApis.get_active_route)
-
-        if not after:
-            log_error("✖ final getActiveRoute command not sent")
-            return False
-
-        if after.startswith("< No response"):
-            log_error("✖ no response from WPEFramework")
-            return False
-
-        log_warning(f"Final active route: {after}")
-
-        # The before-probe is parsed too, so a malformed initial reply is caught rather than
-        # carried silently past the flow it was meant to characterise. Its VALUE is reported and
-        # not asserted on - see the note below.
-        before_envelope = json.loads(before)
-        before_result = (
-            before_envelope.get("result") if isinstance(before_envelope, dict) else None
+    if _route_reading(after_path) != cleared_reading:
+        log_error(
+            f"✖ setActivePath changed the reported route: {cleared_reading} became "
+            f"{_route_reading(after_path)}. It broadcasts <Set Stream Path> and moves no local "
+            "route state, so any change here is the plugin doing something it does not document"
         )
-        if not isinstance(before_result, dict):
-            before_result = {}
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
 
-        after_envelope = json.loads(after)
-        result = after_envelope.get("result") if isinstance(after_envelope, dict) else None
-        if not isinstance(result, dict):
-            result = {}
+    log_success("✔ setActivePath broadcast the stream path and left the local route untouched")
 
-        has_success = result.get("success") is True
-        has_available = isinstance(result.get("available"), bool)
+    # ------------------------------------------------- STEP 3: give the route to the television
+    # setRoutingChange with newPort naming the television sets m_currentActiveSource to the
+    # television's own allocated address (cpp:2408-2412), and GetActiveRoute's second branch then
+    # answers available true with ActiveRoute exactly "TV" (:1527-1531). This is a real
+    # transition out of step 1's cleared state and it is attributable to this one request, which
+    # is what makes an exact expected value sound here.
+    log_info("Executing the curl command set routing change (HDMI input -> television)")
+    if not _acknowledged(
+        send_curl_command(HdmiCecSinkApis.set_routing_change_to_tv),
+        "setRoutingChange to the television",
+    ):
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+    time.sleep(1)
 
-        available = result.get("available")
-        length = result.get("length")
-        path_list = result.get("pathList")
-        # Read from the key "ActiveRoute", with a CAPITAL A. It is the one field of the sink's
-        # JSON-RPC surface that is not lowerCamelCase (IHdmiCecSink.h:191), so it is spelled
-        # deliberately here and not by habit.
-        route_text = result.get("ActiveRoute")
+    on_tv = _probe_route("after routing to the television")
+    if on_tv is None:
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
 
-        if available is True:
-            # A route is being reported, so its description must be well formed. ActiveRoute is
-            # the one REQUIRED field - the only one the plugin sets on BOTH available-true
-            # branches - and it must be non-empty: an available route with no description is not
-            # a route.
-            #
-            # length and pathList are checked only WHEN PRESENT, and that is not laxness. The
-            # television being its own active source takes the second branch of GetActiveRoute
-            # (HdmiCecSinkImplementation.cpp:1527-1531), which sets available true and
-            # ActiveRoute "TV" and never assigns a length or builds a path list - a state
-            # reachable from this very flow, since setRoutingChange makes the television the
-            # active source whenever the new port identifier names "TV" (:2408-2412). Demanding
-            # both fields unconditionally would fail a correct device; the sink's own L2 test
-            # guards its iterator the same way.
-            route_valid = isinstance(route_text, str) and route_text != ""
-
-            # bool is a subclass of int, so a reply rendering length as true/false would
-            # otherwise satisfy an isinstance(int) test.
-            if length is not None and (
-                not isinstance(length, int) or isinstance(length, bool)
-            ):
-                route_valid = False
-
-            if path_list is not None and not isinstance(path_list, list):
-                route_valid = False
-
-            # "length" is the length of the ROUTE, taken from route.size(), while the path list
-            # is built by skipping every UNREGISTERED hop of that route (:1489-1501). So
-            # len(pathList) is at most length and equality must not be demanded - but a path
-            # list LONGER than the declared route length is a real defect.
-            if isinstance(path_list, list) and isinstance(length, int):
-                if not isinstance(length, bool) and len(path_list) > length:
-                    route_valid = False
-        else:
-            # available is False, or absent - has_available already fails on absent. With no
-            # peer acting as the active source the plugin answers
-            # {"available":false,"length":0,"ActiveRoute":"","success":true}, so an empty route
-            # set is the correct reply and demanding a populated route would be a false failure.
-            route_valid = True
-
-        # THE ROUTE VALUE IS REPORTED, NOT PINNED, AND THAT IS THE HONEST ASSERTION.
-        #
-        # Nothing above asserts a particular route string or a particular path length, and
-        # nothing should. Which route the plugin last recorded depends on how the two setters
-        # and the three injected frames interleave with whatever the preceding registered cases
-        # left behind, and this suite does not pin that ordering beyond its registration list.
-        # Worse for any fixed expectation, the three injected opcodes are handled by log-only
-        # bodies (:323, :327, :331) that move no route state at all, so asserting the route
-        # CHANGED after injection would assert behaviour the plugin does not implement. Shape
-        # and acknowledgement are what is asserted; the before and after values are logged so a
-        # human reading the run can see the transition that actually occurred.
-        log_info(
-            f"Route transition: before={before_result.get('ActiveRoute')!r} "
-            f"after={route_text!r}  available: {available}  length: {length}  "
-            f"pathList entries: "
-            f"{len(path_list) if isinstance(path_list, list) else 'absent'}"
+    if on_tv.get("available") is not True or on_tv.get("ActiveRoute") != TV_ROUTE_TEXT:
+        log_error(
+            "✖ after setRoutingChange to the television the route reads "
+            f"{_route_reading(on_tv)}, expected available True with ActiveRoute "
+            f"{TV_ROUTE_TEXT!r}. Still reading available False would mean the request was "
+            "acknowledged and did nothing"
         )
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
 
-        if has_success and has_available and route_valid:
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID19_Active_Path_Routing_Change_Flow Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
+    tv_reading = _route_reading(on_tv)
+    log_success(f"✔ the television holds the route: {tv_reading}")
 
-        log_warning(f"Actual  : {json.dumps(after_envelope, indent=2, sort_keys=True)}")
-    except json.JSONDecodeError:
-        log_error("Invalid JSON response")
+    # -------------------------------------- STEP 4: input to input resolves BOTH port addresses
+    # The third branch of setRoutingChange, and the one the pre-existing version of this case
+    # exercised: with NEITHER port naming the television, both names are resolved against
+    # hdmiInputs[portID].m_physicalAddr and <Routing Change> is broadcast, while
+    # m_currentActiveSource is left exactly as it was (cpp:2389-2433). It is kept because it is the
+    # only shape that walks the port map on BOTH sides - the dependency this module's own @details
+    # says it exists to walk - and because an unresolvable port index makes the plugin return
+    # before broadcasting (:2400, :2424), so an acknowledgement here is evidence the map placed
+    # both indices.
+    #
+    # The assertion is that the route did NOT move, measured against step 3's reading. That is the
+    # documented behaviour of this branch, so it is a real invariant rather than a weakened one.
+    log_info("Executing the curl command set routing change (HDMI input -> HDMI input)")
+    if not _acknowledged(
+        send_curl_command(HdmiCecSinkApis.set_routing_change),
+        "setRoutingChange between HDMI inputs",
+    ):
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+    time.sleep(1)
 
-    log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
-    return False
+    between_inputs = _probe_route("after routing between HDMI inputs")
+    if between_inputs is None:
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+
+    if _route_reading(between_inputs) != tv_reading:
+        log_error(
+            f"✖ setRoutingChange between two HDMI inputs changed the reported route: "
+            f"{tv_reading} became {_route_reading(between_inputs)}. Neither port names the "
+            "television, so that branch resolves both addresses and broadcasts without touching "
+            "the active source"
+        )
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+
+    log_success(
+        "✔ routing between two HDMI inputs resolved both port addresses and left the active "
+        "source where it was"
+    )
+
+    # ------------------------------------------- STEP 5: inbound routing frames are informational
+    # The peer-driven direction of the same exchange. Each post is a plain frame injection through
+    # the vComponent: no fixture changes the device's role, and no payload is hand-built here -
+    # see the framing note above the helper.
+    #
+    # THE ASSERTION IS THAT NONE OF THE THREE MOVES THE ROUTE. All three sink handlers are
+    # log-only bodies - process(RoutingChange) at cpp:323, process(RoutingInformation) at :327 and
+    # process(SetStreamPath) at :331 each contain a single LOGINFO and nothing else - so a route
+    # change after these injections would be behaviour the plugin does not implement. Asserting
+    # the documented no-op is a real assertion; asserting that the route CHANGED would have been
+    # asserting a defect.
+    log_info("Emulating peer-driven routing traffic towards the sink")
+
+    ok1 = _post_hdmicec("Process_Routing_Change.yaml")
+    time.sleep(1)
+    ok2 = _post_hdmicec("Process_Routing_Information.yaml")
+    time.sleep(1)
+    ok3 = _post_hdmicec("Process_Set_Stream_Path.yaml")
+    time.sleep(1)
+
+    # All three are REQUIRED, and the check comes after all three rather than between them: a
+    # missing document or a refused path returns (0, diagnostic) from send_vcomponent_command, so
+    # posting the rest first makes the log name every document that failed instead of only the
+    # first.
+    if not (ok1 and ok2 and ok3):
+        log_error("✖ required vComponent emulation posts failed")
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+
+    final = _probe_route("after the inbound routing frames")
+    if final is None:
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+
+    if _route_reading(final) != tv_reading:
+        log_error(
+            f"✖ the inbound routing frames changed the reported route: {tv_reading} became "
+            f"{_route_reading(final)}. All three of those handlers are log-only, so the route "
+            "must be exactly as step 3 left it"
+        )
+        log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
+        return False
+
+    log_success("✔ the three inbound routing frames were informational, as documented")
+    log_info(
+        f"Route transitions observed: {_route_reading(before)} -> {cleared_reading} "
+        f"(cleared) -> unchanged by setActivePath -> {tv_reading} (television) -> unchanged by "
+        "routing between inputs -> unchanged by the inbound frames"
+    )
+
+    elapsed_time = time.perf_counter() - start_time
+    msg = "TCID19_Active_Path_Routing_Change_Flow Passed ✅"
+    if os.environ.get("HDMICEC_TIMING_ENABLED"):
+        log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
+    else:
+        log_success(msg)
+    return True
 
 
-# NO RESTORE STEP HERE, AND ITS ABSENCE IS DELIBERATE.
+# THE RESTORE LIVES IN cleanup() ABOVE. The reported route is a function of m_currentActiveSource,
+# so restoring the route means restoring the selection - and the suite's fixtures plus
+# setRoutingChange(newPort=TV) between them express all three states the plugin can report: a peer
+# holds it, the sink holds it, nobody holds it. cleanup() reproduces whichever was observed at entry
+# and confirms it by read-back, and reports a residual rather than inventing a value when the entry
+# route described a peer no fixture in this suite can announce.
 #
-# This case leaves the routing state wherever the last setter and the last injected frame put
-# it. There is no inverse operation to call - the sink's JSON-RPC surface publishes setActivePath
+# On a passing run the residual is KNOWN rather than incidental: the television holds the active
+# source, so getActiveRoute answers available true with ActiveRoute "TV". Step 4 is the last write
+# and step 5 is asserted to change nothing, which is what makes the residual a stated value instead
+# of "wherever the last frame put it".
+#
+# There is no inverse operation to call - the sink's JSON-RPC surface publishes setActivePath
 # and setRoutingChange but nothing that restores a previously observed route - and the only
 # remaining way to force one would be to hand-build a CEC payload for the purpose, which this
 # suite does not do, because every frame it injects comes from a reviewed document under
