@@ -1,0 +1,9 @@
+HdmiCec:
+  command: "cec_message"
+  description: "Trigger process(ReportPhysicalAddress) from AudioSystem (LA=5)"
+  message:
+    user_defined: true
+    # Header byte 0x5F: initiator=5 (AudioSystem), destination=0xF (broadcast)
+    # Opcode  0x84: ReportPhysicalAddress
+    # Physical address 2.0.0.0 (sink HDMI port 2), device type 0x05 (AudioSystem)
+    payload: ["0x5F", "0x84", "0x20", "0x00", "0x05"]

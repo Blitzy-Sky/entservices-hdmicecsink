@@ -1,0 +1,79 @@
+#** *****************************************************************************
+# *
+# * If not stated otherwise in this file or this component's LICENSE file the
+# * following copyright and licenses apply:
+# *
+# * Copyright 2023 RDK Management
+# *
+# * Licensed under the Apache License, Version 2.0 (the "License");
+# * you may not use this file except in compliance with the License.
+# * You may obtain a copy of the License at
+# *
+# * http://www.apache.org/licenses/LICENSE-2.0
+# *
+# * Unless required by applicable law or agreed to in writing, software
+# * distributed under the License is distributed on an "AS IS" BASIS,
+# * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# * See the License for the specific language governing permissions and
+# * limitations under the License.
+# *
+#* ******************************************************************************
+# A single CEC frame exchanged between two emulated peers, described SYMBOLICALLY.
+#
+# THIS IS THE ONLY SYMBOLIC FIXTURE IN THIS DIRECTORY, and that exception is the whole
+# point of the document. Every other cec_message fixture here marks itself user-defined and
+# hands the vComponent raw hex bytes - Device_Give_OSD_Name.yaml posts a two-element byte
+# list whose first element is the header addressing logical address 5, the emulated audio
+# system, to logical address 0, the television that is the device under test, and whose
+# second element is the opcode. This document instead clears that flag and NAMES the frame's
+# parts, leaving the emulator to synthesize the bytes from the topology it already holds. Do
+# not convert it to the raw-byte form: Device_CEC_Message_Userdef.yaml is the separate
+# fixture that covers that shape, and collapsing the two would leave the symbolic path of
+# the vComponent's command parser untested by this suite.
+#
+# BECAUSE IT IS SYMBOLIC, IT IS ALSO THE COUPLING POINT between this directory and
+# ../hdmicec/hdmicec_vcomponent_cec_responses.yaml, which owns the opcode, type and payload
+# vocabulary. The emulator resolves the opcode string through its own token table and any
+# string absent from that table becomes CEC_OPCODE_UNKNOWN, so the frame silently never
+# matches an exchange - no error, no failure, just a step that quietly does nothing.
+# "CecVersion" and the "cec_version" operand placeholder are both defined in that document
+# (as the request the emulated peer absorbs, and as the operand of the reply it sends to
+# <Give CEC Version>), so this frame has a counterpart there. Cross-check the two documents
+# together whenever either is edited; neither can be trusted alone.
+#
+# ENDPOINTS ARE SOURCE-ROLE ON BOTH SIDES, which is the one substantive difference from the
+# HdmiCecSource template this file was modelled on. That template sends from a mapped child
+# to an emulated television, because its device under test is a playback device. Here the
+# device under test IS the television: HdmiCecSinkImplementation::allocateLAforTV() takes
+# LogicalAddress::TV for the sink itself and records it in m_logicalAddressAllocated, so no
+# emulated peer may hold that role and no television exists in this tree to address. The
+# direction of the reference frame is preserved - a mapped child sending to the emulated
+# device - with the endpoints re-pointed onto peers that exist here:
+#
+#   source      "SAMSUNG"  a mapped child of the root peer, device_type Tuner on port 1
+#   destination "VAUDIO"   the emulated device itself, an AudioSystem at logical address 5
+#
+# Both names are resolved by the emulator against the topology declared in
+# Device_Config_Add_Network.yaml, and "VAUDIO" is additionally the identity pinned by
+# config.emulated_device there and by ../hdmicec/hdmicec_vcomponent_configuration.yaml. An
+# endpoint that is not in the device map cannot be resolved, and an unresolved endpoint is
+# the same silent no-op as an unknown opcode - so a peer renamed in the topology must be
+# renamed here in the same change.
+#
+# Two peers exchanging a frame is NOT role inversion: nothing here reconfigures the device
+# under test to stand in for its own peer. The sink remains the television throughout.
+#
+# The filename is part of the contract. utils.HDMICEC_CMD_BASE resolves to this directory,
+# so a test case posts the bare name "Device_CEC_Message.yaml" against it; note the
+# upper-case CEC and the distinction from Device_CEC_Message_Userdef.yaml. A mismatch
+# returns not-found and disables that step of the case without failing it.
+HdmiCec:
+  command: cec_message
+  description: Send a CEC message
+  message:
+    user_defined: false
+    source: "SAMSUNG"
+    destination: "VAUDIO"
+    opcode: "CecVersion"
+    type: "Direct"
+    payload: ["cec_version"] # Optional parameters for the CEC message
