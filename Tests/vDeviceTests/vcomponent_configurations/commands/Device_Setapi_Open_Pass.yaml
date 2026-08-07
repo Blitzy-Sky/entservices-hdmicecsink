@@ -1,0 +1,7 @@
+HdmiCec:
+  command: update_device_status
+  description: Clear emulated HAL open failure for post-condition cleanup
+  device:
+    name: "VAUDIO"
+    power_status: "on"
+    fault: no
