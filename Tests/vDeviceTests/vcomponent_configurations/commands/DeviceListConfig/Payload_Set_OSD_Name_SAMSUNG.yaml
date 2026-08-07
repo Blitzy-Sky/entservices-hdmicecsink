@@ -1,0 +1,8 @@
+HdmiCec:
+  command: "cec_message"
+  description: "Trigger process(SetOSDName) from SAMSUNG (LA=3) - OSD name 'SAMSUNG'"
+  message:
+    user_defined: true
+    # Header 0x30: initiator=3 (SAMSUNG), destination=0 (sink DUT, directed)
+    # Opcode 0x47: SetOSDName  "SAMSUNG" = 0x53 0x41 0x4D 0x53 0x55 0x4E 0x47
+    payload: ["0x30", "0x47", "0x53", "0x41", "0x4D", "0x53", "0x55", "0x4E", "0x47"]

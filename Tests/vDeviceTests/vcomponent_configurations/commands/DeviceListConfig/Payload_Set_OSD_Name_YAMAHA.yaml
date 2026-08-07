@@ -1,0 +1,9 @@
+HdmiCec:
+  command: "cec_message"
+  description: "Trigger process(SetOSDName) from AudioSystem (LA=5) - OSD name 'YAMAHA'"
+  message:
+    user_defined: true
+    # Header 0x50: initiator=5 (AudioSystem), destination=0 (sink DUT, directed)
+    # Opcode 0x47: SetOSDName
+    # "YAMAHA" = 0x59 0x41 0x4D 0x41 0x48 0x41
+    payload: ["0x50", "0x47", "0x59", "0x41", "0x4D", "0x41", "0x48", "0x41"]
