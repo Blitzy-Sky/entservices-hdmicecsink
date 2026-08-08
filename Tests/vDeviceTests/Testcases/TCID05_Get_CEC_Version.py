@@ -74,7 +74,6 @@
 
 
 import time
-import os
 
 
 import json
@@ -247,11 +246,7 @@ def run_test():
                 f"✔ the dispatcher reported the method as unknown (code {error_code})"
             )
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID05_Get_CEC_Version Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID05_Get_CEC_Version Passed ✅", elapsed_time))
             return True
 
         if answered_with_result:

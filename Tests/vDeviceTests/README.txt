@@ -153,7 +153,7 @@ would say so.
   Any other value - "ture", "2", "enabled" - is a configuration error and fails.
 - Init_Devicelist_Populate_MIN_DEVICES
   Minimum device count accepted in the default bootstrap mode. Default 1, and accepted only
-  as a whole number within 1..<number of seeded peers>, which is 5. Below 1 the gate would
+  as a whole number within 1..<number of seeded peers>, which is 6. Below 1 the gate would
   assert nothing and an empty device list would pass; above the peer count it could never be
   satisfied, because this module seeds exactly that many peers. Either is a configuration
   error and fails.
@@ -172,18 +172,38 @@ Prerequisites:
 
 The device under test is the sink: the television itself, which owns CEC logical address 0.
 Every virtual CEC peer this suite configures is therefore a source-role device sitting
-beneath that television. The five peers seeded before the first test case are an audio
-system at address 5, a playback device at 4, two tuners at 3 and 6, and a recording device
-at 1. No virtual television is created, and the device under test keeps its sink role
-throughout; it is never reconfigured to stand in for a peer of its own.
+beneath that television. The six peers seeded before the first test case are a recording
+device at 1 (DENON) and a second at 2 (LG), a tuner at 3 (SAMSUNG), a playback device at 4
+(SONY), an audio system at 5 (YAMAHA) and a second playback device at 8 (PANASONIC). No
+virtual television is created, and the device under test keeps its sink role throughout; it
+is never reconfigured to stand in for a peer of its own.
 
 Each peer's address is one its role can actually hold. CEC allots every device type a fixed
-set of logical addresses - audio system 5; recording device 1, 2 and 9; tuner 3, 6 and 7 and
+set of logical addresses - audio system 5; recording device 1, 2 and 9; tuner 3, 6, 7 and
 10; playback device 4, 8 and 11 - so a peer declared as one role and announced at another
 role's address describes a device that cannot exist, and strict verification could never be
-satisfied by it. The same rule bounds the full emulated network in
-vcomponent_configurations/commands/Device_Config_Add_Network.yaml: its eleven peers occupy
-all eleven non-television addresses, so adding a peer there means removing one.
+satisfied by it. Those pools are also what fix each address: the emulator hands a device the
+first free address in the pool for its declared type, so the tree in
+vcomponent_configurations/commands/Device_Config_Add_Network.yaml determines all six
+addresses and none of them is a choice this suite makes.
+
+That tree is the single authoritative topology, and it declares SIX peers rather than one per
+address:
+
+  VTV (television, 0.0.0.0, three ports)
+    HDMI input 0 -> SAMSUNG    Tuner            1.0.0.0   -> logical address 3
+    HDMI input 1 -> YAMAHA     AudioSystem      2.0.0.0   -> logical address 5
+                     port 1 -> DENON      RecordingDevice  2.1.0.0  -> 1
+                     port 2 -> PANASONIC  PlaybackDevice   2.2.0.0  -> 8
+                     port 3 -> LG         RecordingDevice  2.3.0.0  -> 2
+                     port 4 -> reserved, left free for Device_Add.yaml
+    HDMI input 2 -> SONY       PlaybackDevice   3.0.0.0   -> logical address 4  (active source)
+
+Addresses 6, 7, 9, 10 and 11 are deliberately unoccupied, so a peer can be added without
+removing one - which is what TCID27_Device_Add_Remove_Discovery_Flow relies on. Every peer's
+three seed payload documents announce the address, physical address and device type this tree
+produces for it, and Init_Devicelist_Populate.verify_topology_consistency() proves all three
+sources still agree before the first frame is injected.
 
 Status:
 AUTHORED, NOT EXECUTED.

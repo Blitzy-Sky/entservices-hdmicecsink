@@ -117,24 +117,30 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
+ *  - HDMI-CEC reads enabled on both sides of the malformed request.
  *  - The active route read after the malformed request equals the one read before it, and the
  *    audio-device connected status is likewise unchanged.
- *  - The setupARCRouting reply to the malformed request is logged and not asserted:
- *    see @details.
+ *  - The setupARCRouting reply to the malformed request IS asserted, by require_ack: reading
+ *    Thunder's registration template settles what the plugin does with an unrecognised member,
+ *    so the acknowledgement is a determined outcome rather than a plugin choice this case
+ *    would be wrong to pin. See @details, which sets out the derivation.
  *  - No ARC routing state change is claimed, because none is observable from this transport.
  *
  * @pass_criteria
- *  - The malformed setupARCRouting write is answered with a real JSON-RPC envelope, both route
- *    reads parse and carry a result member reporting success True with a boolean available,
- *    their available / ActiveRoute / length / pathList values are equal, the two
- *    connected-status reads agree, and run_test() returns True.
+ *  - HDMI-CEC reads enabled before and after, the malformed setupARCRouting write is
+ *    acknowledged with success True, all four state reads classify as JSON-RPC result objects
+ *    reporting success True, both route reads carry a boolean available, their available /
+ *    ActiveRoute / length / pathList values are equal, the two connected-status reads agree,
+ *    and run_test() returns True.
  *
  * @failure_criteria
- *  - A request is not dispatched, a response is the no-response sentinel, the malformed
- *    setupARCRouting write returns no JSON-RPC envelope or one with neither a result nor an
- *    error member, either read lacks a result member or reports success other than True or a
- *    non-boolean available, any compared route field differs, the connected-status values
- *    differ, a parse error occurs, or run_test() returns False.
+ *  - HDMI-CEC reads other than enabled on either side, a request is not dispatched, a response
+ *    is the no-response sentinel, the malformed setupARCRouting write is refused or not
+ *    acknowledged, any state read is not a JSON-RPC result object or reports success other than
+ *    True, either route read carries a non-boolean available, the baseline connected status is
+ *    not a boolean, any compared route field still differs after the bounded settle, the
+ *    connected-status values still differ after it, a parse error occurs, or run_test() returns
+ *    False.
  */
 """
 
@@ -152,6 +158,7 @@ from utils import (
     log_success,
     log_error,
     log_warning,
+    log_with_timing,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -333,6 +340,21 @@ def run_test():
     # are read on either side and compared. That a typo can silently take the stop path is a
     # production robustness gap of the same family as TCID29_Invalid_OSD_Setnochange's, and it is
     # reported in this module's @note rather than repaired here.
+    # THE ENABLED PRECONDITION, READ RATHER THAN ASSUMED. Every invariant below is about what a
+    # malformed request must not disturb, and none of them means anything while HDMI-CEC is off:
+    # SetupARCRouting, getActiveRoute and getAudioDeviceConnectedStatus would all be answering from
+    # a plugin that is not driving the bus at all. Init_Devicelist_Populate enables it at bootstrap,
+    # so a false reading here is a precondition failure rather than a finding about ARC.
+    enabled_before = _read_flag(HdmiCecSinkApis.get_enabled, "enabled")
+    if enabled_before is not True:
+        log_error(
+            f"✖ HDMI-CEC reads enabled={enabled_before!r} before the malformed request, so none "
+            "of the invariants this case measures would mean anything - the suite's bootstrap "
+            "enable did not hold"
+        )
+        log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
+        return False
+
     baseline_route = send_curl_command(HdmiCecSinkApis.get_active_route)
     baseline_audio = send_curl_command(HdmiCecSinkApis.get_audio_device_connected_status)
     if not require_ack(HdmiCecSinkApis.setup_arc_routing_invalid, "malformed setupARCRouting"):
@@ -367,34 +389,108 @@ def run_test():
 
     log_warning(f"Baseline route response: {sanitise_for_log(baseline_route, max_chars=2048)}")
     log_warning(f"Final route response: {sanitise_for_log(final_route, max_chars=2048)}")
+    log_warning(f"Baseline audio status: {sanitise_for_log(baseline_audio, max_chars=2048)}")
+    log_warning(f"Final audio status: {sanitise_for_log(final_audio, max_chars=2048)}")
 
-    log_warning(f"ARC status before: {before_status}")
-    log_warning(f"ARC status after: {after_status}")
-    try:
-        before_connected = json.loads(before_status).get("result", {}).get("connected")
-        after_connected = json.loads(after_status).get("result", {}).get("connected")
-        # `is not None` first: two absent keys both resolve to None and would compare equal.
-        if before_connected is not None and after_connected == before_connected:
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID32_Invalid_ARC_Routing_Nochange Passed"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
-    except Exception:
-        # Broader than JSONDecodeError on purpose: a non-object result raises on .get(), and
-        # either shape failure leaves the invariant unconfirmed - as a mismatch does.
-        pass
+    # CLASSIFY ALL FOUR READS BEFORE COMPARING ANY OF THEM. _envelope admits a result object and an
+    # error envelope and rejects everything that is neither, which is what stops this case comparing
+    # two unreadable bodies and calling them equal - the failure mode a negative-path case is most
+    # exposed to, because "nothing changed" is exactly what a broken read looks like. The four
+    # bodies are classified from the strings already logged above rather than re-fetched, so what a
+    # reader sees in the transcript is what was judged.
+    classified = {}
+    for label, response in (
+        ("baseline getActiveRoute", baseline_route),
+        ("final getActiveRoute", final_route),
+        ("baseline getAudioDeviceConnectedStatus", baseline_audio),
+        ("final getAudioDeviceConnectedStatus", final_audio),
+    ):
+        shape, result = _envelope(response)
+        if shape != "result":
+            log_error(
+                f"✖ {label} did not answer with a JSON-RPC result object "
+                f"({'an error envelope' if shape == 'error' else 'not a JSON-RPC envelope at all'})"
+                ", so there is nothing here to compare"
+            )
+            log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
+            return False
+        if result.get("success") is not True:
+            log_error(
+                f"✖ {label} reports success={sanitise_for_log(result.get('success'))}, so its "
+                "contents are not a reading this case may rest on"
+            )
+            log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
+            return False
+        classified[label] = result
 
-    connected_ok, connected_after = _wait_until(
-        lambda: _read_flag(HdmiCecSinkApis.get_audio_device_connected_status, "connected"),
-        connected_before,
-    )
-    if not connected_ok:
+    # THE ACTIVE ROUTE. Compared as the four-field tuple _route_fields defines, present-or-absent on
+    # both sides. `available` is additionally required to be a boolean on both, because a reply
+    # missing it is a shape this case cannot read rather than a route that did not move.
+    before_route = classified["baseline getActiveRoute"]
+    after_result = classified["final getActiveRoute"]
+    for label, result in (
+        ("baseline getActiveRoute", before_route), ("final getActiveRoute", after_result)
+    ):
+        if not isinstance(result.get("available"), bool):
+            log_error(
+                f"✖ {label} carries available={sanitise_for_log(result.get('available'))} rather "
+                "than a boolean, so the route it reports cannot be believed"
+            )
+            log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
+            return False
+
+    baseline_fields = _route_fields(before_route)
+    after_route = _route_fields(after_result)
+    if after_route != baseline_fields:
+        # Given a bounded second chance before failing. The route is owned by active-source
+        # handling, which runs off the plugin's own poll and decode path, so an immediate re-read
+        # taken microseconds after a write can legitimately catch a transient - and _wait_until
+        # returns the instant it agrees, or the LAST reading it saw, which is the one worth naming.
+        settled, last_route = _wait_until(_read_active_route, baseline_fields)
+        if not settled:
+            log_error(
+                f"✖ the active route moved across the malformed request: {baseline_fields} -> "
+                f"{after_route}, still {last_route} after {OBSERVE_TIMEOUT_S:.0f}s. ARC setup does "
+                "not own the active route, so a malformed ARC request must not perturb it"
+            )
+            log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
+            return False
+        after_route = last_route
+
+    # THE AUDIO-DEVICE CONNECTED FLAG. `is not None` is not enough on its own here - two absent
+    # members both read None and would compare equal - so the baseline is required to be a boolean
+    # before it is used as the expectation.
+    connected_before = classified["baseline getAudioDeviceConnectedStatus"].get("connected")
+    connected_after = classified["final getAudioDeviceConnectedStatus"].get("connected")
+    if not isinstance(connected_before, bool):
         log_error(
-            f"✖ audio device connected reads {connected_after!r} after the malformed request, "
-            f"expected the baseline {connected_before!r}"
+            f"✖ the baseline audio-device connected status reads "
+            f"{sanitise_for_log(connected_before)} rather than a boolean, so there is no baseline "
+            "for the after-read to be compared against"
+        )
+        log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
+        return False
+
+    if connected_after != connected_before:
+        connected_ok, connected_after = _wait_until(
+            lambda: _read_flag(HdmiCecSinkApis.get_audio_device_connected_status, "connected"),
+            connected_before,
+        )
+        if not connected_ok:
+            log_error(
+                f"✖ audio device connected reads {connected_after!r} after the malformed request, "
+                f"expected the baseline {connected_before!r}"
+            )
+            log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
+            return False
+
+    # AND STILL ENABLED. Read again on the far side, because a malformed request that took the
+    # plugin's CEC stack down with it would leave every invariant above trivially satisfied.
+    enabled_after = _read_flag(HdmiCecSinkApis.get_enabled, "enabled")
+    if enabled_after is not True:
+        log_error(
+            f"✖ HDMI-CEC reads enabled={enabled_after!r} after the malformed request, so the "
+            "request disturbed considerably more than ARC routing"
         )
         log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
         return False

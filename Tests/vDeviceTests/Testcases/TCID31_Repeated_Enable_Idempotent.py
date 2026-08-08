@@ -6,13 +6,22 @@
  * @testcase TCID31_Repeated_Enable_Idempotent
  * @details Validates that org.rdk.HdmiCecSink.setEnabled is idempotent in the enable
  *          direction: two consecutive setEnabled(true) requests must leave getEnabled
- *          reporting true rather than oscillating back to false. Both reads are logged,
- *          only the second asserted. This is the enable-side twin of
- *          TCID30_Repeated_Disable_Idempotent, which disables at the preceding position.
- *          The enabled state it leaves behind IS the suite invariant - established by
+ *          reporting true rather than oscillating back to false. Both writes are required
+ *          to acknowledge and both reads are asserted, the second of them across three
+ *          consecutive readings so that "held" is distinguishable from "was right once".
+ *          This is the enable-side twin of TCID30_Repeated_Disable_Idempotent, which
+ *          disables at the preceding position.
+ *
+ *          THE DISABLED STATE IS MANUFACTURED FIRST, and that is what gives the case its
+ *          subject. TCID30 restores the enabled invariant, so a plugin arriving here is
+ *          already enabled and both enables would be no-ops against a state nothing had
+ *          moved - satisfied even by a plugin that had stopped honouring setEnabled. One
+ *          setEnabled(false), read back, makes the first enable a real transition and the
+ *          second the idempotence claim. The disable is transient: the enabled state this
+ *          module leaves behind IS the suite invariant - established by
  *          Init_Devicelist_Populate, asserted by TCID01_Get_Enabled_Status - so no
- *          restoration is needed here, and enabling an enabled plugin is a legitimate
- *          no-op, so the module is correct in isolation too.
+ *          restoration follows the flow, while cleanup() closes the window between the
+ *          disable and the re-enable on any path that leaves it open.
  *
  * @precondition
  *  - The org.rdk.HdmiCecSink plugin is active and reachable over the JSON-RPC endpoint.
@@ -26,29 +35,37 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - After two consecutive enable requests the reported state is true, and HDMI-CEC is
- *    left enabled for the remaining test cases.
+ *  - The precondition disable is acknowledged and reads back false; both enable requests
+ *    are acknowledged; the reported state is true after each of them and holds true across
+ *    three consecutive readings; and HDMI-CEC is left enabled for the remaining test cases.
  *
  * @pass_criteria
- *  - The second getEnabled response parses and reports result.enabled as True, and
- *    run_test() returns True.
+ *  - setEnabled(false) is acknowledged and getEnabled reads false within the settle budget,
+ *    both setEnabled(true) requests are acknowledged, getEnabled reports a boolean
+ *    result.enabled of True after each, three consecutive readings agree, and run_test()
+ *    returns True.
  *
  * @failure_criteria
- *  - The request is not dispatched, the response is the no-response sentinel, the body
- *    does not parse, result.enabled is not True, or run_test() returns False.
+ *  - Any request is not dispatched or not acknowledged, a response is the no-response
+ *    sentinel, a body does not parse, result.enabled is absent or not a boolean, the
+ *    precondition disable never reads back false, either enable does not read back true,
+ *    the three confirming readings disagree, or run_test() returns False.
  */
 """
 
 import time
-import os
+import json
 from utils import (
+    send_curl_command,
     send_jsonrpc_envelope,
     envelope_result,
     require_ack,
     sanitise_for_log,
+    log_info,
     log_success,
     log_error,
     log_warning,
+    log_with_timing,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -85,8 +102,17 @@ def _result_object(response_text):
     return result if isinstance(result, dict) else {}
 
 
-def _read_enabled():
-    """Return the published HDMI-CEC enabled flag, or None when it cannot be read."""
+def _read_enabled_quietly():
+    """Return the published HDMI-CEC enabled flag, or None when it cannot be read. Logs nothing.
+
+    THE SILENT READER, and the reason there are two. This one is what the bounded polls and the
+    repeated-reading confirmation call, so a wait that takes sixty samples produces sixty reads and
+    no log lines; _read_enabled(label) below is the reporting form, called where a single reading
+    becomes part of a verdict and has to appear in the transcript. Both were previously spelled
+    _read_enabled, and because a module body runs top to bottom the later definition bound the name -
+    which left _wait_for_enabled and _confirm_held calling a one-argument function with no
+    arguments.
+    """
     response = send_curl_command(HdmiCecSinkApis.get_enabled)
     # utils.send_curl_command reports a transport failure by RETURNING the TRUTHY sentinel
     # "< No response from WPEFramework >", so the prefix form is the detection contract.
@@ -135,7 +161,7 @@ def _wait_for_enabled(expected):
     """Poll the published flag until it reads `expected`; returns (matched, last_reading)."""
     deadline = time.monotonic() + SETTLE_TIMEOUT_S
     while True:
-        observed = _read_enabled()
+        observed = _read_enabled_quietly()
         if observed is expected:
             return True, observed
         if time.monotonic() >= deadline:
@@ -150,7 +176,7 @@ def _confirm_held(expected):
     moment it was sampled", and the idempotent repeat's entire claim is that the value HELD.
     """
     for _ in range(CONFIRM_READINGS):
-        observed = _read_enabled()
+        observed = _read_enabled_quietly()
         if observed is not expected:
             return False, observed
         time.sleep(SETTLE_POLL_S)
@@ -218,7 +244,8 @@ def run_test():
     Returns:
         True when every setEnabled acknowledges and every read-back agrees; False on any transport
         failure, unacknowledged request, unreadable flag or transition that never happened. HDMI-CEC
-        is enabled on every exit path.
+        is enabled on every exit path - by this function on the paths that reach its end, and by
+        cleanup() on the paths that return early with the state still disturbed.
     """
     global _enabled_disturbed
     _enabled_disturbed = False
@@ -231,7 +258,44 @@ def run_test():
     # standing invariant, so the plugin arrives at this case already enabled: a reading of true
     # proves nothing at all unless the write that preceded it was acknowledged. With the replies
     # discarded, this case would have reported a pass with neither request reaching the device.
+    #
+    # AND THE DISABLED STATE IS MANUFACTURED FIRST, which is what makes the first enable a real
+    # TRANSITION rather than a second no-op. TCID30_Repeated_Disable_Idempotent runs immediately
+    # before this case and restores the enabled invariant, so without this step the plugin arrives
+    # already enabled and BOTH enables would be no-ops - the case would then be asserting only that
+    # an already-true flag stayed true, which a plugin that had stopped honouring setEnabled
+    # entirely would satisfy. The disable is transient and this module's terminal state is still
+    # enabled, so the suite invariant the file docstring describes is unaffected; _enabled_disturbed
+    # is what lets cleanup() close the window between the disable and the re-enable if anything
+    # raises inside it.
+    if not _set_enabled(HdmiCecSinkApis.set_enabled_false, "precondition setEnabled(false)"):
+        log_error("TCID31_Repeated_Enable_Idempotent Failed")
+        return False
+    _enabled_disturbed = True
+
+    disabled, observed = _wait_for_enabled(False)
+    if not disabled:
+        log_error(
+            f"✖ the precondition setEnabled(false) was acknowledged but getEnabled reports "
+            f"enabled={observed!r} after {SETTLE_TIMEOUT_S:.0f}s, so the enables that follow would "
+            "not be transitions and their idempotence would be untested"
+        )
+        log_error("TCID31_Repeated_Enable_Idempotent Failed")
+        return False
+    log_success("✔ precondition established: HDMI-CEC reads disabled")
+
     if not require_ack(HdmiCecSinkApis.set_enabled_true, "first setEnabled(true)"):
+        log_error("TCID31_Repeated_Enable_Idempotent Failed")
+        return False
+
+    # Waited for before it is reported: CECEnable() starts the poll thread rather than assigning a
+    # flag, so an immediate read can legitimately still be false.
+    enabled, observed = _wait_for_enabled(True)
+    if not enabled:
+        log_error(
+            f"✖ the first setEnabled(true) was acknowledged but getEnabled reports "
+            f"enabled={observed!r} after {SETTLE_TIMEOUT_S:.0f}s"
+        )
         log_error("TCID31_Repeated_Enable_Idempotent Failed")
         return False
 
@@ -256,36 +320,32 @@ def run_test():
         log_error("TCID31_Repeated_Enable_Idempotent Failed")
         return False
 
+    # HELD, NOT MERELY OBSERVED. The repeat's whole claim is that the state did not move, and a
+    # single sample cannot tell "it held" from "it was right at the instant it was read" - the
+    # repeated enable runs CECEnable()'s guard path, and a plugin that briefly tore the connection
+    # down and rebuilt it would satisfy one reading and fail three.
+    held, observed = _confirm_held(True)
+    if not held:
+        log_error(
+            f"✖ HDMI-CEC did not hold enabled across {CONFIRM_READINGS} consecutive readings "
+            f"after the repeated enable: read {observed!r}"
+        )
+        log_error("TCID31_Repeated_Enable_Idempotent Failed")
+        return False
+    log_success(
+        f"✔ a repeated setEnabled(true) is idempotent: enabled read true after both acknowledged "
+        f"writes and held across {CONFIRM_READINGS} consecutive readings"
+    )
+
     # No restoration request follows, deliberately: enabled IS the suite invariant, so this
     # module's terminal state is already the wanted one. That is the intentional asymmetry
     # with TCID30_Repeated_Disable_Idempotent, which must send a trailing set_enabled_true.
-    # It is also why the two guards above may return early without a restore: every path
-    # through this module leaves HDMI-CEC in the state the rest of the suite needs.
+    # The flag is cleared here rather than left set, so cleanup() reports "nothing to restore"
+    # instead of re-issuing an enable the case has just proven is in force - and so that an early
+    # return from any of the guards ABOVE this point, where the state genuinely is disturbed,
+    # still leaves cleanup() with the restoration to do.
+    _enabled_disturbed = False
 
-    if not second_get:
-        log_error("✖ getEnabled command not sent")
-        return False
-    # The sentinel is a non-empty string, so the falsy check above cannot catch it.
-    if second_get.startswith("< No response"):
-        log_error("✖ getEnabled returned no response from WPEFramework")
-        return False
-
-    log_warning(f"First enabled response: {first_get}")
-    log_warning(f"Final enabled response: {second_get}")
-    try:
-        body = json.loads(second_get)
-        enabled = body.get("result", {}).get("enabled")
-        # `is True`: a missing key yields None, and a truthy non-bool is not the contract.
-        if enabled is True:
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID31_Repeated_Enable_Idempotent Passed"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
-    except Exception:
-        pass
-
-    log_error("TCID31_Repeated_Enable_Idempotent Failed")
-    return False
+    elapsed_time = time.perf_counter() - start_time
+    log_success(log_with_timing("TCID31_Repeated_Enable_Idempotent Passed", elapsed_time))
+    return True

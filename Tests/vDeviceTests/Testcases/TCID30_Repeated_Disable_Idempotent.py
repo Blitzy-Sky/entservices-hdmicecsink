@@ -45,7 +45,6 @@
 """
 
 import time
-import os
 from utils import (
     send_jsonrpc_envelope,
     envelope_result,
@@ -54,6 +53,7 @@ from utils import (
     log_success,
     log_error,
     log_warning,
+    log_with_timing,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -154,9 +154,5 @@ def run_test():
         return False
 
     elapsed_time = time.perf_counter() - start_time
-    msg = "TCID30_Repeated_Disable_Idempotent Passed"
-    if os.environ.get("HDMICEC_TIMING_ENABLED"):
-        log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-    else:
-        log_success(msg)
+    log_success(log_with_timing("TCID30_Repeated_Disable_Idempotent Passed", elapsed_time))
     return True

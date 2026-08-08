@@ -4,18 +4,28 @@
  * @brief L3 HDMI CEC Sink functional testcase.
  *
  * @testcase TCID28_Invalid_VendorID_Nochange
- * @details Validates that a malformed org.rdk.HdmiCecSink.setVendorId request leaves the
- *          advertised vendor identifier unchanged: the identifier is established, read,
- *          subjected to a request whose parameter key is misspelled, then read again. Both
- *          reads are logged and compared; the two setVendorId replies are captured but not
- *          asserted, because a plugin may refuse an unrecognised parameter with an error or
- *          a bare acknowledgement, and pinning that choice would test the reply rather than
- *          the invariant. The misspelled key lives in HdmiCECSink_Curl.set_vendor_id_invalid
- *          and only there, so this module pins no vendor identifier and compares two
- *          observations. It is the negative leg of a triple - TCID11_Set_Vendor_ID is the
- *          positive write, TCID12_Verify_Vendor_ID_Readback the readback - and its first
- *          request re-establishes the value TCID11 wrote at position 11, a residual TCID11
- *          documents and delegates here, so no restore clause is needed on any path.
+ * @details Validates what a malformed org.rdk.HdmiCecSink.setVendorId request may do to the
+ *          advertised vendor identifier: a DISTINGUISHING identifier is written through the
+ *          published setter and read back exactly, the request whose parameter key is
+ *          misspelled is sent, and the identifier is read again. Afterwards it must be
+ *          EXACTLY ONE OF two values, and which one is reported - the distinguishing
+ *          baseline, meaning the request was refused or ignored, or the plugin's documented
+ *          0x0019FB fallback, meaning the misspelt member was absorbed as an empty
+ *          identifier and SetVendorId's catch-all substituted its literal. A third value
+ *          fails. The malformed reply is CLASSIFIED rather than required to acknowledge,
+ *          because both a refusal and an acknowledgement are legitimate answers; a body that
+ *          is neither fails, since that is a transport failure and not a plugin choice. An
+ *          error envelope paired with a changed identifier fails too - a refused request
+ *          cannot have applied anything.
+ *
+ *          WHY THE BASELINE IS NOT THE SHARED CONSTANT'S VALUE. HdmiCECSink_Curl.set_vendor_id
+ *          writes 0x0019FB, which is also the fallback, so baselining with it made "refused"
+ *          and "absorbed and defaulted" the same reading and the case could not fail. The
+ *          misspelled key lives in HdmiCECSink_Curl.set_vendor_id_invalid and only there.
+ *          This is the negative leg of a triple - TCID11_Set_Vendor_ID is the positive write,
+ *          TCID12_Verify_Vendor_ID_Readback the readback - and because it now writes a value
+ *          of its own it creates a residual, which cleanup() restores to whatever the
+ *          identifier read before this case wrote anything.
  *
  * @precondition
  *  - The org.rdk.HdmiCecSink plugin is active and reachable over the JSON-RPC endpoint.
@@ -30,28 +40,41 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - The vendor identifier read after the malformed request equals the one read before it.
+ *  - The distinguishing baseline is acknowledged and reads back exactly; the malformed
+ *    request answers with a JSON-RPC result or error envelope; the identifier afterwards is
+ *    either that baseline or the plugin's 0x0019FB fallback, and which one is reported; and
+ *    cleanup() restores the identifier this case found before it wrote anything.
  *
  * @pass_criteria
- *  - Both reads parse, both carry a result member, their vendorid values are equal, and
+ *  - The distinguishing baseline renders differently from the fallback, the pre-case
+ *    identifier is readable and captured, the baseline write is acknowledged and reads back
+ *    within the observe budget, the malformed reply classifies as a result or an error
+ *    envelope, the final read carries a non-empty vendorid string, that value is either the
+ *    baseline or the fallback, an error envelope is not paired with a changed identifier, and
  *    run_test() returns True.
  *
  * @failure_criteria
- *  - The final read is empty or is the no-response sentinel, either read lacks a result
- *    member, the values differ, a parse error occurs, or run_test() returns False.
+ *  - The baseline and the fallback render alike, the pre-case identifier cannot be read, the
+ *    baseline write is refused or never reads back, the malformed reply is neither a result
+ *    nor an error envelope, the final read is empty or lacks a usable vendorid, the final
+ *    value is neither the baseline nor the fallback, an error envelope accompanies a changed
+ *    identifier, a parse error occurs, or run_test() returns False.
  */
 """
 
 import time
-import os
+import json
 from utils import (
+    send_curl_command,
+    send_jsonrpc_command,
     send_jsonrpc_envelope,
     envelope_result,
-    require_ack,
     sanitise_for_log,
+    log_info,
     log_success,
     log_error,
     log_warning,
+    log_with_timing,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -316,79 +339,99 @@ def run_test():
     # no-response sentinel, refuses an envelope answering another request id, and requires the
     # sink's published success shape.
     #
-    # WHY "no change" IS THE RIGHT INVARIANT HERE, AND WHY IT IS NOT IN TCID29. Neither Thunder
-    # nor the generated binding rejects a misspelt parameter name: Core::JSONRPC's registration
-    # template calls inbound.FromString(parameters) and IGNORES its result
+    # HOW THE MALFORMED REQUEST IS TREATED, AND WHY "no change" IS NOT THE INVARIANT ASSERTED.
+    # Neither Thunder nor the generated binding rejects a misspelt parameter name: Core::JSONRPC's
+    # registration template calls inbound.FromString(parameters) and IGNORES its result
     # (Thunder/Source/core/JSONRPC.h, InternalRegister), so "vllendorid" leaves the generated
-    # SetVendorIdParamsData::Vendorid at its default and the implementation is called with an
-    # EMPTY string. HdmiCecSinkImplementation::SetVendorId then does stoi("") inside a try, and
-    # its catch-all substitutes 0x0019FB (HdmiCecSinkImplementation.cpp:1586-1592) - which is
-    # exactly the value set_vendor_id writes as the baseline. The identifier is therefore
-    # genuinely unchanged, but by way of a documented fallback that happens to agree with the
-    # baseline, NOT by way of a rejection. A different baseline would make this case fail for a
-    # correct implementation, so the two values are deliberately kept the same.
-    baseline_written = require_ack(HdmiCecSinkApis.set_vendor_id, "baseline setVendorId")
-    if not baseline_written:
-        log_error("TCID28_Invalid_VendorID_Nochange Failed")
-        return False
+    # SetVendorIdParamsData::Vendorid at its default and the implementation is called with an EMPTY
+    # string. HdmiCecSinkImplementation::SetVendorId then does stoi("") inside a try, and its
+    # catch-all substitutes 0x0019FB (HdmiCecSinkImplementation.cpp:1586-1592).
+    #
+    # SUPERSEDED READING, RECORDED RATHER THAN SILENTLY DROPPED. An earlier revision concluded from
+    # that analysis that the baseline had to REMAIN HdmiCECSink_Curl.set_vendor_id's own 0x0019FB,
+    # arguing that "a different baseline would make this case fail for a correct implementation".
+    # It would not: the fallback is one of the two outcomes this case ACCEPTS. Keeping the two
+    # values identical is what made the case unfalsifiable - the absorbed request's own default
+    # landed on the very value being compared against, so the invariant held whether the request
+    # was rejected, absorbed or never dispatched at all. The baseline is therefore a DISTINGUISHING
+    # value written through the published setter, and the two outcomes are told apart by which of
+    # the two renderings the identifier carries afterwards.
+    #
+    # REQUIRED PRODUCTION CHANGE, REPORTED AND NOT MADE (AAP Directive 6). That a misspelt member
+    # silently rewrites the advertised vendor identifier to a hard-coded literal is a robustness
+    # gap of the same family as TCID29's. Closing it needs input validation in
+    # HdmiCecSinkImplementation::SetVendorId - reject an empty or unparsable identifier with
+    # Core::ERROR_INVALID_SIGNATURE instead of substituting 0x0019FB - which is a production source
+    # change this suite is not permitted to make.
 
-    log_warning(f"Baseline vendor response: {baseline_get}")
-    log_warning(f"Final vendor response: {final_get}")
-    try:
-        b = json.loads(baseline_get)
-        f = json.loads(final_get)
-        # "result" must be in BOTH bodies before comparing: two absent members would each
-        # resolve to None and compare equal, passing the case on no evidence at all.
-        if (
-            "result" in b
-            and "result" in f
-            and b["result"].get("vendorid") == f["result"].get("vendorid")
-        ):
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID28_Invalid_VendorID_Nochange Passed"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
-    except (json.JSONDecodeError, AttributeError, TypeError) as exc:
-        # Named for what can actually happen here rather than catching everything:
-        # json.loads raises JSONDecodeError on a body that is not JSON - the no-response
-        # sentinel among them - a "result" member that is not an object raises
-        # AttributeError on .get(), and a body that is a list rather than an object raises
-        # TypeError on the subscript. Each leaves the invariant unconfirmed, which is the
-        # same verdict as a mismatch; what changes is that the reason is now reported.
-        #
-        # `except Exception: pass` would also have swallowed a defect in THIS module - a
-        # mistyped member name, say - and reported it as a product failure. Any exception
-        # outside these three now propagates instead of being flattened into a False.
-        log_warning(
-            f"  Vendor-ID comparison could not be completed: {type(exc).__name__}: {exc}"
-        )
-        log_warning(f"  Baseline body: {baseline_get!r}")
-        log_warning(f"  Final body: {final_get!r}")
-
-    baseline_vendor = baseline_result.get("vendorid")
-    if not isinstance(baseline_vendor, str) or baseline_vendor.strip() == "":
+    # THE BASELINE VALUE IS SELF-CHECKED BEFORE IT IS WRITTEN. Its one required property is that it
+    # renders differently from the fallback; were they equal, "rejected" and "absorbed and
+    # defaulted" would be the same reading and this case would be back where it started.
+    if _render_vendor_id(DISTINGUISHING_VENDOR_ID) == _render_vendor_id(PLUGIN_FALLBACK_VENDOR_ID):
         log_error(
-            "✖ baseline getVendorId reported no usable vendorid "
-            f"({sanitise_for_log(baseline_vendor, max_chars=64)}), so there is no value for the "
-            "malformed write to leave alone"
+            f"✖ the distinguishing baseline 0x{DISTINGUISHING_VENDOR_ID:06X} renders as "
+            f"{_render_vendor_id(DISTINGUISHING_VENDOR_ID)!r}, the same as the plugin's fallback "
+            f"0x{PLUGIN_FALLBACK_VENDOR_ID:06X} - a rejected and an absorbed request would leave "
+            "the same reading and this case could not tell them apart"
         )
         log_error("TCID28_Invalid_VendorID_Nochange Failed")
         return False
-    log_warning(f"Baseline vendorid: {sanitise_for_log(baseline_vendor, max_chars=64)}")
 
-    # The write under test. It is ACKNOWLEDGED rather than refused - see the analysis above -
-    # and that acknowledgement is asserted, because it is what proves the request was processed.
-    if not require_ack(HdmiCecSinkApis.set_vendor_id_invalid, "malformed setVendorId"):
+    # CAPTURED FIRST, BEFORE ANYTHING IS WRITTEN, so cleanup() restores what this case found rather
+    # than what it assumes was there. An unreadable identifier is a precondition failure: writing
+    # over a state that cannot be captured is what makes a case unsafe to run.
+    _captured_vendor_id = _read_vendor_id()
+    if _captured_vendor_id is None:
         log_error(
-            "✖ the malformed setVendorId was not acknowledged, so this case cannot tell a "
-            "plugin that absorbed it from a request that never arrived"
+            "✖ the vendor identifier could not be read before the baseline write - either the "
+            "endpoint is dead, the reply is not JSON, or it did not report success - so there is "
+            "nothing for cleanup() to restore and this case must not write over it"
         )
         log_error("TCID28_Invalid_VendorID_Nochange Failed")
         return False
+    log_info(f"Captured vendor identifier before this case wrote anything: {_captured_vendor_id!r}")
 
+    # THE BASELINE WRITE, THROUGH THE PUBLISHED SETTER AND READ BACK EXACTLY. The read-back is what
+    # proves the write path works at all, which is what makes the comparison afterwards evidence
+    # rather than an assumption about a value nobody confirmed had arrived.
+    baseline_vendor = _render_vendor_id(DISTINGUISHING_VENDOR_ID)
+    if not _write_vendor_id(DISTINGUISHING_VENDOR_ID, "baseline setVendorId"):
+        log_error("TCID28_Invalid_VendorID_Nochange Failed")
+        return False
+    established, observed = _wait_for_vendor_id(
+        baseline_vendor, OBSERVE_TIMEOUT_S, OBSERVE_POLL_S
+    )
+    if not established:
+        log_error(
+            f"✖ the baseline setVendorId was acknowledged but the identifier reads "
+            f"{sanitise_for_log(observed, max_chars=64)} rather than {baseline_vendor!r} after "
+            f"{OBSERVE_TIMEOUT_S:.0f}s, so there is no established baseline to measure against"
+        )
+        log_error("TCID28_Invalid_VendorID_Nochange Failed")
+        return False
+    log_success(f"✔ baseline established: the identifier reads {baseline_vendor!r}")
+
+    # THE WRITE UNDER TEST, CLASSIFIED RATHER THAN REQUIRED TO ACKNOWLEDGE. Both a refusal and an
+    # acknowledgement are admissible answers to a malformed request - the first is what a validating
+    # plugin does, the second is what this one does today - so the reply is classified by which
+    # member it carries, and only a body that is NEITHER fails here, because that is a transport or
+    # framing failure rather than a plugin choice.
+    malformed_reply = send_curl_command(HdmiCecSinkApis.set_vendor_id_invalid)
+    kind = _envelope_kind(malformed_reply)
+    if kind is None:
+        log_error(
+            "✖ the malformed setVendorId produced no JSON-RPC envelope "
+            f"({sanitise_for_log(malformed_reply, max_chars=192)}), so nothing can be concluded "
+            "about how the plugin treated it - a request that never arrived leaves the baseline "
+            "in place and would otherwise green this case on no evidence at all"
+        )
+        log_error("TCID28_Invalid_VendorID_Nochange Failed")
+        return False
+    log_info(f"The malformed setVendorId answered with a JSON-RPC {kind} envelope")
+
+    # The strict reader for the reading the verdict rests on: send_jsonrpc_envelope refuses the
+    # no-response sentinel, refuses an envelope answering another request's id, and requires
+    # jsonrpc 2.0, so the value below describes THIS call.
     final_envelope = send_jsonrpc_envelope(
         HdmiCecSinkApis.get_vendor_id, "final getVendorId"
     )
@@ -400,23 +443,57 @@ def run_test():
 
     final_vendor = final_result.get("vendorid")
     log_warning(f"Final vendorid: {sanitise_for_log(final_vendor, max_chars=64)}")
-
-    if final_vendor != baseline_vendor:
+    if not isinstance(final_vendor, str) or final_vendor.strip() == "":
         log_error(
-            "✖ the vendor identifier changed across the malformed setVendorId: "
-            f"{sanitise_for_log(baseline_vendor, max_chars=64)} -> "
-            f"{sanitise_for_log(final_vendor, max_chars=64)}"
+            "✖ final getVendorId reported no usable vendorid "
+            f"({sanitise_for_log(final_vendor, max_chars=64)}), so what the malformed write left "
+            "behind cannot be determined"
         )
         log_error("TCID28_Invalid_VendorID_Nochange Failed")
         return False
 
-    log_success(
-        "✔ the vendor identifier is unchanged after an acknowledged malformed setVendorId"
-    )
-    elapsed_time = time.perf_counter() - start_time
-    msg = "TCID28_Invalid_VendorID_Nochange Passed"
-    if os.environ.get("HDMICEC_TIMING_ENABLED"):
-        log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
+    fallback_vendor = _render_vendor_id(PLUGIN_FALLBACK_VENDOR_ID)
+
+    # AN ERROR ENVELOPE AND A CHANGED IDENTIFIER ARE MUTUALLY EXCLUSIVE. A request the framework
+    # refused cannot have moved anything, so this pairing is checked rather than each half being
+    # judged alone: it is the one combination that means the reply and the state disagree.
+    if kind == "error" and final_vendor != baseline_vendor:
+        log_error(
+            "✖ the malformed setVendorId was refused with an error envelope, yet the vendor "
+            f"identifier changed from {baseline_vendor!r} to "
+            f"{sanitise_for_log(final_vendor, max_chars=64)} - a refused request must not have "
+            "applied anything"
+        )
+        log_error("TCID28_Invalid_VendorID_Nochange Failed")
+        return False
+
+    if final_vendor == baseline_vendor:
+        log_success(
+            "✔ the malformed setVendorId left the vendor identifier at the distinguishing "
+            f"baseline {baseline_vendor!r}: this build refused or ignored the misspelt member "
+            "rather than absorbing it"
+        )
+    elif final_vendor == fallback_vendor:
+        log_info(
+            f"The vendor identifier moved from {baseline_vendor!r} to the plugin's documented "
+            f"fallback {fallback_vendor!r}: the misspelt member was absorbed as an empty "
+            "identifier and SetVendorId's catch-all substituted 0x"
+            f"{PLUGIN_FALLBACK_VENDOR_ID:06X}. That is today's behaviour, and closing it is the "
+            "production change reported above rather than made here."
+        )
+        log_success(
+            "✔ the malformed setVendorId resolved to exactly one of the two admissible outcomes"
+        )
     else:
-        log_success(msg)
+        log_error(
+            "✖ the malformed setVendorId left the vendor identifier at "
+            f"{sanitise_for_log(final_vendor, max_chars=64)}, which is neither the distinguishing "
+            f"baseline {baseline_vendor!r} nor the plugin's fallback {fallback_vendor!r} - so the "
+            "identifier was taken from somewhere neither outcome accounts for"
+        )
+        log_error("TCID28_Invalid_VendorID_Nochange Failed")
+        return False
+
+    elapsed_time = time.perf_counter() - start_time
+    log_success(log_with_timing("TCID28_Invalid_VendorID_Nochange Passed", elapsed_time))
     return True

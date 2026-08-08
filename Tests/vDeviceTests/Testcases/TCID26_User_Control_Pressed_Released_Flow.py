@@ -89,9 +89,9 @@
 
 
 import time
-import os
 import re
 import json
+from pathlib import Path
 
 from utils import (
     send_curl_command,
@@ -174,6 +174,209 @@ def _result_object(response_text):
 # the header on one of them would turn a controlled comparison into two unrelated variables.
 
 
+# THE OPCODE THE THREE PRESS FIXTURES ARE REQUIRED TO CARRY. CEC <User Control Pressed> is 0x44 and
+# <User Control Released> is 0x45; the sink dispatches them at
+# HdmiCecSinkImplementation.cpp:295-305. Both are named here so _verify_fixture_sweep can require the
+# fixtures to be what this module says they are, rather than posting whatever the documents happen to
+# contain.
+OPCODE_USER_CONTROL_PRESSED = 0x44
+OPCODE_USER_CONTROL_RELEASED = 0x45
+
+# THE THREE-POINT SWEEP, AND THE ONE DOCUMENT THAT CLOSES EACH OF ITS PRESSES. The key codes live in
+# the YAML documents and nowhere else, so no operand value appears in this file: adding a fourth key
+# code means adding a fourth fixture and naming it here, which is the intended cost. The description
+# beside each filename is what the diagnostics call it, so a refused post names the arm of the sweep
+# that was lost rather than a filename a reader has to map back.
+PRESS_FIXTURES = (
+    ("Device_User_Control_Pressed.yaml", "the nominal key code"),
+    ("Device_User_Control_Pressed_Min.yaml", "the minimum key code"),
+    ("Device_User_Control_Pressed_Boundary.yaml", "the boundary key code"),
+)
+RELEASE_FIXTURE = "Device_User_Control_Released.yaml"
+
+# Bounded budget for the closing inventory observation. A poll ceiling, never a duration anything
+# waits out: it returns the moment the inventory agrees and reports its last sample on expiry.
+OBSERVE_TIMEOUT_S = 15.0
+OBSERVE_POLL_S = 0.5
+
+# The press this module currently has outstanding, as the description a diagnostic should use, or
+# None when every press it has issued has been closed. Read by _ensure_key_released so the guaranteed
+# closing release can say whether it actually closed something or was the harmless no-op it usually
+# is - which is the difference between "this case cleaned up after an early exit" and "this case
+# completed its own pairing".
+_press_outstanding = None
+
+# Matches the payload list a vComponent cec_message document declares, so an expectation can be
+# DERIVED from the frame each fixture actually carries instead of restated beside it - the same
+# technique Init_Devicelist_Populate.verify_seed_payload_consistency() uses on the seed payloads.
+_PAYLOAD_PATTERN = re.compile(r'payload:\s*\[(.*?)\]', re.S)
+
+
+def _payload_bytes(yaml_name):
+    """Return the CEC frame bytes a fixture declares, or None with a reason.
+
+    Args:
+        yaml_name: Command-document filename relative to utils.HDMICEC_CMD_BASE.
+    Returns:
+        (list_of_ints, None) on success, or (None, reason).
+    """
+    path = Path(HDMICEC_CMD_BASE) / yaml_name
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"cannot read {yaml_name}: {exc}"
+    match = _PAYLOAD_PATTERN.search(text)
+    if not match:
+        return None, f"{yaml_name} declares no payload list"
+    values = []
+    for token in match.group(1).split(","):
+        token = token.strip().strip('"').strip("'")
+        if not token:
+            continue
+        try:
+            values.append(int(token, 16))
+        except ValueError:
+            return None, f"{yaml_name} carries a non-hexadecimal payload byte {token!r}"
+    return values, None
+
+
+def _verify_fixture_sweep():
+    """Prove the three press fixtures form a genuine sweep before any frame is injected.
+
+    WHAT A SWEEP HAS TO BE FOR THE COMPARISON TO MEAN ANYTHING. The three documents must differ in
+    exactly one variable - the key-code operand - so this checks all four conditions that make that
+    true, and reports which one failed:
+
+      * every press fixture carries at least a header, the <User Control Pressed> opcode and a key
+        code, so a truncated document is not posted as though it were a key press;
+      * all three declare the SAME header, so the sweep is one peer pressing three keys rather than
+        three peers pressing one each;
+      * all three declare opcode 0x44, so a document re-purposed to another opcode is refused
+        instead of quietly leaving the sweep one arm short;
+      * the three key codes are DISTINCT, which is the entire point - two fixtures sharing an
+        operand would make the sweep a two-point one while every check downstream still passed.
+
+    The closing release document is checked against the same header and its own opcode, because a
+    release framed from another initiator would not close the presses it follows.
+    Returns:
+        (key_codes, None) with the three codes in fixture order, or (None, reason).
+    """
+    headers = {}
+    key_codes = []
+    for yaml_name, description in PRESS_FIXTURES:
+        payload, reason = _payload_bytes(yaml_name)
+        if payload is None:
+            return None, reason
+        if len(payload) < 3:
+            return None, (
+                f"{yaml_name} ({description}) declares {len(payload)} payload byte(s); a "
+                "<User Control Pressed> frame needs a header, an opcode and a key code"
+            )
+        if payload[1] != OPCODE_USER_CONTROL_PRESSED:
+            return None, (
+                f"{yaml_name} ({description}) carries opcode 0x{payload[1]:02X}, not the "
+                f"<User Control Pressed> 0x{OPCODE_USER_CONTROL_PRESSED:02X} this sweep injects"
+            )
+        headers[yaml_name] = payload[0]
+        key_codes.append(payload[2])
+
+    release_payload, reason = _payload_bytes(RELEASE_FIXTURE)
+    if release_payload is None:
+        return None, reason
+    if len(release_payload) < 2:
+        return None, (
+            f"{RELEASE_FIXTURE} declares {len(release_payload)} payload byte(s); a "
+            "<User Control Released> frame needs a header and an opcode"
+        )
+    if release_payload[1] != OPCODE_USER_CONTROL_RELEASED:
+        return None, (
+            f"{RELEASE_FIXTURE} carries opcode 0x{release_payload[1]:02X}, not the "
+            f"<User Control Released> 0x{OPCODE_USER_CONTROL_RELEASED:02X} that closes a press"
+        )
+    headers[RELEASE_FIXTURE] = release_payload[0]
+
+    distinct_headers = set(headers.values())
+    if len(distinct_headers) != 1:
+        return None, (
+            "the injected documents do not share one header, so the sweep would not be one peer "
+            f"pressing three keys: {{{', '.join(f'{name}: 0x{value:02X}' for name, value in headers.items())}}}"
+        )
+
+    if len(set(key_codes)) != len(key_codes):
+        return None, (
+            f"the three press fixtures do not carry distinct key codes "
+            f"({[f'0x{code:02X}' for code in key_codes]}), so the sweep covers fewer points than "
+            "it reports"
+        )
+
+    return key_codes, None
+
+
+def _published_request(argv):
+    """Decode the JSON-RPC request a HdmiCECSink_Curl constant carries, or None with a reason.
+
+    The payload sits in the argv element after "-d". Decoding it means the logical address this
+    module checks the topology for is DERIVED from the constants it actually sends, rather than
+    restated beside them where it could drift from them unnoticed.
+    Args:
+        argv: A command definition from HdmiCECSink_Curl.py, in argv form.
+    Returns:
+        (request_mapping, None) on success, or (None, reason).
+    """
+    try:
+        payload = argv[argv.index("-d") + 1]
+    except (ValueError, IndexError):
+        return None, "the command constant carries no -d payload"
+    try:
+        request = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        return None, f"the command constant's -d payload is not valid JSON: {exc}"
+    if not isinstance(request, dict):
+        return None, "the command constant's -d payload is not a JSON object"
+    return request, None
+
+
+def _acknowledged(argv, label):
+    """Dispatch one published call and report whether it acknowledged success.
+
+    Both outbound user-control methods answer with success alone - sendUserControlPressed takes a
+    logical address and a key code, sendUserControlReleased the address only (IHdmiCecSink.h:275,
+    :281) - so the acknowledgement is the whole of what either can be asserted on, and a call whose
+    reply is discarded is indistinguishable from one that never left the host.
+
+    Args:
+        argv: A command definition from HdmiCECSink_Curl.py.
+        label: How the call should be named in the diagnostics.
+    Returns:
+        True when the reply is a JSON-RPC result reporting success True; False otherwise, with the
+        reason already logged.
+    """
+    response = send_curl_command(argv)
+    if not response:
+        log_error(f"✖ {label} command not sent")
+        return False
+    # send_curl_command reports a transport failure by RETURNING the truthy sentinel
+    # "< No response from WPEFramework >", so an emptiness test alone would read a dead endpoint as
+    # a healthy one.
+    if response.startswith("< No response"):
+        log_error(f"✖ no response from WPEFramework for {label}")
+        return False
+    log_warning(f"  {label} response: {sanitise_for_log(response)}")
+    try:
+        result = _result_object(response)
+    except json.JSONDecodeError:
+        log_error(f"✖ {label} reply is not valid JSON")
+        return False
+    if result.get("success") is not True:
+        log_error(
+            f"✖ {label} did not acknowledge success "
+            f"(success={sanitise_for_log(result.get('success'), max_chars=32)})"
+        )
+        return False
+    log_success(f"✔ {label} acknowledged")
+    return True
+
+
 def _ensure_key_released():
     """Inject a closing UserControlReleased frame and report whether it was accepted.
 
@@ -191,10 +394,52 @@ def _ensure_key_released():
     state that is already clear - so the extra post costs nothing and removes the need to reason
     about which exit path was taken.
     """
-    if _post_hdmicec("Device_User_Control_Released.yaml"):
-        return True, "closing UserControlReleased injected; no key left held"
-    return False, "the closing UserControlReleased frame was not accepted by the emulator"
+    global _press_outstanding
+    outstanding = _press_outstanding
+    _press_outstanding = None
 
+    if _post_hdmicec(RELEASE_FIXTURE):
+        if outstanding is None:
+            return True, "closing UserControlReleased injected; no press was outstanding"
+        return True, (
+            f"closing UserControlReleased injected; it closed the press left outstanding by "
+            f"{outstanding}"
+        )
+    if outstanding is None:
+        return False, (
+            "the closing UserControlReleased frame was not accepted by the emulator; no press was "
+            "outstanding, so no key is held, but the emulator refused a post"
+        )
+    return False, (
+        "the closing UserControlReleased frame was not accepted by the emulator and "
+        f"{outstanding} is still outstanding, so a key may be held down for subsequent cases"
+    )
+
+
+def _device_inventory():
+    '''Return (readable, count, sorted_logical_addresses) from the published getDeviceList method.
+
+    readable is False when the reply could not be read as a JSON-RPC result reporting success,
+    which is deliberately distinct from an empty inventory.
+    '''
+    response = send_curl_command(HdmiCecSinkApis.get_device_list)
+    if not response or response.startswith("< No response"):
+        return False, None, None
+    try:
+        result = _result_object(response)
+    except json.JSONDecodeError:
+        return False, None, None
+    if result.get("success") is not True:
+        return False, None, None
+    device_list = result.get("deviceList")
+    if not isinstance(device_list, list):
+        return False, None, None
+    addresses = sorted(
+        device["logicalAddress"]
+        for device in device_list
+        if isinstance(device, dict) and isinstance(device.get("logicalAddress"), int)
+    )
+    return True, result.get("numberofdevices"), addresses
 
 def run_test():
     '''Drive the outbound user-control pair, sweep three inbound key codes, verify liveness.
@@ -227,11 +472,7 @@ def run_test():
 
     if flow_ok and cleanup_ok:
         elapsed_time = time.perf_counter() - start_time
-        msg = "TCID26_User_Control_Pressed_Released_Flow Passed ✅"
-        if os.environ.get("HDMICEC_TIMING_ENABLED"):
-            log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-        else:
-            log_success(msg)
+        log_success(log_with_timing("TCID26_User_Control_Pressed_Released_Flow Passed ✅", elapsed_time))
         return True
 
     log_error("TCID26_User_Control_Pressed_Released_Flow Failed ❌")
@@ -239,12 +480,12 @@ def run_test():
 
 
 def _run_user_control_flow():
-    """The outbound pair, the three-key inbound sweep and the liveness probe.
+    """The outbound pair, the three-key inbound sweep and the closing inventory invariant.
 
-    Returns True when every assertion holds. Every assertion is exactly as it was; only the
-    verdict reporting moved to run_test() so the guaranteed release in its finally block runs
-    first.
+    Returns True when every assertion holds. The verdict line and the guaranteed closing release
+    live in run_test(), so an early return here still reaches them.
     """
+    global _press_outstanding
 
     log_info(
         "Executing the user-control flow: outbound pressed and released, then inbound "
@@ -252,6 +493,10 @@ def _run_user_control_flow():
     )
 
     # ── FIXTURE CONSISTENCY, BEFORE ANY FRAME IS INJECTED ────────────────────────────────────────
+    # The sweep's whole claim is that three documents differ in exactly one variable. That is a
+    # property of the fixture tree rather than of the plugin, so it is proven here rather than
+    # assumed: a document re-addressed, re-purposed to another opcode, truncated, or edited to
+    # repeat a key code would leave every check below passing while the sweep silently lost an arm.
     key_codes, reason = _verify_fixture_sweep()
     if key_codes is None:
         log_error(f"✖ {reason}")
@@ -296,21 +541,25 @@ def _run_user_control_flow():
         return False
     target_address = next(iter(targets.values()))
 
-    log_success("✔ curl command sent")
-    log_warning(f"Response: {pressed_response}")
-
-    # ACT 2 - OUTBOUND RELEASE, WHICH CLOSES ACT 1. sendUserControlReleased takes the logical
-    # address ALONE (IHdmiCecSink.h:281) - the asymmetry with pressed is by contract, since a
-    # release identifies no key - and likewise answers with success only.
-    #
-    # This call is not an optional extra: without it the outbound leg would leave the peer
-    # holding the key this case just pressed, which is the stuck-key condition described in
-    # this function's docstring. Ordering is therefore load-bearing, not stylistic.
-    log_info("Dispatching the outbound sendUserControlReleased call to close the press")
-    released_response = send_curl_command(HdmiCecSinkApis.send_user_control_released)
-
-    if not released_response:
-        log_error("✖ sendUserControlReleased command not sent")
+    # ── BEFORE-PROBE: THE INVENTORY THE CLOSING OBSERVATION IS MEASURED AGAINST ──────────────────
+    # Read before anything is dispatched, and required to be readable: Init_Devicelist_Populate
+    # guarantees a seeded topology before the first case runs, so an unreadable list means the
+    # precondition never held and every claim below would rest on it.
+    readable, before_count, before_addresses = _device_inventory()
+    if not readable:
+        log_error(
+            "✖ the device list could not be read before the flow - either the endpoint is dead "
+            "(send_curl_command returns the truthy \"< No response from WPEFramework >\" "
+            "sentinel), the reply is not JSON, or it did not acknowledge success"
+        )
+        log_error("TCID26_User_Control_Pressed_Released_Flow Failed ❌")
+        return False
+    if not isinstance(before_count, int):
+        log_error(
+            f"✖ the device list reports numberofdevices {before_count!r}, expected an integer - "
+            "the closing comparison would be against None"
+        )
+        log_error("TCID26_User_Control_Pressed_Released_Flow Failed ❌")
         return False
     if target_address not in before_addresses:
         log_error(
@@ -324,182 +573,121 @@ def _run_user_control_flow():
         f"{target_address} present"
     )
 
-    log_success("✔ curl command sent")
-    log_warning(f"Response: {released_response}")
+    # ── ACT 1 - OUTBOUND PRESS ───────────────────────────────────────────────────────────────────
+    # sendUserControlPressed takes a logical address AND a key code (IHdmiCecSink.h:275) and answers
+    # with success only, so the acknowledgement is the whole of what it can be asserted on. Both
+    # parameter values are carried by the command constant itself and are never restated here.
+    log_info("Dispatching the outbound sendUserControlPressed call")
+    if not _acknowledged(HdmiCecSinkApis.send_user_control_pressed, "sendUserControlPressed"):
+        log_error("TCID26_User_Control_Pressed_Released_Flow Failed ❌")
+        return False
+    _press_outstanding = "the outbound sendUserControlPressed call"
 
-    # ACTS 3 TO 8 - THE INBOUND BOUNDARY SWEEP. THIS IS THE REASON THIS MODULE EXISTS.
+    # ── ACT 2 - OUTBOUND RELEASE, WHICH CLOSES ACT 1 ─────────────────────────────────────────────
+    # sendUserControlReleased takes the logical address ALONE (IHdmiCecSink.h:281) - the asymmetry
+    # with pressed is by contract, since a release identifies no key - and likewise answers with
+    # success only. This call is not an optional extra: without it the outbound leg would leave the
+    # peer holding the key this case just pressed, which is the stuck-key condition
+    # _ensure_key_released exists for. Ordering is load-bearing, not stylistic.
+    log_info("Dispatching the outbound sendUserControlReleased call to close the press")
+    if not _acknowledged(HdmiCecSinkApis.send_user_control_released, "sendUserControlReleased"):
+        log_error("TCID26_User_Control_Pressed_Released_Flow Failed ❌")
+        return False
+    _press_outstanding = None
+
+    # ── ACTS 3 TO 8 - THE INBOUND BOUNDARY SWEEP. THIS IS THE REASON THIS MODULE EXISTS. ─────────
     #
     # Three UserControlPressed frames are injected, differing ONLY in their key-code operand -
-    # nominal, minimum, upper byte boundary - and each is closed by the same UserControlReleased
-    # frame. That is the same three-point sweep the sink L1 suite applies to these APIs as
-    # sendUserControlPressed_MinKeyCode and sendUserControlPressed_BoundaryKeyCode, lifted to
-    # device level rather than reinvented.
+    # nominal, minimum, upper byte boundary, all three proven distinct above - and each is closed by
+    # the same UserControlReleased frame. That is the same three-point sweep the sink L1 suite
+    # applies to these APIs as sendUserControlPressed_MinKeyCode and
+    # sendUserControlPressed_BoundaryKeyCode, lifted to device level rather than reinvented.
     #
-    # Each press is paired with a release IN SEQUENCE rather than the three presses being fired
-    # and then released together. Pairing them keeps at most one key outstanding at any moment,
-    # so a failure part-way through this block cannot leave two or three keys held; and it means
-    # the sink observes three complete press-release cycles, which is what a real remote sends.
+    # Each press is paired with its release IN SEQUENCE rather than the three presses being fired
+    # and then released together. Pairing them keeps at most one key outstanding at any moment, so
+    # a failure part-way through cannot leave two or three keys held; and it means the sink observes
+    # three complete press-release cycles, which is what a real remote sends.
     #
-    # The key codes themselves live in the YAML documents, so no operand value appears in this
-    # file and no frame is hand-built here. Adding a fourth key code would mean adding a fourth
-    # fixture; the fixture set is the vocabulary of this sweep and is not extended from here.
-    log_info("Injecting the inbound UserControlPressed frame with the nominal key code")
-    ok_nominal = _post_hdmicec("Device_User_Control_Pressed.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-
-    log_info("Injecting the UserControlReleased frame to close the nominal press")
-    ok_rel_1 = _post_hdmicec("Device_User_Control_Released.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-
-    log_info("Injecting the inbound UserControlPressed frame with the minimum key code")
-    ok_min = _post_hdmicec("Device_User_Control_Pressed_Min.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-
-    log_info("Injecting the UserControlReleased frame to close the minimum press")
-    ok_rel_2 = _post_hdmicec("Device_User_Control_Released.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-
-    log_info("Injecting the inbound UserControlPressed frame with the boundary key code")
-    ok_boundary = _post_hdmicec("Device_User_Control_Pressed_Boundary.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-
-    log_info("Injecting the UserControlReleased frame to close the boundary press")
-    ok_rel_3 = _post_hdmicec("Device_User_Control_Released.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-
-    # All six posts are required TOGETHER. Tolerating any one of them would report a pass on a
-    # run that never delivered part of the sweep - a dropped Min or Boundary press would silently
-    # shrink this case to the nominal key code, and a dropped release would leave a key held.
-    # Neither shortfall is visible downstream, so it has to be caught here.
-    if not (ok_nominal and ok_min and ok_boundary and ok_rel_1 and ok_rel_2 and ok_rel_3):
-        log_error("✖ required vComponent emulation posts failed")
-        return False
-
-    # CLOSING PROBE - A LIVENESS CHECK, NOT A KEY-DELIVERY CHECK.
-    #
-    # getDeviceList is read once here because it is the only consequence of this flow the L3
-    # transport can actually observe. Six injected frames that left the plugin unable to answer,
-    # or answering without a device count, would be a real regression and a genuine signal; that
-    # is the whole of what this probe claims. It deliberately does NOT stand in for evidence that
-    # any key arrived - see the assertion block below.
-    log_info("Reading the device list as a closing liveness check")
-    after = send_curl_command(HdmiCecSinkApis.get_device_list)
-
-    if not after:
-        log_error("✖ final getDeviceList command not sent")
-        return False
-
-    if after.startswith("< No response"):
-        log_error("✖ no response from WPEFramework - final device list unavailable")
-        return False
-
-    log_warning(f"Final device list: {after}")
-
-    try:
-        # ── ACT 1 - OUTBOUND PRESS ──────────────────────────────────────────────────────────────
-        # sendUserControlPressed takes a logical address AND a key code (IHdmiCecSink.h:275) and
-        # answers with success only, so the acknowledgement is the whole of what it can be
-        # asserted on. Both parameter values are carried by the command constant itself and are
-        # never restated here.
-        log_info("Dispatching the outbound sendUserControlPressed call")
-        if not _acknowledged(HdmiCecSinkApis.send_user_control_pressed, "sendUserControlPressed"):
+    # EVERY POST IS REQUIRED, AND REQUIRED AT THE POINT IT IS MADE. utils resolves a filename
+    # against HDMICEC_CMD_BASE and returns (0, "YAML file not found: ...") rather than raising, so a
+    # refused or misnamed document does not fail loudly: tolerating one would report a pass on a run
+    # that never delivered part of the sweep - a dropped Min or Boundary press silently shrinks this
+    # case to the nominal key code, and a dropped release leaves a key held. Neither shortfall is
+    # visible downstream, so each is caught where it happens.
+    for yaml_name, description in PRESS_FIXTURES:
+        log_info(f"Injecting the inbound UserControlPressed frame with {description}")
+        if not _post_hdmicec(yaml_name):
+            log_error(
+                f"✖ required injection refused - the press carrying {description} was never "
+                f"delivered ({yaml_name})"
+            )
+            log_error("TCID26_User_Control_Pressed_Released_Flow Failed ❌")
             return False
-        outbound_press_outstanding = True
+        _press_outstanding = f"the injected press carrying {description}"
+        time.sleep(CEC_FRAME_PACING_SECONDS)
 
-        # ── ACT 2 - OUTBOUND RELEASE, WHICH CLOSES ACT 1 ────────────────────────────────────────
-        # sendUserControlReleased takes the logical address ALONE (IHdmiCecSink.h:281) - the
-        # asymmetry with pressed is by contract, since a release identifies no key.
-        log_info("Dispatching the outbound sendUserControlReleased call to close the press")
-        if not _acknowledged(HdmiCecSinkApis.send_user_control_released, "sendUserControlReleased"):
+        log_info(f"Injecting the UserControlReleased frame to close {description}")
+        if not _post_hdmicec(RELEASE_FIXTURE):
+            log_error(
+                f"✖ required injection refused - the release closing {description} was never "
+                f"delivered ({RELEASE_FIXTURE})"
+            )
+            log_error("TCID26_User_Control_Pressed_Released_Flow Failed ❌")
             return False
-        outbound_press_outstanding = False
+        _press_outstanding = None
+        time.sleep(CEC_FRAME_PACING_SECONDS)
+        log_success(f"✔ delivered the press carrying {description} and the release closing it")
 
-        # ── ACTS 3 TO 8 - THE INBOUND BOUNDARY SWEEP. THE REASON THIS MODULE EXISTS ─────────────
-        # Three UserControlPressed frames differing ONLY in their key-code operand - nominal,
-        # minimum, upper byte boundary, all three verified distinct above - each closed by the
-        # same UserControlReleased frame. That is the sweep the sink L1 suite applies to these
-        # APIs as sendUserControlPressed_MinKeyCode and sendUserControlPressed_BoundaryKeyCode,
-        # lifted to device level rather than reinvented.
-        #
-        # Asserted: the two outbound acknowledgements, the six emulation posts (gated above),
-        # and that the plugin still answers getDeviceList with a success envelope carrying an
-        # integer device count.
-        #
-        # NOT asserted, and NOT implied anywhere in this module: that any key press or key
-        # release actually reached the sink's handlers, and that OnKeyPressEvent or
-        # OnKeyReleaseEvent fired. Those are Thunder notifications, and this suite's one-shot
-        # curl transport cannot subscribe to a notification channel, so there is no observation
-        # to make here - only an assumption that could be dressed up as one. Inventing an event
-        # assertion at this level would be a false green, which is worse than saying nothing.
-        #
-        # Those two events are NOT unverified in the estate, though - they are simply verified
-        # somewhere this transport cannot reach. The sink L1 suite asserts them directly
-        # (onKeyPressEvent_SubscribedClient_ReceivesAddressAndKeyCode,
-        # onKeyPressEvent_BoundaryOperands_AreForwardedVerbatim,
-        # onKeyPressEvent_NoSubscriber_ProducesNoClientNotification,
-        # onKeyReleaseEvent_SubscribedClient_ReceivesLogicalAddress) and the sink L2 suite
-        # asserts them from injected frames (InjectUserControlPressedFrameAndVerifyEvent plus
-        # its minimum / maximum-named / out-of-range key-code variants, and
-        # InjectUserControlReleasedFrameAndVerifyEvent). The coverage register's listing of
-        # both events as uncovered is its pre-change baseline, not the current state.
-        #
-        # The device count is likewise NOT compared against a before-probe. User-control frames
-        # carry no address discovery, so this flow has no defensible expectation about how the
-        # count should move, and asserting a direction would be a guess. Its type is checked
-        # because a probe that answers without an integer count is a malformed response
-        # regardless of what this flow did.
-        if pressed_ack and released_ack and alive_ack and has_count:
-            return True
-
-            log_info(f"Injecting the UserControlReleased frame to close {description}")
-            if not _post_hdmicec(RELEASE_FIXTURE):
+    # ── CLOSING OBSERVATION - AN INVARIANT, NOT A LIVENESS CHECK ─────────────────────────────────
+    # An earlier revision read getDeviceList here purely as liveness and declined to compare the
+    # count, on the grounds that "asserting a direction would be a guess". Equality is not a guess:
+    # neither process(UserControlPressed) nor process(UserControlReleased) calls addDevice or
+    # touches deviceList at all (HdmiCecSinkImplementation.cpp:295-305), and every injected frame
+    # initiates from an address the suite already seeded, so the inventory MUST be identical. That
+    # makes this a real invariant - six frames that added, dropped or renumbered a peer would be a
+    # genuine regression - and it is polled on a bounded monotonic budget so a busy plugin is
+    # waited for rather than raced.
+    log_info("Reading the device list as the closing inventory invariant")
+    deadline = time.monotonic() + OBSERVE_TIMEOUT_S
+    while True:
+        after_readable, after_count, after_addresses = _device_inventory()
+        if after_readable and (after_count, after_addresses) == (before_count, before_addresses):
+            break
+        if time.monotonic() >= deadline:
+            if not after_readable:
                 log_error(
-                    f"✖ required injection refused - the release closing {description} was never "
-                    f"delivered ({RELEASE_FIXTURE})"
+                    "✖ the device inventory became unreadable after the flow - six injected "
+                    "frames that left the plugin unable to answer is a regression"
                 )
-                return False
-            inbound_press_outstanding = None
-            log_success(f"✔ delivered the release closing {description}")
+            else:
+                log_error(
+                    "✖ the user-control flow changed the device inventory: "
+                    f"{before_count}/{before_addresses} -> {after_count}/{after_addresses}. "
+                    "Neither user-control handler touches deviceList, so it must be identical"
+                )
+            log_error("TCID26_User_Control_Pressed_Released_Flow Failed ❌")
+            return False
+        time.sleep(OBSERVE_POLL_S)
+    log_success(f"✔ inventory unchanged: {after_count} devices at exactly {after_addresses}")
 
-        # ── CLOSING OBSERVATION - AN INVARIANT, NOT A LIVENESS CHECK ────────────────────────────
-        # An earlier revision read getDeviceList here purely as liveness and declined to compare
-        # the count, on the grounds that "asserting a direction would be a guess". Equality is not
-        # a guess: neither process(UserControlPressed) nor process(UserControlReleased) calls
-        # addDevice or touches deviceList at all (:295-305), and every injected frame initiates
-        # from an address the suite already seeded, so the inventory MUST be identical. That makes
-        # this a real invariant - six frames that added, dropped or renumbered a peer would be a
-        # genuine regression - and it is polled on a bounded monotonic budget so a busy plugin is
-        # waited for rather than raced.
-        deadline = time.monotonic() + OBSERVE_TIMEOUT_S
-        while True:
-            after_readable, after_count, after_addresses = _device_inventory()
-            if after_readable and (after_count, after_addresses) == (before_count, before_addresses):
-                break
-            if time.monotonic() >= deadline:
-                if not after_readable:
-                    log_error(
-                        "✖ the device inventory became unreadable after the flow - six injected "
-                        "frames that left the plugin unable to answer is a regression"
-                    )
-                else:
-                    log_error(
-                        "✖ the user-control flow changed the device inventory: "
-                        f"{before_count}/{before_addresses} -> {after_count}/{after_addresses}. "
-                        "Neither user-control handler touches deviceList, so it must be identical"
-                    )
-                return False
-            time.sleep(OBSERVE_POLL_S)
-        log_success(
-            f"✔ inventory unchanged: {after_count} devices at exactly {after_addresses}"
-        )
-        log_warning(f"Pressed  : {pressed_response}")
-        log_warning(f"Released : {released_response}")
-        log_warning(f"Probe    : {after}")
-    except json.JSONDecodeError:
-        # No return from this handler, by design: control falls through to the single failure
-        # tail below, so the case reports one verdict from one place however it failed. The
-        # diagnostic is logged here because a parse error and a payload mismatch are different
-        # faults, and this suite's idiom is to name which one occurred.
-        log_error("Invalid JSON response")
-
-    return False
+    # NOT asserted, and NOT implied anywhere in this module: that any key press or key release
+    # actually reached the sink's handlers, and that OnKeyPressEvent or OnKeyReleaseEvent fired.
+    # Those are Thunder notifications, and this suite's one-shot curl transport cannot subscribe to
+    # a notification channel, so there is no observation to make here - only an assumption that
+    # could be dressed up as one. Inventing an event assertion at this level would be a false green.
+    #
+    # Those two events are NOT unverified in the estate, though - they are simply verified somewhere
+    # this transport cannot reach. The sink L1 suite asserts them directly
+    # (onKeyPressEvent_SubscribedClient_ReceivesAddressAndKeyCode,
+    # onKeyPressEvent_BoundaryOperands_AreForwardedVerbatim,
+    # onKeyPressEvent_NoSubscriber_ProducesNoClientNotification,
+    # onKeyReleaseEvent_SubscribedClient_ReceivesLogicalAddress) and the sink L2 suite asserts them
+    # from injected frames (InjectUserControlPressedFrameAndVerifyEvent plus its minimum /
+    # maximum-named / out-of-range key-code variants, and
+    # InjectUserControlReleasedFrameAndVerifyEvent). The coverage register's listing of both events
+    # as uncovered is its pre-change baseline, not the current state.
+    log_info(
+        "Key delivery itself is not observable over this transport: OnKeyPressEvent and "
+        "OnKeyReleaseEvent are Thunder notifications, asserted by the sink's own L1 and L2 suites"
+    )
+    return True

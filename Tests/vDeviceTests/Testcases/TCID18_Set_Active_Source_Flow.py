@@ -230,7 +230,7 @@ def run_test():
         log_error("✖ the required <Active Source> injection was rejected")
         log_error("TCID18_Set_Active_Source_Flow Failed ❌")
         return False
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     peer_state = _probe_active_source("after the peer announcement")
     if peer_state is None:
@@ -290,7 +290,7 @@ def run_test():
         log_error("TCID18_Set_Active_Source_Flow Failed ❌")
         return False
 
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
     tv_state = _probe_active_source("after setActiveSource")
     if tv_state is None:
         log_error("TCID18_Set_Active_Source_Flow Failed ❌")
@@ -330,7 +330,7 @@ def run_test():
         log_error("✖ the required <Inactive Source> injection was rejected")
         log_error("TCID18_Set_Active_Source_Flow Failed ❌")
         return False
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     final_state = _probe_active_source("after the inactive-source announcement")
     if final_state is None:
@@ -358,11 +358,7 @@ def run_test():
     )
 
     elapsed_time = time.perf_counter() - start_time
-    msg = "TCID18_Set_Active_Source_Flow Passed ✅"
-    if os.environ.get("HDMICEC_TIMING_ENABLED"):
-        log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-    else:
-        log_success(msg)
+    log_success(log_with_timing("TCID18_Set_Active_Source_Flow Passed ✅", elapsed_time))
     return True
 
 

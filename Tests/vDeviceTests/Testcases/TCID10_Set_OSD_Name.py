@@ -57,7 +57,6 @@
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -68,6 +67,15 @@ from utils import (
     log_with_timing
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
+
+
+# The write is applied asynchronously, so the read-back is polled rather than slept out. The
+# names follow the convention every other bounded observer in this suite uses
+# (<PURPOSE>_TIMEOUT_S / <PURPOSE>_POLL_S), so a reader who has met one has met them all.
+# The budget is generous relative to a local apply and the interval is short, which is the
+# combination that makes a fast apply fast and a slow one visible rather than fatal.
+READBACK_TIMEOUT_S = 10.0
+READBACK_POLL_S = 0.25
 
 
 def _osd_result(curl_response):
@@ -184,12 +192,43 @@ def run_test():
             log_error("TCID10_Set_OSD_Name Failed ❌")
             return False
 
-        # The plugin applies the setting asynchronously, so one bounded pause separates the
-        # write from the read-back. One second, once - deliberately not a poll loop, since a
-        # loop would hide a slow apply behind a retry instead of reporting it.
-        time.sleep(1)
+        # THE APPLY IS OBSERVED, NOT WAITED OUT.
+        #
+        # setOSDName is applied asynchronously, so the read-back needs a settling window, and
+        # a fixed pause is the wrong shape for that window in both directions: on a host
+        # slower than the guess this case fails for a write that was about to land, and on
+        # every other host it spends the whole guess even when the value arrived in the first
+        # millisecond. Neither behaviour is a property of the thing under test, which makes
+        # the verdict depend on the host rather than on the plugin.
+        #
+        # This loop polls the observable itself - the name getOSDName reports - and it does
+        # NOT hide a slow apply behind a retry, which was the stated objection to a poll here
+        # and is worth answering directly: it exits the instant the value matches, measures
+        # how long that took, and REPORTS that duration below, so an apply that needed most
+        # of the budget appears in the output instead of being smoothed away. If the budget
+        # expires, the last response observed is carried out of the loop and reported verbatim
+        # by the three checks that follow, unchanged - which is a diagnosis a fixed pause
+        # cannot give, because it separates "never applied" from "applied too late".
+        poll_started = time.perf_counter()
+        readback_deadline = time.monotonic() + READBACK_TIMEOUT_S
+        readback_result = None
+        while True:
+            readback_result = _osd_result(send_curl_command(HdmiCecSinkApis.get_osd_name))
+            if (
+                readback_result is not None
+                and readback_result.get("success") is True
+                and readback_result.get("name") == HdmiCecSinkApis.SET_OSD_NAME_VALUE
+            ):
+                break
+            if time.monotonic() >= readback_deadline:
+                break
+            time.sleep(READBACK_POLL_S)
+        settle_seconds = time.perf_counter() - poll_started
+        log_info(
+            f"  OSD name read-back settled after {settle_seconds:.3f}s "
+            f"(budget {READBACK_TIMEOUT_S:.1f}s)"
+        )
 
-        readback_result = _osd_result(send_curl_command(HdmiCecSinkApis.get_osd_name))
         if readback_result is None:
             log_error("✖ read-back of the OSD name returned no usable response")
             log_error("TCID10_Set_OSD_Name Failed ❌")
@@ -235,11 +274,7 @@ def run_test():
         log_warning(f"OSD name transition: {baseline_name!r} -> {final_name!r}")
 
         elapsed_time = time.perf_counter() - start_time
-        msg = "TCID10_Set_OSD_Name Passed ✅"
-        if os.environ.get("HDMICEC_TIMING_ENABLED"):
-            log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-        else:
-            log_success(msg)
+        log_success(log_with_timing("TCID10_Set_OSD_Name Passed ✅", elapsed_time))
         return True
     except json.JSONDecodeError:
         # The documented contract boundary, not a speculative guard: utils.send_curl_command

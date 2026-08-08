@@ -78,7 +78,6 @@
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -158,6 +157,141 @@ def _ensure_peers_woken():
     return False, f"the wake leg was not accepted by the emulator: {rejected}"
 
 
+# EVERY STRING THE PLUGIN CAN PUBLISH AS A PEER'S powerStatus, AND NOTHING ELSE. getDeviceList
+# renders the field through PowerStatus::toString() (HdmiCecSinkImplementation.cpp:1403), so the
+# admissible set is that function's own output and is written out here rather than guessed at:
+# Operands.hpp:595-614 names "On", "Standby", "In transition Standby to On" and
+# "In transition On to Standby" for the four bytes validate() accepts, and returns "Unknown" for
+# anything else. "Unknown" is admitted deliberately - PowerStatus' frame constructor takes whatever
+# byte arrives on the wire, so a peer reporting POWER_STATUS_NOT_KNOWN (0x04) or
+# POWER_STATUS_FEATURE_ABORT (0x05) legitimately renders as "Unknown" because validate() rejects
+# both, which also means the "Not Known" and "Feature Abort" names in that table are unreachable.
+# A value outside this set is therefore not an unusual peer, it is a reply this case cannot read:
+# a renamed field, a non-string value, or a corrupted record. Per-peer MOVEMENT is judged separately
+# in the after-probe, which is where an unexpected but well-formed value is caught.
+POWER_STATUS_VOCABULARY = frozenset({
+    "On",
+    "Standby",
+    "In transition Standby to On",
+    "In transition On to Standby",
+    "Unknown",
+})
+
+# Bounded budgets for the after-probe and for the restoration report. Poll ceilings, never
+# durations anything waits out: an inbound frame crosses the vComponent, the driver receive
+# callback, the read queue, the read thread and the decoder before a handler runs, so a fixed pause
+# is a guess at how long that takes and a poll is a measurement. Both return as soon as the wanted
+# state is observed and report the LAST sample on expiry.
+OBSERVE_TIMEOUT_S = 20.0
+OBSERVE_POLL_S = 0.5
+
+# The per-peer power statuses as they read BEFORE the standby broadcast, captured by the flow and
+# consumed by run_test()'s finally block. None until the before-probe succeeds, which is what
+# distinguishes "the cycle never started" from "nothing was recorded".
+_captured_power_status = None
+
+
+def _recorded_power_status():
+    """Return (device_count, {logical_address: powerStatus}) from getDeviceList, or None.
+
+    The single reader this case measures everything through, so the before-probe, the after-probe
+    and the restoration report all judge the same shape. None means the list could not be READ -
+    a dead endpoint, a body that is not JSON, an envelope that is not an object, or a reply that
+    did not report success - which is deliberately distinct from an empty device list, since the
+    latter is a readable answer this case fails on for its own stated reason.
+
+    Only peers carrying an integer logicalAddress and a string powerStatus are collected. An entry
+    missing either is not silently defaulted: it is absent from the mapping, so the before-probe's
+    vocabulary check and the after-probe's set-equality check both report it rather than comparing
+    against a value this module invented.
+    Returns:
+        (count, {int: str}) on success - count is whatever numberofdevices carried, so a plugin
+        that stops reporting it is visible in the log rather than papered over - or None when the
+        list could not be read.
+    """
+    response = send_curl_command(HdmiCecSinkApis.get_device_list)
+    # send_curl_command reports a transport failure by RETURNING the truthy sentinel
+    # "< No response from WPEFramework >", so an emptiness test alone would read a dead endpoint
+    # as a healthy one.
+    if not response or response.startswith("< No response"):
+        return None
+    try:
+        envelope = json.loads(response)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    result = envelope.get("result")
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return None
+    device_list = result.get("deviceList")
+    if not isinstance(device_list, list):
+        return None
+    statuses = {
+        device["logicalAddress"]: device["powerStatus"]
+        for device in device_list
+        if isinstance(device, dict)
+        and isinstance(device.get("logicalAddress"), int)
+        and isinstance(device.get("powerStatus"), str)
+    }
+    return result.get("numberofdevices"), statuses
+
+
+def _report_power_restoration():
+    """Report whether every peer captured before the cycle reads its captured power status again.
+
+    REPORTED, NOT ASSERTED, and the distinction is the whole point of this function. The wake leg
+    is the only lever this suite has for restoring a peer that genuinely powered down, and it is
+    an inbound frame rather than a setter with a readback - so whether the recorded status has
+    caught up by the time the suite moves on is not something this case may fail on. The sink
+    re-reads a peer's power status only once HDMICECSINK_UPDATE_POWER_STATUS_INTERVA_MS has
+    elapsed since the last update - sixty seconds - so on real hardware a peer that has been woken
+    can legitimately still read "Standby" here, long after the frame was accepted. Failing that
+    would be failing correct behaviour, and waiting it out would put a minute of wall clock into
+    every run of this case.
+
+    So this bounded poll ends the transcript with what was actually observed: restored, or a named
+    list of the peers whose recorded status had not come back yet. _ensure_peers_woken keeps the
+    cleanup verdict, and it keys that verdict on what the suite can guarantee - that both wake
+    frames were accepted by the emulator.
+    """
+    if not _captured_power_status:
+        return
+
+    deadline = time.monotonic() + OBSERVE_TIMEOUT_S
+    while True:
+        reading = _recorded_power_status()
+        outstanding = {}
+        if reading is None:
+            outstanding = dict(_captured_power_status)
+        else:
+            for address, captured in _captured_power_status.items():
+                observed = reading[1].get(address)
+                if observed != captured:
+                    outstanding[address] = (captured, observed)
+        if not outstanding:
+            log_success(
+                "✔ every peer captured before the cycle reads its captured power status again "
+                f"after the wake leg: {_captured_power_status}"
+            )
+            return
+        if time.monotonic() >= deadline:
+            if reading is None:
+                log_warning(
+                    "  the device list was unreadable while checking the wake leg, so the "
+                    f"restoration of {_captured_power_status} could not be confirmed"
+                )
+            else:
+                log_warning(
+                    "  the wake frames were accepted but these peers had not returned to their "
+                    f"captured power status within {OBSERVE_TIMEOUT_S:.0f}s "
+                    f"(address: captured -> observed): {outstanding}. On a real device this is "
+                    "expected until the sink's sixty-second power-status refresh elapses"
+                )
+            return
+        time.sleep(OBSERVE_POLL_S)
+
+
 def run_test():
     """Drive standby coordination in both directions and assert what the published surface reports.
 
@@ -180,13 +314,19 @@ def run_test():
     # The wake leg is guaranteed rather than merely ordered: the flow runs inside a try whose
     # finally always re-issues it, so no early return and no exception can leave the emulated
     # peers in standby. The restoration reports its own verdict and this case fails if either
-    # half fails.
+    # half fails. THIS IS THE RESTORATION HOOK - the module publishes no cleanup() for SuitManager
+    # to call, deliberately: the wake leg has to be re-issued even when the flow raises, and a
+    # finally block runs on that path where a cleanup() hook keyed to a returned verdict would
+    # too, but only after the exception had already propagated through the suite's runner.
     try:
         flow_ok = _run_standby_coordination_flow()
     finally:
         cleanup_ok, cleanup_detail = _ensure_peers_woken()
         if cleanup_ok:
             log_info(f"  Cleanup: {cleanup_detail}")
+            # What the wake leg actually achieved, against the statuses the flow captured. Report
+            # only - see _report_power_restoration for why this may not be a verdict.
+            _report_power_restoration()
         else:
             log_error(
                 "TCID25_Standby_Coordination_Flow cleanup FAILED: the emulated peers may still "
@@ -195,11 +335,7 @@ def run_test():
 
     if flow_ok and cleanup_ok:
         elapsed_time = time.perf_counter() - start_time
-        msg = "TCID25_Standby_Coordination_Flow Passed ✅"
-        if os.environ.get("HDMICEC_TIMING_ENABLED"):
-            log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-        else:
-            log_success(msg)
+        log_success(log_with_timing("TCID25_Standby_Coordination_Flow Passed ✅", elapsed_time))
         return True
 
     log_error("TCID25_Standby_Coordination_Flow Failed ❌")
@@ -212,6 +348,7 @@ def _run_standby_coordination_flow():
     Every assertion is exactly as it was; only the verdict reporting moved to run_test() so the
     guaranteed wake leg in its finally block runs first.
     """
+    global _captured_power_status
 
     log_info(
         "Executing the standby coordination flow: outbound standby, inbound standby "
@@ -219,7 +356,8 @@ def _run_standby_coordination_flow():
     )
 
     # ── BEFORE-PROBE, ASSERTED AND CAPTURED ─────────────────────────────────────────────────────
-    # The per-peer power statuses are captured here, which is what lets cleanup() restore them and
+    # The per-peer power statuses are captured here, which is what lets run_test()'s finally block
+    # report what the wake leg restored, and
     # what gives the after-probe something real to be measured against. A before-probe that cannot
     # be read fails outright rather than being waived: Init_Devicelist_Populate guarantees a seeded
     # topology before the first case runs, so an unreadable list means the precondition never held,
@@ -298,7 +436,8 @@ def _run_standby_coordination_flow():
     # addDevice(header.from) before their notifications, and because logical address 5 is already
     # seeded that call is idempotent (:2449-2470), which is what entitles the after-probe to require
     # an IDENTICAL address set rather than a merely non-shrinking one.
-    # These two do NOT restore the peers - see cleanup() - so their position after the standby
+    # These two do NOT restore the peers on their own - see run_test()'s finally block, which
+    # re-issues them unconditionally - so their position after the standby
     # posts is a matter of covering the wake handlers in a realistic order, not a restoration.
     for yaml_name, description in (
         ("Device_Standby_Emulation.yaml", "the inbound DIRECTED Standby frame (0x50 0x36)"),
@@ -353,7 +492,8 @@ def _run_standby_coordination_flow():
     #     legitimately becomes Standby. Failing that would be failing correct behaviour.
     # ANY OTHER MOVEMENT IS WRONG IN BOTH ENVIRONMENTS and fails: a peer captured as Standby reading
     # anything else means something woke it, and a value outside the PowerStatus vocabulary means
-    # the record is malformed. Whichever outcome occurred, cleanup() restores the capture.
+    # the record is malformed. Whichever outcome occurred, run_test()'s finally block re-issues the
+    # wake leg and reports the capture against what the peers read afterwards.
     illegitimate = {}
     moved_to_standby = {}
     for address, status in before_status.items():
@@ -375,8 +515,8 @@ def _run_standby_coordination_flow():
     if moved_to_standby:
         log_success(
             "✔ the standby broadcast was observed directly: recorded power status moved to "
-            f"'Standby' for {sorted(moved_to_standby)} (was {moved_to_standby}); cleanup() will "
-            "restore the capture"
+            f"'Standby' for {sorted(moved_to_standby)} (was {moved_to_standby}); the wake leg in "
+            "run_test()'s finally block is issued next and its effect on the capture is reported"
         )
     else:
         log_success(
@@ -388,4 +528,7 @@ def _run_standby_coordination_flow():
         "set observed before the cycle"
     )
 
-    return False
+    # Every act was delivered, the address set is identical and no peer moved in a way neither
+    # environment permits, which is the whole of what this function claims. run_test() owns the
+    # verdict line and the wake leg; this returns the flow's own result to it.
+    return True

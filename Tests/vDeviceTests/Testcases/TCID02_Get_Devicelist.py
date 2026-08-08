@@ -46,7 +46,6 @@
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -126,11 +125,7 @@ def run_test():
 
         if has_success and has_count and has_devices and list_consistent and entries_valid:
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID02_Get_Devicelist Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID02_Get_Devicelist Passed ✅", elapsed_time))
             return True
 
         log_warning(

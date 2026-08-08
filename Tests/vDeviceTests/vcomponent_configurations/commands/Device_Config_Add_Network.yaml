@@ -173,8 +173,16 @@ HdmiCec:
                 name: "YAMAHA"
                 language: "eng"
                 cec_version: "1.4"
-                # Tuner: address 5 is the only audio-system address and VAUDIO, the ARC counterpart, holds it.
-                device_type: "Tuner"
+                # AudioSystem, and it has to be. Address 5 is the ONLY audio-system address the
+                # vComponent allocates, and it is the only address for which the sink's
+                # addDevice() additionally raises ReportAudioDeviceConnectedStatus - which is what
+                # makes the ARC, System Audio Mode and short-audio-descriptor flows observable at
+                # all. Declaring this peer a Tuner instead would allocate it from the tuner pool
+                # (3, 6, 7, 10), leaving 3 to SAMSUNG and 6 to this device, so address 5 would be
+                # unoccupied and Init_Devicelist_Populate's bootstrap - which declares discovery
+                # ready on address 5 - could never complete. There is no separate VAUDIO device in
+                # this topology; the audio system IS this peer.
+                device_type: "AudioSystem"
                 power_status: "on"
                 fault: no
                 port_id: 2

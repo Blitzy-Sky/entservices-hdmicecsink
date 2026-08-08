@@ -53,8 +53,10 @@
 """
 
 import time
-import os
+import json
 from utils import (
+    send_curl_command,
+    send_jsonrpc_command,
     send_jsonrpc_envelope,
     envelope_result,
     require_ack,
@@ -63,6 +65,7 @@ from utils import (
     log_success,
     log_error,
     log_warning,
+    log_with_timing,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -72,10 +75,17 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 # osdName.toString(), which for an empty operand is the empty string.
 PLUGIN_DEFAULTED_OSD_NAME = ""
 
-# The baseline this module writes, chosen for two properties that run_test() self-checks: it is not
-# empty, so "rejected" and "absorbed and stored" become two distinguishable observations; and it is
-# within OSDName::MAX_LEN so the operand cannot be truncated on the way in.
-DISTINGUISHING_OSD_NAME = "L3ProbeName"
+# The baseline this module writes, taken from the shared setter constant rather than restated here.
+# Two properties make it usable as a baseline and run_test() self-checks both: it is not empty, so
+# "rejected" and "absorbed and stored" become two distinguishable observations; and it is within
+# OSDName::MAX_LEN so the operand cannot be truncated on the way in.
+#
+# IT MUST BE THE SHARED CONSTANT'S VALUE, not a literal of this module's own. _restore_osd_name puts
+# the name back by re-issuing HdmiCECSink_Curl.set_osd_name, and the cases after this one are written
+# against the name TCID10_Set_OSD_Name establishes through that same constant - so a private literal
+# here would be written, then "restored" to a different value, and the read-back would fail on a
+# discrepancy this module had manufactured.
+DISTINGUISHING_OSD_NAME = HdmiCecSinkApis.SET_OSD_NAME_VALUE
 
 # OSDName::MAX_LEN, ccec/include/ccec/Operands.hpp - the operand is a fixed-maximum CEC byte string.
 OSD_NAME_MAX_LEN = 14
@@ -112,23 +122,35 @@ def _result_object(response_text):
     return result if isinstance(result, dict) else {}
 
 
-def _envelope_kind(response_text):
+def _envelope_kind(reply):
     """Classify a JSON-RPC reply as "result", "error" or None (not an envelope at all).
 
     The malformed request's reply is the one body this module must classify rather than merely
     parse, because the two admissible outcomes - an explicit rejection and an acceptance with a
-    defaulted argument - are told apart by which member the envelope carries.
+    defaulted argument - are told apart by which member the envelope carries. The third answer
+    matters just as much: a body carrying NEITHER member is an unusable reply, and reading it as a
+    rejection would let a broken transport pose as a validating plugin.
+
+    Args:
+        reply: Either a raw response body as returned by utils.send_curl_command, or an envelope
+               already parsed by utils.send_jsonrpc_envelope. Both are accepted because the two
+               readers in this module hold the reply in those two different forms, and the
+               classification must not depend on which one asked.
     Returns:
-        "result", "error", or None when the body is not JSON or is not a JSON-RPC envelope.
+        "result", "error", or None when the reply is absent, is not JSON, or is not a JSON-RPC
+        envelope carrying one of the two members.
     """
-    if not response_text or response_text.startswith("< No response"):
-        return None
-    try:
-        body = json.loads(response_text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(body, dict):
-        return None
+    if isinstance(reply, dict):
+        body = reply
+    else:
+        if not reply or reply.startswith("< No response"):
+            return None
+        try:
+            body = json.loads(reply)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(body, dict):
+            return None
     if "error" in body:
         return "error"
     if isinstance(body.get("result"), dict):
@@ -156,11 +178,18 @@ def _published_request(argv):
     return request, None
 
 
-def _read_osd_name():
-    """Return the published OSD name, or None when it cannot be read.
+def _read_osd_name_quietly():
+    """Return the published OSD name, or None when it cannot be read. Logs nothing.
 
     The empty string is a VALID reading and is returned as such - it is one of the two outcomes this
     module distinguishes - so None means "could not be read" and nothing else.
+
+    THE SILENT READER, and the reason there are two. This one is what the bounded polls call, so a
+    wait that takes twenty samples produces twenty reads and no log lines; _read_osd_name(label)
+    below is the reporting form, called where a single reading becomes part of a verdict and has to
+    appear in the transcript. Both were previously spelled _read_osd_name, and because a module body
+    runs top to bottom the later definition bound the name - which left cleanup() and
+    _wait_for_osd_name calling a one-argument function with no arguments.
     """
     response = send_curl_command(HdmiCecSinkApis.get_osd_name)
     # utils.send_curl_command reports a transport failure by RETURNING the TRUTHY sentinel
@@ -181,7 +210,7 @@ def _wait_for_osd_name(expected, timeout, interval):
     """Poll the published name until it reads `expected`; returns (matched, last_reading)."""
     deadline = time.monotonic() + timeout
     while True:
-        observed = _read_osd_name()
+        observed = _read_osd_name_quietly()
         if observed == expected:
             return True, observed
         if time.monotonic() >= deadline:
@@ -238,7 +267,7 @@ def cleanup():
     captured = _captured_osd_name
     _captured_osd_name = None
 
-    if _read_osd_name() == captured:
+    if _read_osd_name_quietly() == captured:
         log_info(f"TCID29 cleanup: the name already reads {captured!r}, nothing to restore")
         return True
 
@@ -301,12 +330,24 @@ def _observe_malformed_write(baseline_name):
         )
         return False
 
+    # WHICH MEMBER THE ENVELOPE CARRIES IS THE BRANCH DECISION, so it is classified rather than
+    # inferred from a missing result. envelope_result() answers None both for a refusal and for an
+    # envelope whose result is not an object, and those are opposite findings: the first is a
+    # validating plugin, the second is a reply this case cannot read at all.
+    kind = _envelope_kind(envelope)
+    if kind is None:
+        log_error(
+            "✖ the malformed setOSDName answered with an envelope carrying neither a result "
+            "object nor an error member, so it is neither a refusal nor an acknowledgement"
+        )
+        return False
+
     result = envelope_result(envelope)
     observed_name = _read_osd_name("getOSDName after the malformed write")
     if observed_name is None:
         return False
 
-    if result is None:
+    if kind == "error":
         # Branch (a): a validating plugin refused the call. The name must be exactly as it was.
         if observed_name != baseline_name:
             log_error(
@@ -433,28 +474,77 @@ def run_test():
     # Closing it needs input validation in HdmiCecSinkImplementation::SetOSDName - reject an
     # empty name with Core::ERROR_INVALID_SIGNATURE, or honour CECBytes::validate()'s result -
     # which is a production source change this suite is not permitted to make.
+    # THE BASELINE VALUE IS SELF-CHECKED BEFORE IT IS WRITTEN. Both properties are load-bearing and
+    # neither is this module's to choose - the value comes from the shared setter constant - so a
+    # change to that constant that broke either one would otherwise quietly hollow this case out.
+    # An empty baseline would make branches (a) and (b) indistinguishable, because "unchanged" and
+    # "emptied" would be the same reading; a baseline longer than OSDName::MAX_LEN would be
+    # truncated on the way in, so the read-back would fail against a value the plugin never
+    # promised to store.
+    if not DISTINGUISHING_OSD_NAME:
+        log_error(
+            "✖ HdmiCECSink_Curl.SET_OSD_NAME_VALUE is empty, so an absorbed malformed write and a "
+            "refused one would leave the same reading and this case could not tell them apart"
+        )
+        log_error("TCID29_Invalid_OSD_Setnochange Failed")
+        return False
+    if len(DISTINGUISHING_OSD_NAME) > OSD_NAME_MAX_LEN:
+        log_error(
+            f"✖ HdmiCECSink_Curl.SET_OSD_NAME_VALUE is {len(DISTINGUISHING_OSD_NAME)} characters, "
+            f"beyond OSDName::MAX_LEN ({OSD_NAME_MAX_LEN}), so the operand would be truncated on "
+            "the way in and the read-back would fail against a value never stored"
+        )
+        log_error("TCID29_Invalid_OSD_Setnochange Failed")
+        return False
+
+    # CAPTURED FIRST, BEFORE ANYTHING IS WRITTEN. cleanup() puts this value back, and it is read
+    # here rather than assumed to be the shared constant's: a sibling case may legitimately have
+    # left another name in place, and restoring a name this case never observed would be a
+    # different change rather than a restoration. An unreadable name is a precondition failure -
+    # writing over a state that cannot be captured is what makes a case unsafe to run.
+    _captured_osd_name = _read_osd_name("the OSD name before this case wrote anything")
+    if _captured_osd_name is None:
+        log_error(
+            "✖ the OSD name could not be read before the baseline write, so there is nothing for "
+            "cleanup() to restore and this case must not write over it"
+        )
+        log_error("TCID29_Invalid_OSD_Setnochange Failed")
+        return False
+
     if not require_ack(HdmiCecSinkApis.set_osd_name, "baseline setOSDName"):
         log_error("TCID29_Invalid_OSD_Setnochange Failed")
         return False
 
-    log_warning(f"Baseline OSD name response: {baseline_get}")
-    log_warning(f"Final OSD name response: {final_get}")
-    try:
-        b = json.loads(baseline_get)
-        f = json.loads(final_get)
-        # "result" must be in BOTH envelopes before the names are compared: two absent values
-        # would otherwise compare equal and turn a failed read into a vacuous pass.
-        if "result" in b and "result" in f and b["result"].get("name") == f["result"].get("name"):
-            elapsed_time = time.perf_counter() - start_time
-            msg = "TCID29_Invalid_OSD_Setnochange Passed"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
-            return True
-    except Exception:
-        # A parse or shape failure means the invariant could not be confirmed - a failure.
-        pass
+    # READ BACK, AND WAITED FOR. The baseline is the value every comparison below is against, so an
+    # acknowledged write whose value never arrived would make the malformed write's effect
+    # unmeasurable. Bounded, because the setter stores the operand on the plugin's own thread.
+    established, observed = _wait_for_osd_name(
+        DISTINGUISHING_OSD_NAME, OBSERVE_TIMEOUT_S, OBSERVE_POLL_S
+    )
+    if not established:
+        log_error(
+            f"✖ the baseline setOSDName was acknowledged but the name reads "
+            f"{sanitise_for_log(observed, max_chars=64)!r} rather than "
+            f"{sanitise_for_log(DISTINGUISHING_OSD_NAME, max_chars=64)!r} after "
+            f"{OBSERVE_TIMEOUT_S:.0f}s, so there is no established baseline to measure against"
+        )
+        log_error("TCID29_Invalid_OSD_Setnochange Failed")
+        return False
+    log_success(
+        f"✔ baseline established: the OSD name reads "
+        f"{sanitise_for_log(DISTINGUISHING_OSD_NAME, max_chars=64)!r}"
+    )
 
-    log_error("TCID29_Invalid_OSD_Setnochange Failed")
-    return False
+    # THE MEASUREMENT, then the restoration. Both are required: the acknowledged-and-emptied branch
+    # leaves the name empty, and every case after this one is written against the established value.
+    if not _observe_malformed_write(DISTINGUISHING_OSD_NAME):
+        log_error("TCID29_Invalid_OSD_Setnochange Failed")
+        return False
+
+    if not _restore_osd_name(DISTINGUISHING_OSD_NAME):
+        log_error("TCID29_Invalid_OSD_Setnochange Failed")
+        return False
+
+    elapsed_time = time.perf_counter() - start_time
+    log_success(log_with_timing("TCID29_Invalid_OSD_Setnochange Passed", elapsed_time))
+    return True

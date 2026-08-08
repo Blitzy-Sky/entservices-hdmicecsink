@@ -55,7 +55,6 @@
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -104,11 +103,7 @@ def run_test():
     try:
         if json.loads(curl_response) == expected_output_response:
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID15_Send_Standby_Message Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID15_Send_Standby_Message Passed ✅", elapsed_time))
             return True
         else:
             log_error("TCID15_Send_Standby_Message Failed ❌")

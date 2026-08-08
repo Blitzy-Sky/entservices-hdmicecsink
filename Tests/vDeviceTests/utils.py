@@ -1236,7 +1236,7 @@ def _with_http_status_write_out(argv):
     return [argv[0], "-w", _HTTP_CODE_WRITE_OUT] + list(argv[1:])
 
 
-def send_curl_command(curl_command):
+def send_curl_command(curl_command, timeout=None):
     '''Run a curl command and return its JSON-RPC response line as a string.
 
     Accepts either the complete curl command STRING that HdmiCECSink_Curl.py exports, or an
@@ -1276,6 +1276,10 @@ def send_curl_command(curl_command):
     sentinel, which callers detect with response.startswith("< No response").
     Args:
         curl_command: Complete curl command string, or a sequence of argv tokens
+        timeout: Optional whole-second bound for this one invocation, so a caller polling
+                 against its own deadline spends only the time it still has.  Omitted, or set
+                 to anything that is not a positive integer, falls back to
+                 CURL_TIMEOUT_SECONDS.
     Returns:
         The single JSON-RPC envelope line, otherwise the sentinel string.
     '''
@@ -1312,7 +1316,16 @@ def send_curl_command(curl_command):
         # Bounded in time AND in bytes by _run_curl, which reads incrementally and kills the
         # child at the response ceiling rather than accumulating whatever the endpoint chooses
         # to send.  It also reaps the child and closes every pipe on every path.
-        ok, returncode, stdout, stderr = _run_curl(argv, CURL_TIMEOUT_SECONDS)
+        #
+        # The budget is the caller's when it supplies one, and CURL_TIMEOUT_SECONDS otherwise.
+        # A caller polling against its own deadline - Init_Devicelist_Populate's discovery and
+        # seed loops are the ones that do - must be able to hand each request only the time it
+        # still has, or a single request can outlive the deadline the loop is enforcing and the
+        # bound becomes advisory.  _normalise_timeout is what makes an unusable value fall back
+        # rather than raise, so a caller cannot shorten the budget to zero by accident.
+        ok, returncode, stdout, stderr = _run_curl(
+            argv, _normalise_timeout(timeout, CURL_TIMEOUT_SECONDS)
+        )
 
         if not ok:
             detail = stderr.strip() or stdout.strip()

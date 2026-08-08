@@ -34,13 +34,13 @@
  *          The emulator cannot answer the solicitation by itself either - the
  *          <Request Short Audio Descriptor> -> <Report Short Audio Descriptor> pair is recorded
  *          as ABSENT from the auto-response table in
- *          vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml:152-153 -
+ *          vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml:82-83 -
  *          which is why the answer is injected as a raw user_defined payload.
  *
  * @precondition
  *  - A device under test - physical hardware or a QEMU target - is running WPEFramework with
  *    the org.rdk.HdmiCecSink plugin activated and reachable over JSON-RPC.
- *  - Init_Devicelist_Populate has seeded the emulated topology, including the VAUDIO
+ *  - Init_Devicelist_Populate has seeded the emulated topology, including the YAMAHA
  *    AudioSystem peer at CEC logical address 5, and has left HDMI-CEC enabled.
  *  - The vComponent HTTP API is reachable, so the reply payload can be injected.
  *
@@ -269,7 +269,8 @@ def run_test():
 
     # VALUE ASSERTION ON `connected`, NOT A TYPE ASSERTION. An earlier revision checked only
     # isinstance(connected, bool), reasoning from the sink's own L2 suite, which asserts
-    # EXPECT_FALSE(connected) (../../L2Tests/tests/HdmiCecSink_L2Test.cpp:1827 over COM-RPC, :2539
+    # EXPECT_FALSE(connected) (../../L2Tests/tests/HdmiCecSink_L2Test.cpp
+    # GetAudioDeviceConnectedStatus_COMRPC over COM-RPC, GetAudioDeviceConnectedStatus_JSONRPC
     # over JSON-RPC). THAT CITATION DOES NOT TRANSFER: the L2 host discovers no audio system at
     # all, which is why False is correct there, whereas this suite REQUIRES the VAUDIO peer at
     # logical address 5 as a @precondition and addDevice() sets hdmiCecAudioDeviceConnected

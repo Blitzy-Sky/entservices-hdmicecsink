@@ -93,12 +93,13 @@
  *    (ccec/include/ccec/Operands.hpp:593-614), in the published device list for logical address
  *    5. The expectation is DERIVED from the fixture in step 0 rather than restated, so the
  *    fixture remains the single source of truth.
- *    WHAT THAT ASSERTION DOES NOT PROVE, stated rather than assumed: it is not a TRANSITION
- *    proof. CECDeviceParams() initialises m_powerStatus to 0 (HdmiCecSinkImplementation.h:150)
- *    and clear() resets it to 0 (:173), both rendering "On", which is the value both of this
- *    suite's <Report Power Status> fixtures carry (operand 0x00). Proving a transition needs a
- *    fixture with a non-zero [Power Status] operand, which this suite does not ship; that
- *    remains an open gap and is not papered over here.
+ *    WHY THAT ASSERTION IS A TRANSITION PROOF. CECDeviceParams() initialises m_powerStatus to 0
+ *    (HdmiCecSinkImplementation.h:150) and clear() resets it to 0 (:173), both rendering "On",
+ *    so a fixture carrying operand 0x00 would be indistinguishable from a frame that never
+ *    arrived. Device_Report_Power_Status.yaml therefore carries a NON-ZERO operand - 0x01,
+ *    "Standby" - and the published field must MOVE from "On" to "Standby", which only a
+ *    delivered and decoded frame can do. The sibling Process_Report_Power_Status.yaml, which
+ *    initiates from address 4 and is not the fixture this case injects, still carries 0x00.
  *  - THE DECODED VOLUME AND MUTE STATE ARE NOT ASSERTED, because no state exists to read them
  *    back from. Process_ReportAudioStatus_msg stores neither value: it flips two internal timer
  *    flags and fans the pair out through ReportAudioStatusEvent (:1171-1195,
@@ -526,14 +527,13 @@ def run_test():
     # bounded monotonic budget, so a handler that runs on the CEC thread is waited for rather than
     # raced, and a handler that never runs is still reported.
     #
-    # WHAT THIS DOES AND DOES NOT PROVE, stated rather than left to be assumed. It proves the
-    # published field agrees with the injected operand. It does NOT by itself prove a TRANSITION,
-    # because CECDeviceParams() initialises m_powerStatus to 0 (HdmiCecSinkImplementation.h:150)
-    # and clear() resets it to 0 (:173), both of which render "On" - the same value this suite's
-    # only <Report Power Status> fixtures carry (operand 0x00, from address 5 here and from
-    # address 4 in the sibling Process_ document). Proving the transition needs a fixture with a
-    # non-zero [Power Status] operand, which this suite does not ship and which this pass may not
-    # add; that is recorded in @expected_result as the remaining gap rather than papered over.
+    # WHAT THIS PROVES, stated rather than left to be assumed. It proves the published field
+    # agrees with the injected operand, and because the operand is NON-ZERO it also proves a
+    # TRANSITION: CECDeviceParams() initialises m_powerStatus to 0 (HdmiCecSinkImplementation.h:150)
+    # and clear() resets it to 0 (:173), both of which render "On", while
+    # Device_Report_Power_Status.yaml carries operand 0x01 - "Standby" - so the field can only
+    # read "Standby" after a delivered and decoded frame. The sibling Process_ document, which
+    # initiates from address 4 and is not injected here, still carries 0x00.
     matched, observed = _wait_for_power_status(
         AUDIO_SYSTEM_LOGICAL_ADDRESS, expected_power_status
     )

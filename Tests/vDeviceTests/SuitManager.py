@@ -48,6 +48,7 @@
 import importlib
 import io
 import sys
+import time
 from pathlib import Path
 import os
 
@@ -629,6 +630,21 @@ def run_suite(suite_name):
                     f"Plugin {callsign} did not report state 'activated' before the deadline; "
                     "the cases below will run anyway and their own assertions decide the verdict"
                 )
+            # "Activated" and "dispatching its own methods" are two different observables, and a
+            # plugin reaches the first before the second.  readiness_probe is the suite's
+            # declaration of the second, so it is polled here rather than slept through: the wait
+            # returns on the first answering read and reports its own elapsed time, and an expiry
+            # is a warning rather than a verdict because the cases' own assertions decide that.
+            ready, ready_elapsed = wait_for_plugin_ready(callsign, readiness_probe)
+            if ready:
+                log_success(
+                    f"{callsign} answered its readiness probe after {ready_elapsed:.2f}s"
+                )
+            else:
+                log_warning(
+                    f"{callsign} did not answer its readiness probe within {ready_elapsed:.2f}s; "
+                    "the cases below will run anyway and their own assertions decide the verdict"
+                )
         else:
             # Abort rather than run: every case would fail against a plugin that is not up,
             # and 33 misleading failures are worth less than one accurate one.
@@ -690,6 +706,12 @@ def run_suite(suite_name):
             # and skip alike. _run_cleanup swallows nothing but propagates nothing either, so
             # the stdout restore below is always reached.
             cleanup_ok = _run_cleanup(tc_name, tc_cleanup)
+            if not cleanup_ok:
+                # Recorded, not raised.  An unrestored device is a property of the RUN, not a
+                # verdict on this case, so it is collected here and applied once to the suite
+                # result - which is exactly what this function's contract promises and what
+                # cleanup_failures is read for at the end.
+                cleanup_failures.append(tc_name)
         finally:
             sys.stdout = original_stdout
 
@@ -721,6 +743,25 @@ def run_suite(suite_name):
                 f"{callsign} did not answer getEnabled after {tc_name}; the cases that follow may "
                 "fail against a plugin that is no longer serving"
             )
+
+        # Then let the bus go quiet before the next case observes it.  settle_probe is the suite's
+        # declaration of the one piece of plugin state inbound CEC traffic changes, and consecutive
+        # equal readings of it are what "settled" means as an observable - so this replaces a fixed
+        # inter-case sleep and returns immediately on a quiet bus.  Skipped after the LAST case,
+        # because nothing follows it that could observe unsettled state, and paying the wait there
+        # would only lengthen the run.
+        if index != last_index:
+            settled, settle_elapsed, settle_value = wait_for_settled(settle_probe)
+            if settled:
+                log_info(
+                    f"Bus settled after {tc_name} in {settle_elapsed:.2f}s (probe read "
+                    f"{settle_value})"
+                )
+            else:
+                log_warning(
+                    f"Bus had not settled {settle_elapsed:.2f}s after {tc_name} (last probe read "
+                    f"{settle_value}); the next case may observe state still in flight"
+                )
 
     log_info(f"\n{'='*60}")
     log_info(f"Suite Summary: {passed} passed, {failed} failed, {skipped} skipped")

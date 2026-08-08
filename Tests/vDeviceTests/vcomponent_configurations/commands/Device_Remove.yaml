@@ -21,9 +21,13 @@
 # Drops one HDMI-CEC peer from the vComponent's device map at run time. This document is
 # the third leg of the add / mutate / remove triple: Device_Add.yaml attaches the peer,
 # Device_Status.yaml mutates it, and this one takes it away. All three name
-# "GameConsole", and so does the PlaybackDevice declared beneath CECAdapter in
-# Device_Config_Add_Network.yaml. That name has to change in all four places at once, or
-# the removal addresses a peer the topology never declared and silently does nothing.
+# "GameConsole", and the name has to change in all three at once or the removal addresses a
+# peer that is not in the map - which the vComponent does not reject, it simply has no
+# effect. "GameConsole" is NOT declared in Device_Config_Add_Network.yaml: that document
+# declares exactly six peers, SAMSUNG, YAMAHA, DENON, PANASONIC, LG and SONY beneath VTV,
+# and leaves port 4 of the audio system free for this triple. An earlier note here claimed a
+# collision with a PlaybackDevice beneath a "CECAdapter" in that document; neither device
+# exists in it, and the claim was carried across from the source plugin's tree where they do.
 #
 # The filename is part of the contract rather than a label: utils.HDMICEC_CMD_BASE
 # resolves to this directory and a consumer posts the literal "Device_Remove.yaml" joined

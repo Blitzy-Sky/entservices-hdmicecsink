@@ -151,11 +151,17 @@ def _post_hdmicec(yaml_file):
 #
 # PhysicalAddress::toString() renders {0x10, 0x00} as "1.0.0.0" and GetActiveSource derives the port
 # from getByteValue(0), which is 1, as "HDMI" + (1 - 1) (Operands.hpp; Implementation.cpp:1356-1362).
-ANNOUNCED_LOGICAL_ADDRESS = 4
-ANNOUNCED_PHYSICAL_ADDRESS = "1.0.0.0"
-ANNOUNCED_PORT = "HDMI0"
+# ONE SOURCE OF TRUTH, AND IT IS THE FIXTURE.  These three used to carry 1.0.0.0 and HDMI0 while
+# EXPECTED_ACTIVE_SOURCE_* above carried 3.0.0.0 and HDMI2 for the same reading, and the fixture on
+# disk carries ["0x4F","0x82","0x30","0x00"] - 3.0.0.0.  _is_announced_peer compares against these,
+# so the disagreement meant the Step 1 wait for the peer to take the bus could never be satisfied
+# and only ever expired.  They are now bound to the EXPECTED_ACTIVE_SOURCE_* values rather than
+# restated, so the two families cannot drift apart again.
+ANNOUNCED_LOGICAL_ADDRESS = EXPECTED_ACTIVE_SOURCE_LA
+ANNOUNCED_PHYSICAL_ADDRESS = EXPECTED_ACTIVE_SOURCE_PHYSICAL
+ANNOUNCED_PORT = EXPECTED_ACTIVE_SOURCE_PORT
 
-# Process_In_Active_Source.yaml carries ["0x40", "0x9D", "0x20", "0x00"]: header 0x40 is initiator 4
+# Process_In_Active_Source.yaml carries ["0x40", "0x9D", "0x30", "0x00"]: header 0x40 is initiator 4
 # DIRECTED to the sink at 0, which is what process(InActiveSource) requires - it ignores broadcast.
 # updateInActiveSource clears m_currentActiveSource when it is the announcing address, so posting it
 # after the announcement above drives getActiveSource to available false. That pair is what makes a
@@ -471,63 +477,19 @@ def run_test():
             f"{EXPECTED_ACTIVE_SOURCE_PORT}"
         )
         elapsed_time = time.perf_counter() - start_time
-        msg = "TCID17_Request_Active_Source_Flow Passed ✅"
-        if os.environ.get("HDMICEC_TIMING_ENABLED"):
-            log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-        else:
-            log_success(msg)
+        log_success(log_with_timing("TCID17_Request_Active_Source_Flow Passed ✅", elapsed_time))
         return True
     except json.JSONDecodeError:
         log_error("Invalid JSON response")
         log_error("TCID17_Request_Active_Source_Flow Failed ❌")
         return False
-    ack_result = acknowledgement.get("result") if isinstance(acknowledgement, dict) else None
-    if not isinstance(ack_result, dict) or ack_result.get("success") is not True:
-        log_error(f"✖ requestActiveSource did not report success: {acknowledgement!r}")
-        log_error("TCID17_Request_Active_Source_Flow Failed ❌")
-        return False
-    log_success("✔ requestActiveSource acknowledged")
-
-    log_info("TCID17 Step 3: inject the peer's request and its answer")
-    # BOTH posts are required, and each is checked at the point it is made rather than collected
-    # into one predicate afterwards, so a refusal names the document that was actually refused.
-    if not _post_hdmicec("Process_Request_Active_Source.yaml"):
-        log_error("✖ the <Request Active Source> injection was refused")
-        log_error("TCID17_Request_Active_Source_Flow Failed ❌")
-        return False
-    if not _post_hdmicec(ACTIVE_SOURCE_YAML):
-        log_error("✖ the <Active Source> answer injection was refused")
-        log_error("TCID17_Request_Active_Source_Flow Failed ❌")
-        return False
-
-    # ── ASSERT: the transition, not the shape ──────────────────────────────────────────────────
-    log_info(
-        f"TCID17 Step 4: require the active source to become LA {ANNOUNCED_LOGICAL_ADDRESS} at "
-        f"{ANNOUNCED_PHYSICAL_ADDRESS}"
-    )
-    became, after = _wait_for_active_source(
-        _is_announced_peer, "the announced peer becoming the active source"
-    )
-    if not became:
-        log_error("TCID17_Request_Active_Source_Flow Failed ❌")
-        return False
-
-    # The port string is derived by the plugin from the same physical address, so it is asserted
-    # too: a mismatch here means the address was applied but the port derivation disagrees with it.
-    if after.get("port") != ANNOUNCED_PORT:
-        log_error(
-            f"✖ active-source port is {after.get('port')!r}, expected {ANNOUNCED_PORT!r} for "
-            f"physical address {ANNOUNCED_PHYSICAL_ADDRESS}"
-        )
-        log_error("TCID17_Request_Active_Source_Flow Failed ❌")
-        return False
-
-    log_success(
-        f"✔ active source transitioned: available {before.get('available')!r} -> True, "
-        f"LA {after.get('logicalAddress')} at {after.get('physicalAddress')} on "
-        f"{after.get('port')}"
-    )
-
-    elapsed_time = time.perf_counter() - start_time
-    log_success(log_with_timing("TCID17_Request_Active_Source_Flow Passed ✅", elapsed_time))
-    return True
+    # NOTHING FOLLOWS THE except HANDLER ABOVE, AND A SECOND COPY OF STEPS 3 AND 4 USED TO.
+    # It was unreachable - it sat after the terminal `return False` of the try/except that closes
+    # this function, so Python never executed a line of it - and it was also WRONG: it asserted
+    # the active source became 1.0.0.0 on HDMI0, while the fixture it posted,
+    # vcomponent_configurations/commands/Process_Active_Source.yaml, carries
+    # ["0x4F","0x82","0x30","0x00"] - physical address 3.0.0.0, which GetActiveSource reports on
+    # HDMI2.  Its first statement also read an `acknowledgement` name that this module never binds.
+    # The reachable flow above asserts the same transition against the values the fixture actually
+    # produces (EXPECTED_ACTIVE_SOURCE_*), so the duplicate is removed rather than repaired: two
+    # copies of one assertion is how the two drift apart again.

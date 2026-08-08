@@ -191,36 +191,54 @@ BOOTSTRAP_RPA_YAML = next(
 # other two must be broadcast. The source plugin guards none of the three, which is why its
 # payload documents are broadcast throughout and cannot be reused here verbatim.
 PEER_SEEDS = (
-    # Audio System - bootstrap peer, and the ARC counterpart of the sink.
+    # ONE AUTHORITATIVE TOPOLOGY, AND THIS TABLE IS DERIVED FROM IT RATHER THAN BESIDE IT.
+    # Device_Config_Add_Network.yaml declares the tree; the vComponent then assigns each peer the
+    # first free logical address in the pool for its device_type. Reading the two together fixes
+    # every address below, and nothing here is a choice:
+    #
+    #   VTV (television, 0.0.0.0, three ports)
+    #     +- HDMI input 0 -> SAMSUNG    Tuner            1.0.0.0   Tuner 1            -> 3
+    #     +- HDMI input 1 -> YAMAHA     AudioSystem      2.0.0.0   Audio System       -> 5
+    #     |                   +- port 1 -> DENON      RecordingDevice  2.1.0.0  Recording 1 -> 1
+    #     |                   +- port 2 -> PANASONIC  PlaybackDevice   2.2.0.0  Playback 2  -> 8
+    #     |                   +- port 3 -> LG         RecordingDevice  2.3.0.0  Recording 2 -> 2
+    #     |                   +- port 4 -> reserved, free for Device_Add.yaml
+    #     +- HDMI input 2 -> SONY       PlaybackDevice   3.0.0.0   Playback 1         -> 4
+    #
+    # SIX peers, not eleven, and they do not occupy every non-television address: the pools are
+    # per role, so RecordingDevice draws from (1, 2, 9), Tuner from (3, 6, 7, 10), PlaybackDevice
+    # from (4, 8, 11) and AudioSystem has exactly one address, 5.
+    #
+    # AN EARLIER REVISION OF THIS TABLE HAD DRIFTED FROM THAT TREE and the drift was silent in
+    # both directions: DENON was seeded at 2, SONY at 9, PANASONIC at 11 and LG at 10, so four of
+    # the six peers announced one address while the verification waited for another - a wait that
+    # simply times out - and LG additionally carried five fields where every consumer unpacks six,
+    # which made verify_seed_payload_consistency() raise before it could report anything at all.
+    # The entries are now generated from the tree above, and verify_topology_consistency() proves
+    # the payload documents still agree with it.
+    #
+    # ADDRESSING CONTRACT for the referenced payload documents: see the note above this table.
+    #
+    # Recording Device 1 - first recorder beneath the audio system, at 2.1.0.0.
     (
-        5,
-        "YAMAHA",
-        "00A0AF",
-        BOOTSTRAP_RPA_YAML,
-        "DeviceListConfig/Payload_Set_OSD_Name_YAMAHA.yaml",
-        "DeviceListConfig/Payload_Vendor_ID_YAMAHA.yaml",
+        1,
+        "DENON",
+        "0009B0",
+        "DeviceListConfig/Payload_Report_Physical_Address_DENON.yaml",
+        "DeviceListConfig/Payload_Set_OSD_Name_DENON.yaml",
+        "DeviceListConfig/Payload_Vendor_ID_DENON.yaml",
     ),
-    # Playback peer on sink HDMI port 4 - the active-source candidate the routing flows
-    # switch to. Announced device_type is PlaybackDevice (0x04).
+    # Recording Device 2 - second recorder beneath the audio system, at 2.3.0.0. Two recorders
+    # exercise device-list handling of a second peer sharing one role.
     (
-        9,
-        "SONY",
-        "080046",
-        "DeviceListConfig/Payload_Report_Physical_Address_SONY.yaml",
-        "DeviceListConfig/Payload_Set_OSD_Name_SONY.yaml",
-        "DeviceListConfig/Payload_Vendor_ID_SONY.yaml",
+        2,
+        "LG",
+        "00E091",
+        "DeviceListConfig/Payload_Report_Physical_Address_LG.yaml",
+        "DeviceListConfig/Payload_Set_OSD_Name_LG.yaml",
+        "DeviceListConfig/Payload_Vendor_ID_LG.yaml",
     ),
-    # Second routing peer, on sink HDMI port 6, so a route change has somewhere to go.
-    # Announced device_type is Tuner (0x03).
-    (
-        11,
-        "PANASONIC",
-        "008045",
-        "DeviceListConfig/Payload_Report_Physical_Address_PANASONIC.yaml",
-        "DeviceListConfig/Payload_Set_OSD_Name_PANASONIC.yaml",
-        "DeviceListConfig/Payload_Vendor_ID_PANASONIC.yaml",
-    ),
-    # Tuner peer on sink HDMI port 1. Announced device_type is Tuner (0x03).
+    # Tuner 1 - directly on sink HDMI input 0, at 1.0.0.0.
     (
         3,
         "SAMSUNG",
@@ -229,24 +247,38 @@ PEER_SEEDS = (
         "DeviceListConfig/Payload_Set_OSD_Name_SAMSUNG.yaml",
         "DeviceListConfig/Payload_Vendor_ID_SAMSUNG.yaml",
     ),
-    # Recording peer on sink HDMI port 7. Announced device_type is RecordingDevice (0x01).
+    # Playback Device 1 - directly on sink HDMI input 2, at 3.0.0.0, and the one device the
+    # topology declares active_source, so the routing flows have a source to switch away from.
     (
-        2,
-        "DENON",
-        "0009B0",
-        "DeviceListConfig/Payload_Report_Physical_Address_DENON.yaml",
-        "DeviceListConfig/Payload_Set_OSD_Name_DENON.yaml",
-        "DeviceListConfig/Payload_Vendor_ID_DENON.yaml",
+        4,
+        "SONY",
+        "080046",
+        "DeviceListConfig/Payload_Report_Physical_Address_SONY.yaml",
+        "DeviceListConfig/Payload_Set_OSD_Name_SONY.yaml",
+        "DeviceListConfig/Payload_Vendor_ID_SONY.yaml",
     ),
-    # Second audio-system peer on sink HDMI port 5. Announced device_type is
-    # AudioSystem (0x05), which exercises device-list handling of a second audio device
-    # alongside the ARC counterpart at address 5.
+    # Audio System - bootstrap peer, and the ARC counterpart of the sink, at 2.0.0.0. Address 5
+    # is the only audio-system address and the only one for which addDevice() additionally raises
+    # ReportAudioDeviceConnectedStatus, which is why discovery is declared ready on it.
     (
-        10,
-        "LG",
-        "DeviceListConfig/Payload_Report_Physical_Address_LG.yaml",
-        "DeviceListConfig/Payload_Set_OSD_Name_LG.yaml",
-        "DeviceListConfig/Payload_Vendor_ID_LG.yaml",
+        5,
+        "YAMAHA",
+        "00A0AF",
+        BOOTSTRAP_RPA_YAML,
+        "DeviceListConfig/Payload_Set_OSD_Name_YAMAHA.yaml",
+        "DeviceListConfig/Payload_Vendor_ID_YAMAHA.yaml",
+    ),
+    # Playback Device 2 - beneath the audio system at 2.2.0.0, so a route change has somewhere to
+    # go and removeDevice() has a peer nested one level below an HDMI input rather than on one.
+    # Declared power_status "standby" by the topology, which is what makes it the peer a
+    # wake-from-standby observation can be made against.
+    (
+        8,
+        "PANASONIC",
+        "008045",
+        "DeviceListConfig/Payload_Report_Physical_Address_PANASONIC.yaml",
+        "DeviceListConfig/Payload_Set_OSD_Name_PANASONIC.yaml",
+        "DeviceListConfig/Payload_Vendor_ID_PANASONIC.yaml",
     ),
 )
 
@@ -376,64 +408,21 @@ def _post(yaml_name):
     return http_code == 200
 
 
-def _resolve_strict_multi():
-    """Resolve STRICT_MULTI_ENV to a bool, or None when its value is not a documented spelling.
-
-    Returns None rather than a default so the caller can refuse to run. A gate that selects how
-    much of the device list is enforced must not fall back to the weaker setting when it cannot
-    be understood: "STRICT_MULTI=true" reaching a comparison against the literal "1" is how a
-    run that was configured for full enforcement quietly performs the partial one instead.
-    """
-    raw = os.environ.get(STRICT_MULTI_ENV, "")
-    normalised = raw.strip().lower()
-    if normalised in _TRUE_SPELLINGS:
-        return True
-    if normalised in _FALSE_SPELLINGS:
-        return False
-    log_error(
-        f"Init_Devicelist_Populate Failed ❌: {STRICT_MULTI_ENV}="
-        f"'{sanitise_for_log(raw, max_chars=64)}' is not a recognised value; use one of "
-        f"{sorted(_TRUE_SPELLINGS)} to enable strict mode or one of "
-        f"{sorted(_FALSE_SPELLINGS - {''})} to select bootstrap mode"
-    )
-    return None
+# The two gate resolvers used to exist twice in this module, in two different shapes: an early
+# pair returning `value or None` and a later pair returning `(ok, value)`.  Python bound the
+# name to the LATER definition, so the early pair was dead and the two early call sites were
+# reading a 2-tuple as a bool - which made strict mode unconditionally on - and calling
+# _resolve_min_devices with no argument, which its live signature does not accept.  The early
+# pair is removed rather than the later one: the later pair validates everything the early pair
+# did, additionally handles the empty-string spelling and the strict-mode interaction, and is
+# what the module's own Step 3 call sites already use.  Both call sites now use that one shape.
 
 
-def _resolve_min_devices():
-    """Resolve MIN_DEVICES_ENV to an int in [1, len(PEER_SEEDS)], or None when it is invalid.
-
-    Returns None rather than the documented default so the caller can refuse to run. A floor
-    that silently becomes 1 because it was mistyped is worse than no floor at all: the run
-    still reports the mode it was asked for while enforcing far less than it was told to.
-    """
-    raw = os.environ.get(MIN_DEVICES_ENV)
-    if raw is None:
-        return 1
-
-    candidate = raw.strip()
-    try:
-        # int(x, 10) rejects the underscore-separated and non-decimal spellings int(x) accepts,
-        # so "1_0" and "0x2" are configuration errors here rather than surprising values.
-        minimum = int(candidate, 10)
-    except ValueError:
-        log_error(
-            f"Init_Devicelist_Populate Failed ❌: {MIN_DEVICES_ENV}="
-            f"'{sanitise_for_log(raw, max_chars=64)}' is not a base-10 integer"
-        )
-        return None
-
-    if not 1 <= minimum <= len(PEER_SEEDS):
-        log_error(
-            f"Init_Devicelist_Populate Failed ❌: {MIN_DEVICES_ENV}={minimum} is out of range; "
-            f"this module seeds {len(PEER_SEEDS)} peers, so the floor must be between 1 and "
-            f"{len(PEER_SEEDS)} inclusive"
-        )
-        return None
-
-    return minimum
 
 
-def _get_device_list():
+
+
+def _get_device_list(timeout=None):
     """Call getDeviceList and return the parsed result dict, or None on error.
 
     The "< No response" prefix is the byte-exact sentinel utils.send_curl_command returns for
@@ -454,6 +443,45 @@ def _get_device_list():
     except json.JSONDecodeError:
         return None
 
+
+
+def _jsonrpc_result(response, label):
+    """Return the JSON-RPC result mapping from a response, or None with the reason logged.
+
+    The three plugin-toggle helpers below all need the same four checks - a reply arrived, it is
+    not the transport sentinel, it parses as JSON, and it carries a "result" object - and all
+    three need a FAILURE to be distinguishable from a result that merely says success is False.
+    Returning None for every unusable reply, and naming the call in the log while doing it, is
+    what keeps "the device did not answer" separate from "the device answered no" at the call
+    sites; collapsing the two is how an unreachable endpoint gets reported as a refused request.
+
+    Args:
+        response: Raw reply as returned by utils.send_curl_command.
+        label: The JSON-RPC call being reported, used only in the log line.
+    Returns:
+        The "result" mapping when the reply carries one, otherwise None.
+    """
+    if not response:
+        log_warning(f"  {label}: no reply")
+        return None
+    # The sentinel is TRUTHY, so the falsy check above cannot detect a transport failure on its
+    # own; without this the sentinel would reach json.loads and be misreported as a parse error.
+    if response.startswith("< No response"):
+        log_warning(f"  {label}: no response from WPEFramework")
+        return None
+    try:
+        body = json.loads(response)
+    except json.JSONDecodeError:
+        log_warning(f"  {label}: reply was not JSON: {sanitise_for_log(response)}")
+        return None
+    if not isinstance(body, dict):
+        log_warning(f"  {label}: reply was not a JSON object: {sanitise_for_log(response)}")
+        return None
+    result = body.get("result")
+    if not isinstance(result, dict):
+        log_warning(f"  {label}: reply carried no result object: {sanitise_for_log(response)}")
+        return None
+    return result
 
 def _set_enabled_true():
     """Enable HdmiCecSink plugin; returns True when API reports success."""
@@ -523,7 +551,7 @@ def _inject_triplet(la, rpa_yaml, osd_yaml, vid_yaml, step_timeout_s=2.0, step_p
         # the whole triplet, which _seed_device already waits for through _wait_for_device. Removing
         # the gap would rely on frames posted back-to-back never being coalesced by the transport,
         # which cannot be verified from here. Recorded as deferred rather than deleted or guessed.
-        time.sleep(inter_cmd_delay)
+        time.sleep(GIVE_COMMAND_PACING_SECONDS)
     return True
 
 
@@ -822,6 +850,194 @@ def verify_seed_payload_consistency():
     return True
 
 
+# THE TOPOLOGY THE NETWORK DOCUMENT DECLARES, AS THE PAYLOADS ARE REQUIRED TO ANNOUNCE IT.
+#
+# Every value is derived, not chosen. Device_Config_Add_Network.yaml declares the parent/port tree;
+# vcDevice_AllocatePhysicalLogicalAddresses forms a child's physical address by replacing the first
+# zero nibble of its parent's with the parent port it hangs from; and vcDevice_AllocateLogicalAddress
+# takes the first free address from the pool for the device's type. The result is the table below,
+# keyed by logical address:
+#
+#   logical address -> (name, network device_type, announced device-type byte, physical address)
+#
+# The announced device-type byte is the third operand of <Report Physical Address> and uses the CEC
+# device-type enumeration - 0 television, 1 recording device, 3 tuner, 4 playback device,
+# 5 audio system - which is a DIFFERENT encoding from the vComponent's device_type keyword, so both
+# are recorded and both are checked.
+#
+# This table exists because a drift between the network document and the payload documents is
+# invisible at run time: the emulator builds its map from the document, the payloads announce
+# whatever bytes they carry, and a peer that announces an address the map does not hold simply never
+# appears - a wait that times out rather than a failure that names the cause.
+EXPECTED_TOPOLOGY = {
+    1: ("DENON", "RecordingDevice", 0x01, (0x21, 0x00)),
+    2: ("LG", "RecordingDevice", 0x01, (0x23, 0x00)),
+    3: ("SAMSUNG", "Tuner", 0x03, (0x10, 0x00)),
+    4: ("SONY", "PlaybackDevice", 0x04, (0x30, 0x00)),
+    5: ("YAMAHA", "AudioSystem", 0x05, (0x20, 0x00)),
+    8: ("PANASONIC", "PlaybackDevice", 0x04, (0x22, 0x00)),
+}
+
+# The television the sink plugin itself is. It appears in the network document twice - once as
+# emulated_device and once as the root of device_map - and it is not a peer, so it is excluded from
+# the peer comparison rather than being mistaken for a missing seed.
+TOPOLOGY_TELEVISION_NAME = "VTV"
+
+# The document EXPECTED_TOPOLOGY is derived from, and which the check below reads back.
+TOPOLOGY_CONFIG_YAML = "Device_Config_Add_Network.yaml"
+
+
+def verify_topology_consistency():
+    '''Check the seed table, the payload documents and the network document against each other.
+
+    THE THIRD LEG OF THE CONTRACT. verify_seed_payload_consistency() proves the seed table and the
+    payloads agree on WHO each peer is; this proves all three sources agree on WHAT it is and WHERE
+    it sits. Both are static: no device, no emulator and no network is touched, and no YAML parser
+    is imported - the document is read as text, in the idiom the rest of this suite uses on the
+    payload documents.
+
+    Four properties, each reported with its own diagnostic:
+      * every logical address in PEER_SEEDS appears in EXPECTED_TOPOLOGY and vice versa, so a peer
+        cannot be seeded without the topology accounting for it;
+      * each peer's ReportPhysicalAddress payload announces the physical address the tree produces
+        for it - a peer announcing an address the emulator's map does not hold never appears in the
+        device list, and the wait for it simply expires;
+      * each peer's ReportPhysicalAddress payload announces the CEC device-type byte matching its
+        role, so a recorder cannot announce itself as an audio system;
+      * the network document declares each peer with the device_type the table expects, and
+        declares no peer the table does not know about - which is what catches a device added to
+        the document alone, whose logical address would then come out of a pool this table has
+        already assigned.
+
+    Returns:
+        True when all four hold; False after logging one line per inconsistency.
+    '''
+    problems = []
+    payload_pattern = re.compile(r'payload:\s*\[(.*?)\]', re.S)
+
+    seeded = {peer[0]: peer[1] for peer in PEER_SEEDS}
+    for la in sorted(set(seeded) - set(EXPECTED_TOPOLOGY)):
+        problems.append(
+            f"LA={la} ({seeded[la]}) is seeded but is not in EXPECTED_TOPOLOGY, so nothing "
+            "declares where it sits or what it announces"
+        )
+    for la in sorted(set(EXPECTED_TOPOLOGY) - set(seeded)):
+        problems.append(
+            f"LA={la} ({EXPECTED_TOPOLOGY[la][0]}) is in EXPECTED_TOPOLOGY but is not seeded, so "
+            "the topology reserves an address no peer ever claims"
+        )
+    for la in sorted(set(seeded) & set(EXPECTED_TOPOLOGY)):
+        expected_name = EXPECTED_TOPOLOGY[la][0]
+        if seeded[la] != expected_name:
+            problems.append(
+                f"LA={la} is seeded as {seeded[la]} but EXPECTED_TOPOLOGY names it {expected_name}"
+            )
+
+    for la, expected_name, _vendor, rpa_yaml, _osd, _vid in PEER_SEEDS:
+        if la not in EXPECTED_TOPOLOGY:
+            continue
+        _name, _network_type, expected_type_byte, expected_address = EXPECTED_TOPOLOGY[la]
+        path = os.path.join(HDMICEC_CMD_BASE, rpa_yaml)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError as exc:
+            problems.append(f"LA={la} ({expected_name}): cannot read {rpa_yaml}: {exc}")
+            continue
+        match = payload_pattern.search(text)
+        if not match:
+            problems.append(f"LA={la} ({expected_name}): {rpa_yaml} declares no payload list")
+            continue
+        try:
+            values = [
+                int(token.strip().strip('"').strip("'"), 16)
+                for token in match.group(1).split(",")
+                if token.strip()
+            ]
+        except ValueError as exc:
+            problems.append(
+                f"LA={la} ({expected_name}): {rpa_yaml} has a non-hexadecimal payload byte: {exc}"
+            )
+            continue
+        # header, opcode, physical high byte, physical low byte, announced device type
+        if len(values) < 5:
+            problems.append(
+                f"LA={la} ({expected_name}): {rpa_yaml} declares {len(values)} payload byte(s); a "
+                "<Report Physical Address> frame needs five"
+            )
+            continue
+        announced_address = (values[2], values[3])
+        if announced_address != expected_address:
+            problems.append(
+                f"LA={la} ({expected_name}): {rpa_yaml} announces physical address "
+                f"0x{values[2]:02X},0x{values[3]:02X}, but the topology puts it at "
+                f"0x{expected_address[0]:02X},0x{expected_address[1]:02X}"
+            )
+        if values[4] != expected_type_byte:
+            problems.append(
+                f"LA={la} ({expected_name}): {rpa_yaml} announces device type "
+                f"0x{values[4]:02X}, expected 0x{expected_type_byte:02X} for a "
+                f"{EXPECTED_TOPOLOGY[la][1]}"
+            )
+
+    # The network document, read as text. Each device block lists name, language, cec_version then
+    # device_type in that order, so pairing every name with the next device_type after it recovers
+    # the declaration without a YAML parser. Comment lines are dropped first, so a device_type named
+    # in prose cannot be mistaken for a declared one.
+    config_path = os.path.join(HDMICEC_CMD_BASE, TOPOLOGY_CONFIG_YAML)
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config_lines = [
+                line for line in handle.read().splitlines()
+                if not line.lstrip().startswith("#")
+            ]
+    except OSError as exc:
+        problems.append(f"cannot read {TOPOLOGY_CONFIG_YAML}: {exc}")
+        config_lines = []
+
+    declared = {}
+    pending_name = None
+    for line in config_lines:
+        stripped = line.strip()
+        if stripped.startswith("name:"):
+            pending_name = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+        elif stripped.startswith("device_type:") and pending_name is not None:
+            declared[pending_name] = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+            pending_name = None
+
+    if config_lines:
+        expected_types = {entry[0]: entry[1] for entry in EXPECTED_TOPOLOGY.values()}
+        for name, expected_type in sorted(expected_types.items()):
+            if name not in declared:
+                problems.append(
+                    f"{TOPOLOGY_CONFIG_YAML} declares no device named {name}, so the peer this "
+                    "suite seeds is not in the emulated map at all"
+                )
+            elif declared[name] != expected_type:
+                problems.append(
+                    f"{TOPOLOGY_CONFIG_YAML} declares {name} as {declared[name]}, but the "
+                    f"topology requires {expected_type} - the vComponent would allocate its "
+                    "logical address from a different pool"
+                )
+        for name in sorted(set(declared) - set(expected_types) - {TOPOLOGY_TELEVISION_NAME}):
+            problems.append(
+                f"{TOPOLOGY_CONFIG_YAML} declares a device named {name} that no seed accounts "
+                f"for (declared {declared[name]}); its logical address comes out of a pool this "
+                "table has already assigned"
+            )
+
+    if problems:
+        for problem in problems:
+            log_error(f"Init_Devicelist_Populate Failed ❌: topology mismatch: {problem}")
+        return False
+
+    log_success(
+        f"  ✓ the network document, the seed table and the payload documents agree on all "
+        f"{len(EXPECTED_TOPOLOGY)} peers"
+    )
+    return True
+
+
 def run_test():
     start_time = time.perf_counter()
 
@@ -846,25 +1062,37 @@ def run_test():
     # Read first, and refused here rather than at Step 3, for two reasons. A configuration
     # error is not worth forty seconds of seeding to discover, and - more importantly - reading
     # the gates only at the end means the mode that governs enforcement is chosen after the
-    # evidence has been collected. Both resolvers report their own reason and return None, so a
-    # gate that cannot be understood ends the module instead of selecting a mode for it.
-    strict_multi = _resolve_strict_multi()
-    if strict_multi is None:
+    # evidence has been collected. Both resolvers report their own reason and return (False, ...),
+    # so a gate that cannot be understood ends the module instead of selecting a mode for it.
+    gate_ok, strict_multi = _resolve_strict_multi()
+    if not gate_ok:
         return False
 
-    min_devices_required = _resolve_min_devices()
-    if min_devices_required is None:
+    # Strict mode's floor is applied by the resolver itself, which is why the mode is passed in
+    # rather than the floor being raised here afterwards: the resolver is the one place that knows
+    # both the full peer count and whether an explicit override may weaken it, and it reports an
+    # override that strict mode validates but does not apply.
+    gate_ok, min_devices_required = _resolve_min_devices(strict_multi)
+    if not gate_ok:
         return False
-
-    if strict_multi:
-        # Strict mode's floor is the full peer count and is not overridable downwards; an
-        # explicit lower floor is honoured as documentation of intent but cannot weaken it.
-        min_devices_required = max(min_devices_required, len(PEER_SEEDS))
 
     log_info(
         f"Init_Devicelist_Populate gates: {STRICT_MULTI_ENV}={strict_multi}  "
         f"effective minimum device count={min_devices_required}"
     )
+
+    # ── Step 0a: prove the fixture set is self-consistent, before the device is touched ──────
+    #
+    # BOTH CHECKS ARE STATIC and both run FIRST, which is the only place they are worth running.
+    # A seed table that disagrees with its payload documents, or payloads that disagree with the
+    # emulated topology, does not fail loudly at run time: the frames register one address while
+    # the verification waits for another, so the wait expires forty seconds later and the cause
+    # is nowhere in the log. Reading the files takes milliseconds and names the mismatch exactly,
+    # so a fixture defect is reported as one rather than as a device that never appeared.
+    if not verify_seed_payload_consistency():
+        return False
+    if not verify_topology_consistency():
+        return False
 
     # ── Step 0: ensure plugin is active (standalone-safe) ───────────────────
     log_info(
@@ -1010,25 +1238,17 @@ def run_test():
                 )
                 break
 
-            # Secondary seed path: ask the configured peer to answer for itself, so the
-            # middleware learns it from a genuine reply rather than an injected announcement.
-            log_info(f"  Seed fallback: send Give* commands to LA={bootstrap_la}")
-            for yaml_name in GIVE_COMMAND_YAMLS:
-                if not _post(yaml_name):
-                    log_warning(f"  Seed fallback warning: {yaml_name} rejected")
-                # DEFERRED for the same reason as _inject_triplet above: inter-frame bus pacing,
-                # with no per-frame state to observe. The observable outcome of the whole group is
-                # the address appearing in getDeviceList, which _wait_for_la below waits for.
-                time.sleep(GIVE_COMMAND_PACING_SECONDS)
-
-            found, entry, _ = _wait_for_la(bootstrap_la, timeout_s=3.0, poll_s=0.4)
-            if found:
-                log_success(
-                    f"  ✓ Give* learned LA={bootstrap_la:2d}"
-                    f"  osdName='{sanitise_for_log(entry.get('osdName', ''), max_chars=128)}'"
-                    f"  vendorID='{sanitise_for_log(entry.get('vendorID', ''), max_chars=128)}'"
-                )
-                break
+            # NO SECONDARY SEED PATH HERE, AND THAT IS THE DECISION RECORDED AT THE CONSTANT
+            # BLOCK ABOVE, NOT AN OMISSION.  A ladder that posted the Device_Give_*.yaml
+            # documents used to sit at this point.  Those documents are directed requests TO the
+            # television - header 0x50, initiator 5, destination 0 - so they ask the DEVICE UNDER
+            # TEST for its own physical address, OSD name and vendor id.  Nothing in that exchange
+            # can make a PEER appear in the device list, which is the only thing this loop is
+            # trying to achieve, so the ladder could never do what its own log line claimed and
+            # only lengthened each failing attempt by three posts and their pacing.  It was
+            # removed with the tuple that named it; this note replaces it so a reader does not
+            # reintroduce it.  What remains is the injected triplet above, retried
+            # MAX_SEED_ATTEMPTS times, which announces the peer as the peer itself would.
         else:
             log_error(
                 "Init_Devicelist_Populate Failed ❌: middleware did not learn "

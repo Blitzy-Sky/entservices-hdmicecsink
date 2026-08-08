@@ -3713,6 +3713,219 @@ TEST_F(HdmiCecSink_L2Test, GetActiveSource_JSONRPC)
     EXPECT_TRUE(result["success"].Boolean());
 }
 
+/**
+ * @brief An <Active Source> announcement is reported back by getActiveSource, on both transports.
+ *
+ * ADJACENT TO GetActiveSource_COMRPC AND GetActiveSource_JSONRPC, NOT A REWRITE OF EITHER.  Both of
+ * those pass and are left exactly as they are; they call the accessor on a plugin where nothing has
+ * ever claimed the bus, so m_currentActiveSource is still its constructed -1
+ * (HdmiCecSinkImplementation.cpp:608) and only the `available = false` arm at cpp:1372-1375 runs.
+ * Everything the method does when an active source EXISTS - cpp:1346-1369, the eight field
+ * assignments, the port-string selection and the stringstream - had no test at this level at all.
+ *
+ * COVERAGE_GAPS.md traceability: gap-plugin-sink-getactivesource (HdmiCecSinkImplementation.cpp
+ * GetActiveSource positive arm) and gap-plugin-sink-updateactivesource (the
+ * `deviceList[m_currentActiveSource].m_isActiveSource = false` hand-off at cpp:2154, which only
+ * executes when one active source REPLACES another and so needs two announcements to reach).
+ *
+ * How the state is established.  updateActiveSource (cpp:2130-2180) is the only writer that a test
+ * can reach from outside: it sets m_currentActiveSource = logical_address at cpp:2159 for any
+ * announcement whose initiator is not the TV's own allocated address.  So the sequence is
+ * <Report Physical Address> to register the device and give it a physical address and device type,
+ * then <Active Source> from the same device to make it current, then read the accessor back.  Frame
+ * dispatch is synchronous on the calling thread - HdmiCecSinkFrameListener::notify runs
+ * MessageDecoder::decode inline at cpp:127-148 and neither handler defers - so the state is in place
+ * by the time notify() returns and there is nothing to wait for.
+ *
+ * What is asserted, and what deliberately is not.  available, the reported logical address, and the
+ * non-emptiness of the physical address and the port string are all contract, and every field is
+ * additionally compared across the two transports, because a COM-RPC accessor and its JSON-RPC
+ * wrapper are separate code paths over one piece of state and only comparing them catches one
+ * drifting from the other.  The exact TEXT of the physical address and of the HDMI port index is
+ * NOT asserted, and that is a property of the shared mock rather than of the plugin: CECBytes::
+ * toString() (entservices-testframework/Tests/mocks/HdmiCec.h) hex-concatenates its raw bytes rather
+ * than formatting a dotted quad, and PhysicalAddress::getByteValue(0) returns the first PACKED byte
+ * (0x10 for 1.0.0.0) where the production port arithmetic at cpp:1358 expects the first DIGIT - the
+ * same two-representation defect the BLOCKED note on the port-map cases further down this file sets
+ * out in full.  Asserting a literal "HDMI0" here would be asserting the mock's arithmetic, so the
+ * assertions are on the invariants that hold under either representation: the port names an HDMI
+ * input or the TV, and it is never blank while an active source exists.  cecVersion, osdName,
+ * vendorID and powerStatus are copied out unconditionally by the same arm but are legitimately empty
+ * until the device answers the discovery requests for them, so they are checked for cross-transport
+ * agreement only.
+ */
+TEST_F(HdmiCecSink_L2Test, ActiveSourceAnnouncementIsReportedByGetActiveSourceOnBothTransports)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_controller_cecSink);
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener())
+        << "CEC could not be enabled, so no FrameListener was captured and nothing could be injected.";
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    const auto inject = [this](const std::vector<uint8_t>& bytes) {
+        CECFrame frame(bytes.data(), static_cast<size_t>(bytes.size()));
+        for (auto* listener : listeners) {
+            if (listener) {
+                EXPECT_NO_THROW(listener->notify(frame));
+            }
+        }
+    };
+
+    // Every read in this test goes through this pair, so the two transports are always asked the
+    // same question at the same moment and the comparison below is never comparing two different
+    // instants.  Returned by value rather than asserted inside, so each caller states its own
+    // expectation.
+    struct ActiveSourceReading {
+        bool available { false };
+        uint8_t logicalAddress { 0 };
+        string physicalAddress;
+        string deviceType;
+        string cecVersion;
+        string osdName;
+        string vendorID;
+        string powerStatus;
+        string port;
+        bool success { false };
+    };
+
+    const auto readOverComRpc = [this]() {
+        ActiveSourceReading r;
+        EXPECT_EQ(Core::ERROR_NONE,
+            m_cecSinkPlugin->GetActiveSource(r.available, r.logicalAddress, r.physicalAddress,
+                r.deviceType, r.cecVersion, r.osdName, r.vendorID, r.powerStatus, r.port, r.success));
+        EXPECT_TRUE(r.success) << "GetActiveSource reported failure over COM-RPC";
+        return r;
+    };
+
+    const auto readOverJsonRpc = [this]() {
+        ActiveSourceReading r;
+        JsonObject params, result;
+        EXPECT_EQ(Core::ERROR_NONE,
+            InvokeServiceMethod("org.rdk.HdmiCecSink", "getActiveSource", params, result));
+        EXPECT_TRUE(result.HasLabel("success"));
+        r.success = result["success"].Boolean();
+        EXPECT_TRUE(r.success) << "getActiveSource reported failure over JSON-RPC";
+        r.available = result.HasLabel("available") && result["available"].Boolean();
+        r.logicalAddress = result.HasLabel("logicalAddress")
+            ? static_cast<uint8_t>(result["logicalAddress"].Number())
+            : static_cast<uint8_t>(0);
+        r.physicalAddress = result.HasLabel("physicalAddress") ? result["physicalAddress"].String() : string();
+        r.deviceType = result.HasLabel("deviceType") ? result["deviceType"].String() : string();
+        r.cecVersion = result.HasLabel("cecVersion") ? result["cecVersion"].String() : string();
+        r.osdName = result.HasLabel("osdName") ? result["osdName"].String() : string();
+        r.vendorID = result.HasLabel("vendorID") ? result["vendorID"].String() : string();
+        r.powerStatus = result.HasLabel("powerStatus") ? result["powerStatus"].String() : string();
+        r.port = result.HasLabel("port") ? result["port"].String() : string();
+        return r;
+    };
+
+    const auto expectTransportsAgree
+        = [](const ActiveSourceReading& com, const ActiveSourceReading& json, const char* stage) {
+              EXPECT_EQ(com.available, json.available) << stage << ": availability differs across transports";
+              EXPECT_EQ(com.logicalAddress, json.logicalAddress) << stage << ": logical address differs";
+              EXPECT_EQ(com.physicalAddress, json.physicalAddress) << stage << ": physical address differs";
+              EXPECT_EQ(com.deviceType, json.deviceType) << stage << ": device type differs";
+              EXPECT_EQ(com.cecVersion, json.cecVersion) << stage << ": CEC version differs";
+              EXPECT_EQ(com.osdName, json.osdName) << stage << ": OSD name differs";
+              EXPECT_EQ(com.vendorID, json.vendorID) << stage << ": vendor ID differs";
+              EXPECT_EQ(com.powerStatus, json.powerStatus) << stage << ": power status differs";
+              EXPECT_EQ(com.port, json.port) << stage << ": port differs";
+          };
+
+    // 1. NEGATIVE FENCE. Nothing has claimed the bus, so there is no active source - and the
+    //    accessor must report absence with clean out-parameters rather than stale ones. This is
+    //    also what makes step 2 a transition rather than a coincidence.
+    const ActiveSourceReading idleCom = readOverComRpc();
+    const ActiveSourceReading idleJson = readOverJsonRpc();
+    EXPECT_FALSE(idleCom.available)
+        << "an active source was reported before any <Active Source> was announced";
+    EXPECT_TRUE(idleCom.physicalAddress.empty())
+        << "no active source, so the physical address must be empty rather than stale; got '"
+        << idleCom.physicalAddress << "'";
+    EXPECT_TRUE(idleCom.port.empty())
+        << "no active source, so the port must be empty rather than stale; got '" << idleCom.port << "'";
+    expectTransportsAgree(idleCom, idleJson, "idle");
+
+    // 2. POSITIVE. Register logical address 4 at 1.0.0.0 as a playback device, then let it claim the
+    //    bus. <Report Physical Address> carries the packed address and the device type; <Active
+    //    Source> carries the address again and is what moves m_currentActiveSource.
+    TEST_LOG("Announcing logical address 4 at 1.0.0.0 as a playback device, then as active source");
+    inject({ 0x4F, 0x84, 0x10, 0x00, 0x04 });
+    inject({ 0x4F, 0x82, 0x10, 0x00 });
+
+    const ActiveSourceReading firstCom = readOverComRpc();
+    const ActiveSourceReading firstJson = readOverJsonRpc();
+    EXPECT_TRUE(firstCom.available)
+        << "<Active Source> from logical address 4 did not make an active source available";
+    EXPECT_EQ(static_cast<uint8_t>(4), firstCom.logicalAddress)
+        << "the active source is reported as logical address "
+        << static_cast<unsigned>(firstCom.logicalAddress) << " rather than the announcing device 4";
+    EXPECT_FALSE(firstCom.physicalAddress.empty())
+        << "an available active source with no physical address is not a source";
+    EXPECT_FALSE(firstCom.deviceType.empty())
+        << "<Report Physical Address> carried a device type, so it must be reported back";
+    EXPECT_FALSE(firstCom.port.empty()) << "an available active source must resolve to a port";
+    EXPECT_TRUE((firstCom.port == "TV") || (firstCom.port.compare(0, 4, "HDMI") == 0))
+        << "the port is neither the TV nor an HDMI input: '" << firstCom.port << "'";
+    expectTransportsAgree(firstCom, firstJson, "after the first announcement");
+
+    // 3. CORNER: THE ACTIVE SOURCE MOVES. A second device claiming the bus must replace the first,
+    //    not be ignored and not be added alongside it. This is the only way to reach the hand-off at
+    //    cpp:2152-2155, where the outgoing source's m_isActiveSource is cleared, because that arm
+    //    requires m_currentActiveSource to already be set when the announcement arrives.
+    // 0x8F is initiator 8, destination broadcast: both handlers key off header.from, and
+    // ReportPhysicalAddress additionally refuses anything that is not a broadcast (cpp:349-352).
+    TEST_LOG("Announcing logical address 8 at 1.1.0.0, which must take the bus from 4");
+    inject({ 0x8F, 0x84, 0x11, 0x00, 0x04 });
+    inject({ 0x8F, 0x82, 0x11, 0x00 });
+
+    const ActiveSourceReading secondCom = readOverComRpc();
+    const ActiveSourceReading secondJson = readOverJsonRpc();
+    EXPECT_TRUE(secondCom.available) << "the active source became unavailable when it changed hands";
+    EXPECT_EQ(static_cast<uint8_t>(8), secondCom.logicalAddress)
+        << "logical address 8 announced itself as active source but the accessor still reports "
+        << static_cast<unsigned>(secondCom.logicalAddress);
+    expectTransportsAgree(secondCom, secondJson, "after the source changed hands");
+
+    // 4. CORNER: THE ROOT ADDRESS RESOLVES TO THE TV, NOT TO AN HDMI INPUT. cpp:1356-1363 chooses
+    //    between the two on the leading byte of the physical address, and only an address whose
+    //    leading byte is zero takes the TV arm. A device announcing 0.0.0.0 is exactly that case,
+    //    and it is a corner rather than a curiosity: the same arm runs for the TV's own address.
+    TEST_LOG("Announcing logical address 9 at 0.0.0.0, whose leading byte selects the TV port arm");
+    inject({ 0x9F, 0x84, 0x00, 0x00, 0x04 });
+    inject({ 0x9F, 0x82, 0x00, 0x00 });
+
+    const ActiveSourceReading rootCom = readOverComRpc();
+    const ActiveSourceReading rootJson = readOverJsonRpc();
+    EXPECT_TRUE(rootCom.available) << "an active source at the root address is still an active source";
+    EXPECT_EQ(static_cast<uint8_t>(9), rootCom.logicalAddress)
+        << "logical address 9 announced itself as active source but the accessor reports "
+        << static_cast<unsigned>(rootCom.logicalAddress);
+    EXPECT_EQ("TV", rootCom.port)
+        << "a physical address whose leading byte is zero must resolve to the TV, not to '"
+        << rootCom.port << "'";
+    expectTransportsAgree(rootCom, rootJson, "after the root-address announcement");
+
+    // Still serving afterwards - four announcements and eight accessor reads must not have left the
+    // plugin wedged.
+    JsonObject params, result;
+    EXPECT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSink.1", "getEnabled", params, result));
+    ASSERT_TRUE(result.HasLabel("enabled"));
+    EXPECT_TRUE(result["enabled"].Boolean()) << "reading the active source must not switch CEC off";
+}
+
 // Test cases to validate GetActiveRoute using JSONRPC
 TEST_F(HdmiCecSink_L2Test, GetActiveRoute_JSONRPC)
 {
@@ -4995,13 +5208,13 @@ TEST_F(HdmiCecSink_L2Test, InjectAbortFrameBroadcastIgnoreCase)
     }
 }
 
-// reportFeatureAbortEvent at L2: NO LONGER BLOCKED. Both arms are now asserted in this file.
+// reportFeatureAbortEvent at L2: the BROADCAST arm is asserted here; the DIRECTED arm is BLOCKED.
 //
 // COVERAGE_GAPS.md traceability: gap-plugin-sink-reportfeatureabort (Sec. 6.2 rank 38, P2).
 //
-// HISTORY, kept because it explains the shape of the coverage rather than merely recording a fixed
-// bug. Injecting a DIRECTED Feature Abort (header 0x40) used to take SIGSEGV and bring the whole
-// WPEFramework host down with it, which would have taken the entire L2 suite with it:
+// WHY THE DIRECTED ARM CANNOT BE DRIVEN AT THIS LEVEL. Injecting a DIRECTED Feature Abort
+// (header 0x40) takes SIGSEGV and brings the whole WPEFramework host down with it, which would take
+// the entire L2 suite with it:
 //
 //     [56] INFO [HdmiCecSinkImplementation.cpp:146] notify:  >>>>>  Received CEC Frame: :40 00 9F 00
 //     [56] INFO [HdmiCecSinkImplementation.cpp:431] process: Command: FeatureAbort
@@ -5009,30 +5222,29 @@ TEST_F(HdmiCecSink_L2Test, InjectAbortFrameBroadcastIgnoreCase)
 //     Signal received 11. in process [53]
 //     WPEFramework shutting down due to a segmentation fault. All relevant data dumped
 //
-// The cause was in the shared CEC mock, not the plugin: AbortReason declares a public delegate
-// `AbortReason* impl` and its int constructor was the only one in that header which did not
-// initialise it, while AbortReason::toInt() calls through the delegate whenever it is non-null.
-// MessageDecoder::decode builds a frame-parsed Feature Abort's `reason` through exactly that
-// constructor, so HdmiCecSinkImplementation.cpp:438 - `msg.reason.toInt()`, the first statement
-// after the BROADCAST guard - read a wild pointer. That is why a directed frame crashed where a
-// broadcast one was dropped safely at cpp:432-435 beforehand.
+// The cause is in the SHARED CEC MOCK, not the plugin: AbortReason declares a public delegate
+// `AbortReason* impl` and its int constructor is the only one in that header which does not
+// initialise it (entservices-testframework/Tests/mocks/HdmiCec.h:286-288,
+// `AbortReason(int reason) : CECBytes((uint8_t)reason){}`), while AbortReason::toInt() calls through
+// the delegate whenever it is non-null. MessageDecoder::decode builds a frame-parsed Feature
+// Abort's `reason` through exactly that constructor, so HdmiCecSinkImplementation.cpp:438 -
+// `msg.reason.toInt()`, the first statement after the BROADCAST guard - reads a wild pointer. That
+// is why a directed frame crashes where a broadcast one is dropped safely at cpp:432-435 beforehand.
 //
-// THAT CONSTRUCTOR IS NOW INITIALISED in entservices-testframework
-// (Tests/mocks/HdmiCec.h, `AbortReason(int reason) : CECBytes((uint8_t)reason), impl(nullptr) {}`),
-// so the directed route is live and is asserted for real. Measured after the repair, a directed
-// abort delivers the full payload rather than crashing:
+// BLOCKED - REQUIRED CHANGE, REPORTED NOT MADE. The one-token repair is
+// `AbortReason(int reason) : CECBytes((uint8_t)reason), impl(nullptr) {}` in that mock header, and
+// entservices-testframework is a read-only authority for this pass (AAP Sec. 0.10.2), so it is not
+// made here. It cannot be worked around from an in-scope file either: the object is constructed
+// inside the mock's own decoder, before any test-visible seam.
 //
-//     reportFeatureAbortEvent received: {"FeatureAbortReason":0,"opcode":159,"logicalAddress":4}
-//
-// Where each arm is now covered in this file:
-//   * the DIRECTED arm, with exact operands per injection, in
-//     InboundFeatureAbortIsRecordedForEachAbortedFeature further down - five notifications, one per
-//     aborted feature plus one for a non-default abort reason, each waited for and each checked
-//     against the logical address, aborted opcode and reason that were injected;
-//   * the BROADCAST arm, as an observable absence, in the test immediately below and again in
+// Where the reachable arm is covered in this file:
+//   * the BROADCAST arm, as an observable absence, in the test immediately below
+//     (InjectFeatureAbortFrameBroadcastAndVerifyNoEvent) and again in
 //     InjectBroadcastFeatureAbortAndVerifyNoEventOnEitherTransport.
+// The DIRECTED arm's positive coverage is delivered by the sink L1 suite instead, which drives the
+// production overload directly and so never goes through the mock's decoder.
 //
-// What still has no assertion anywhere is the internal bookkeeping the GET_CEC_VERSION arm performs
+// What has no assertion at EITHER level is the internal bookkeeping the GET_CEC_VERSION arm performs
 // (cpp:443-447 and the m_featureAborts append at cpp:468): no registered JSON-RPC method and no
 // COM-RPC method exposes either, so neither level can read them back. Reaching them needs a getter
 // on the published interface, which is a production change and is therefore reported rather than
@@ -5090,17 +5302,34 @@ TEST_F(HdmiCecSink_L2Test, InjectFeatureAbortFrameBroadcastAndVerifyNoEvent)
     jsonrpc.Unsubscribe(EVNT_TIMEOUT, _T("reportFeatureAbortEvent"));
 }
 
+TEST_F(HdmiCecSink_L2Test, InjectPollingFrame)
+{
+    // Polling: header only, no opcode
+    uint8_t buffer[] = { 0x40, 0x13 }; // From device 4 to TV (0)
+    CECFrame frame(buffer, sizeof(buffer));
+    for (auto* listener : listeners) {
+        if (listener)
+            listener->notify(frame);
+    }
+}
+
 /**
- * @brief A <Polling> frame is a bare header, and the inbound path absorbs it without side effects.
+ * @brief A correctly encoded <Polling> frame is a bare header, and the inbound path absorbs it
+ *        without side effects.
+ *
+ * ADJACENT TO InjectPollingFrame ABOVE, NOT A REWRITE OF IT.  That case passes and is therefore
+ * left exactly as it was found (AAP Directive 5: "Existing tests that pass MUST NOT be modified";
+ * "expand coverage via new adjacent tests - do not rewrite the originals").  What it injects is
+ * { 0x40, 0x13 }, which is a two-byte message with an unknown opcode rather than a poll, and it
+ * asserts nothing beyond "does not crash".  Both properties are preserved above; the correctly
+ * encoded frame and the assertions live here.
  *
  * <Polling> is the CEC presence probe and the one message with NO OPCODE BYTE AT ALL: the frame is
  * a single header byte carrying initiator and destination and nothing else. MessageDecoder::decode
  * (hdmicec/ccec/src/MessageDecoder.cpp:48-52) dispatches Polling on exactly that - a frame of
  * length 1 - and the POLLING value in OpCode.hpp is the synthetic 0x200, an internal marker that
  * is never encoded on the wire. So the frame injected here is exactly { 0x40 }: initiator 4
- * (Playback Device 1) to destination 0 (the TV). It previously carried a second byte, 0x13, which
- * is not the <Polling> encoding and is not a CEC opcode either, so the injected frame was a
- * two-byte message with an unknown opcode rather than a poll.
+ * (Playback Device 1) to destination 0 (the TV).
  *
  * WHAT IS ASSERTED, AND WHY IT IS NOT THE HANDLER BEING REACHED. A bare header must be tolerated
  * and must change nothing: a poll conveys no information, so no device may be learned from it and
@@ -5121,7 +5350,7 @@ TEST_F(HdmiCecSink_L2Test, InjectFeatureAbortFrameBroadcastAndVerifyNoEvent)
  * HdmiCecSinkFrameProcessingTest.InjectPollingFrame_Directed_IsProcessed and
  * ..._Broadcast_IsProcessed in ../../L1Tests/tests/test_HdmiCecSink.cpp.
  */
-TEST_F(HdmiCecSink_L2Test, InjectPollingFrame)
+TEST_F(HdmiCecSink_L2Test, InjectBareHeaderPollingFrameChangesNothingAndLeavesThePluginAnswering)
 {
     // The inbound path only exists once CEC is enabled and the implementation has registered its
     // FrameListener; without this the loop below would iterate an empty list and assert nothing.
@@ -6612,7 +6841,12 @@ TEST_F(HdmiCecSink_L2Test, DISABLED_DeviceRemovalUnregistersTheChildFromThePortM
     // ceiling was expressed as an iteration count, so the actual bound was 300 x (100 ms + one
     // COM-RPC round trip) - a wall-clock limit nobody had written down and which grew with load.
     // AwaitCondition checks first and sleeps only if it has to, and its bound is a duration.
-    const bool routeGone = AwaitCondition([this]() {
+    //
+    // The outcome IS asserted.  It was previously bound to a `const bool routeGone` that nothing
+    // read, which made a 30-second wait with no verdict attached to it: the route could still have
+    // been advertised at the end and the case would have passed regardless.  Dropping the port the
+    // chain was announced on must retire the route, so that is what is checked.
+    EXPECT_TRUE(AwaitCondition([this]() {
         bool stillAvailable = false;
         uint8_t stillLength = 0;
         IHdmiCecSinkActivePathIterator* stillPathList = nullptr;
@@ -6626,7 +6860,9 @@ TEST_F(HdmiCecSink_L2Test, DISABLED_DeviceRemovalUnregistersTheChildFromThePortM
         }
         return queried && !stillAvailable;
     },
-        30000, 50);
+        30000, 50))
+        << "the active route was still advertised 30s after HDMI input 0 - the port the 1.x.x.x "
+           "chain was announced on - was dropped";
 
     JsonObject params, result;
     EXPECT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSink.1", "getEnabled", params, result))
@@ -6842,10 +7078,34 @@ TEST_F(HdmiCecSink_L2Test, RepeatedAnnouncementsUpdateRatherThanDuplicateEachDev
  * That last one is the assertion with teeth: it is the only observable difference between a guard
  * that works and a guard that has been removed, and both calls report success either way.
  *
- * Traffic is counted through Connection::sendTo, whose destination and timeout are visible on the
- * mock: every ARC message goes to LogicalAddress::AUDIO_SYSTEM with a 1000 ms timeout
- * (Send_Request_Arc_Initiation_Message and Send_Request_Arc_Termination_Message), which separates
- * them from the 500 ms requests the rest of the implementation makes.
+ * Traffic is counted through Connection::sendTo, keyed on destination and timeout - and ONLY on
+ * those two, because they are the only properties of an outbound frame that this fixture leaves
+ * observable.  The L2 fixture stubs MessageEncoder::encode to return CECFrame::getInstance(), so
+ * every frame that reaches sendTo is the same singleton and carries no opcode payload; frame.opcode()
+ * reads a byte of that singleton and means nothing here.  Destination LogicalAddress::AUDIO_SYSTEM
+ * with a 1000 ms timeout is therefore the finest distinction available, and it is enough: it
+ * separates ARC traffic from the 500 ms, 200 ms and 100 ms requests the rest of the implementation
+ * makes, and from the 100 ms <Give Audio Status> and 500 ms <Give Device Power Status> that also go
+ * to the audio system.
+ *
+ * The consequence is that the expected count per step is derived from the implementation's call
+ * sites rather than assumed to be one.  Six sendTo call sites in HdmiCecSinkImplementation.cpp use
+ * AUDIO_SYSTEM with a 1000 ms timeout - systemAudioModeRequest, Send_Request_Arc_Initiation_Message,
+ * Send_Report_Arc_Initiated_Message, Send_Request_Arc_Termination_Message,
+ * Send_Report_Arc_Terminated_Message, and requestShortaudioDescriptor.  The last is reachable only
+ * from the RequestShortAudioDescriptor method, which this test never calls, so the counter sees ARC
+ * traffic exclusively, and threadArcRouting's switch fixes how much of it each step owes:
+ *   - SetupARCRouting(true)  -> ARC_STATE_REQUEST_ARC_INITIATION  -> systemAudioModeRequest AND
+ *     Send_Request_Arc_Initiation_Message, so exactly TWO sends, not one;
+ *   - inbound <Initiate ARC>  -> ARC_STATE_ARC_INITIATED   -> Send_Report_Arc_Initiated_Message, one;
+ *   - SetupARCRouting(false) -> ARC_STATE_REQUEST_ARC_TERMINATION -> Send_Request_Arc_Termination_Message, one;
+ *   - inbound <Terminate ARC> -> ARC_STATE_ARC_TERMINATED  -> Send_Report_Arc_Terminated_Message, one;
+ *   - the repeated SetupARCRouting(false) -> guard holds, state untouched, thread never signalled, zero.
+ * Each of those is asserted exactly below, so a step that sends too much is caught as well as a step
+ * that sends nothing.  The two inbound steps are fenced before the next window opens, because the
+ * notification is delivered from Process_InitiateArc/Process_TerminateArc BEFORE the ARC thread it
+ * signalled has transmitted - waiting only on the event would leave that send to land inside the
+ * following step's window and be miscounted against it.
  *
  * The ARC state itself has no getter, so it is observed through the events instead: an inbound
  * <Initiate ARC> from the audio system drives Process_InitiateArc, which only fires
@@ -6910,6 +7170,21 @@ TEST_F(HdmiCecSink_L2Test, ArcRoutingCanBeTornDownAfterBeingSetUp)
     if (!AwaitQuiescence([]() { return g_sinkSendToCount.load(); }, 150, 5000)) {
         TEST_LOG("the CEC bus never went quiet within 5s after ARC setup");
     }
+    // ... and the requests must actually have gone out.  Quiescence says "the ARC thread has stopped
+    // transmitting", which is also true of a thread that never transmitted, so the delta is what
+    // carries the contract.  Bounded polling first, because the ARC thread does the sending
+    // asynchronously; then an exact check.  Two, not one: threadArcRouting's
+    // ARC_STATE_REQUEST_ARC_INITIATION arm calls systemAudioModeRequest() and then
+    // Send_Request_Arc_Initiation_Message(), and both go to the audio system with a 1000 ms timeout.
+    const int afterSetup = beforeSetup + 2;
+    EXPECT_TRUE(WaitUntil([&]() { return arcRequestsToAudioSystem.load() >= afterSetup; },
+        std::chrono::milliseconds(EVNT_TIMEOUT)))
+        << "SetupARCRouting(true) reported success but put fewer than the two owed messages - "
+           "<System Audio Mode Request> and <Request ARC Initiation> - on the bus; saw "
+        << (arcRequestsToAudioSystem.load() - beforeSetup);
+    EXPECT_EQ(afterSetup, arcRequestsToAudioSystem.load())
+        << "one SetupARCRouting(true) produced " << (arcRequestsToAudioSystem.load() - beforeSetup)
+        << " message(s) to the audio system; exactly two are expected";
 
     // 2. The audio system answers <Initiate ARC>, which is what moves the session into the
     //    initiated state - and the event proves it got there.
@@ -6919,6 +7194,20 @@ TEST_F(HdmiCecSink_L2Test, ArcRoutingCanBeTornDownAfterBeingSetUp)
         m_notificationHandler.WaitForRequestStatus(EVNT_TIMEOUT, ARC_INITIATION_EVENT))
         << "<Initiate ARC> did not raise arcInitiationEvent, so the session never reached the "
            "initiated state and the teardown below would not be testing a teardown";
+    // Process_InitiateArc fires that event AFTER releasing the ARC thread, so the
+    // <Report ARC Initiated> it owes is still in flight here.  Wait for it, for two reasons: it is
+    // what proves the state machine actually entered ARC_STATE_ARC_INITIATED - the 3 s
+    // arcStartStopTimer also raises arcInitiationEvent, with "failure", and sends nothing - and it
+    // fences step 3's window, which would otherwise count this send against the teardown.
+    const int afterInitiated = afterSetup + 1;
+    EXPECT_TRUE(WaitUntil([&]() { return arcRequestsToAudioSystem.load() >= afterInitiated; },
+        std::chrono::milliseconds(EVNT_TIMEOUT)))
+        << "arcInitiationEvent was raised but no <Report ARC Initiated> followed, so the session "
+           "did not reach ARC_STATE_ARC_INITIATED and the event came from the start-timer's "
+           "failure path instead";
+    EXPECT_EQ(afterInitiated, arcRequestsToAudioSystem.load())
+        << "one inbound <Initiate ARC> produced " << (arcRequestsToAudioSystem.load() - afterSetup)
+        << " message(s) to the audio system; exactly one is expected";
 
     // 3. Tearing down from an initiated session must reach the bus too.
     const int beforeTeardown = arcRequestsToAudioSystem.load();
@@ -6929,6 +7218,19 @@ TEST_F(HdmiCecSink_L2Test, ArcRoutingCanBeTornDownAfterBeingSetUp)
     if (!AwaitQuiescence([]() { return g_sinkSendToCount.load(); }, 150, 5000)) {
         TEST_LOG("the CEC bus never went quiet within 5s after ARC teardown");
     }
+    // ... and the FIRST teardown, unlike the repeat in step 5, must reach the bus: the session is
+    // initiated, so stopArc's already-terminated guard does not hold and a <Request ARC
+    // Termination> is owed.  Exactly one this time, not two: the ARC_STATE_REQUEST_ARC_TERMINATION
+    // arm sends only Send_Request_Arc_Termination_Message, with no systemAudioModeRequest beside it.
+    // Asserting it here is what makes step 5's no-delta check meaningful rather than vacuous.
+    EXPECT_TRUE(WaitUntil([&]() { return arcRequestsToAudioSystem.load() >= beforeTeardown + 1; },
+        std::chrono::milliseconds(EVNT_TIMEOUT)))
+        << "SetupARCRouting(false) on an initiated session reported success but put no ARC request "
+           "on the bus";
+    EXPECT_EQ(beforeTeardown + 1, arcRequestsToAudioSystem.load())
+        << "one SetupARCRouting(false) produced "
+        << (arcRequestsToAudioSystem.load() - beforeTeardown)
+        << " message(s) to the audio system; exactly one is expected";
 
     // 4. The audio system confirms with <Terminate ARC>.
     TEST_LOG("Audio system replies <Terminate ARC>");
@@ -6936,6 +7238,20 @@ TEST_F(HdmiCecSink_L2Test, ArcRoutingCanBeTornDownAfterBeingSetUp)
     EXPECT_EQ(ARC_TERMINATION_EVENT,
         m_notificationHandler.WaitForRequestStatus(EVNT_TIMEOUT, ARC_TERMINATION_EVENT))
         << "<Terminate ARC> did not raise arcTerminationEvent";
+    // Same asymmetry as step 2: Process_TerminateArc raises the event before the ARC thread it
+    // signalled has sent <Report ARC Terminated>.  Waiting for that send here proves the state
+    // machine reached ARC_STATE_ARC_TERMINATED - which is precisely the state step 5's guard is
+    // meant to detect - and closes step 5's window on an observable rather than on a timer.
+    const int afterTerminated = beforeTeardown + 2;
+    EXPECT_TRUE(WaitUntil([&]() { return arcRequestsToAudioSystem.load() >= afterTerminated; },
+        std::chrono::milliseconds(EVNT_TIMEOUT)))
+        << "arcTerminationEvent was raised but no <Report ARC Terminated> followed, so the session "
+           "did not reach ARC_STATE_ARC_TERMINATED and step 5 would not be exercising stopArc's "
+           "already-terminated guard";
+    EXPECT_EQ(afterTerminated, arcRequestsToAudioSystem.load())
+        << "one inbound <Terminate ARC> produced "
+        << (arcRequestsToAudioSystem.load() - beforeTeardown - 1)
+        << " message(s) to the audio system; exactly one is expected";
 
     // 5. A second teardown must be a no-op on the bus. Bounded settle first, so any request the
     //    previous step was still emitting is counted before the window opens; then nothing more may
@@ -7032,12 +7348,24 @@ TEST_F(HdmiCecSink_L2Test, AudioDevicePowerStatusCanBeRequested)
     result.success = false;
     TEST_LOG("Requesting the audio device's power status over COM-RPC");
     EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->RequestAudioDevicePowerStatus(result));
+    EXPECT_TRUE(result.success) << "the COM-RPC call reported failure";
     // The request transmits and the answer, if any, arrives later on the bus.  Letting the bus go
     // quiet is what makes the JSON-RPC repeat below a second independent request rather than one
     // that races the first one's transmit.
     if (!AwaitQuiescence([]() { return g_sinkSendToCount.load(); }, 150, 5000)) {
         TEST_LOG("the CEC bus never went quiet within 5s after the COM-RPC power-status request");
     }
+    // The COM-RPC leg is held to exactly the same outbound contract as the JSON-RPC leg in step 2.
+    // Without this the COM-RPC half asserted only its return code, so a call that returned
+    // ERROR_NONE and transmitted nothing - or transmitted twice - would have passed.  Bounded wait
+    // first (the send is on the caller's thread but the counter is read from this one), then an
+    // exact-one check against the destination/timeout pair the filter above pins.
+    EXPECT_TRUE(WaitUntil([&]() { return powerStatusRequests.load() >= beforeComRpc + 1; },
+        std::chrono::milliseconds(EVNT_TIMEOUT)))
+        << "the COM-RPC call did not put the power-status request on the bus";
+    EXPECT_EQ(beforeComRpc + 1, powerStatusRequests.load())
+        << "one COM-RPC request produced " << (powerStatusRequests.load() - beforeComRpc)
+        << " outbound messages";
 
     // 2. JSON-RPC, same expectation. The wrapper must not send twice, nor forget to send.
     const int beforeJsonRpc = powerStatusRequests.load();

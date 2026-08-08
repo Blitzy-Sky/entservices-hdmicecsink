@@ -56,7 +56,6 @@
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -166,11 +165,7 @@ def run_test():
 
         if has_success and has_available and route_valid:
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID07_Get_Active_Route Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID07_Get_Active_Route Passed ✅", elapsed_time))
             return True
 
         log_warning(

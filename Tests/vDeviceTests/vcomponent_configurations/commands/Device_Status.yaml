@@ -60,15 +60,22 @@
 # show for it. The document is self-contained for the same reason - one YAML
 # document, no anchors, aliases or includes - because send_vcomponent_command()
 # posts these bytes verbatim and the vComponent parses them on their own.
-# THE PEER NAMED BELOW IS THE TEST-ONLY PEER Device_Add.yaml CREATES, not the baseline
-# GameConsole. An earlier revision named "GameConsole", which collides with the PlaybackDevice
-# declared beneath CECAdapter in Device_Config_Add_Network.yaml, so this document mutated a
-# BASELINE peer and left it faulted for every later case. The name must change in Device_Add.yaml,
-# this document and Device_Remove.yaml together.
+# THE PEER NAMED BELOW IS THE TEST-ONLY PEER Device_Add.yaml CREATES, and its name has to be the
+# one that document and Device_Remove.yaml use: "GameConsole". A previous revision named
+# "L3TestPeer" here alone, on the reasoning that "GameConsole" collided with a PlaybackDevice
+# declared beneath a "CECAdapter" in Device_Config_Add_Network.yaml. There is no CECAdapter and no
+# GameConsole in that document - the sink topology declares exactly six peers, SAMSUNG, YAMAHA,
+# DENON, PANASONIC, LG and SONY beneath VTV, and that reasoning was carried across from the source
+# plugin's tree where such a device does exist. The rename therefore did not avoid a collision; it
+# created one, because this document then addressed a peer that was never in the map, and the
+# vComponent does not reject an update for an unknown device - it simply has no effect, so the
+# power-status change this document exists to make silently stopped happening.
+# Init_Devicelist_Populate.verify_topology_consistency() is what now makes a claim about the
+# topology checkable rather than a comment.
 HdmiCec:
   command: update_device_status
   description: Updates the status of an HDMI CEC device
   device:
-    name: "L3TestPeer"
+    name: "GameConsole"
     power_status: "off"
     fault: yes

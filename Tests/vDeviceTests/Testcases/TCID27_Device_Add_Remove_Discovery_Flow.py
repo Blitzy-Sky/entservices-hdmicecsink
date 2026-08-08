@@ -39,7 +39,9 @@
  *          third arm the baseline recorded as uncovered: it calls HdmiPortMap::removeChild for
  *          whichever HDMI input matches the departing peer's physical address
  *          (HdmiCecSinkImplementation.cpp:2494), an arm only a NESTED peer can reach, and
- *          "GameConsole" is nested one level below CECAdapter in the seeded topology.
+ *          Device_Add.yaml hangs "GameConsole" from port 4 of the YAMAHA audio system - one
+ *          level below the HDMI input rather than directly on it - so it lands at 2.4.0.0 with
+ *          a non-zero second address byte, which is what that arm needs.
  *          This module drives all three from the device level, which is the one leg the other
  *          two suites cannot supply. It does not measure them - this suite has never been
  *          executed, as the preconditions below record - so no coverage claim is made here.
@@ -260,6 +262,31 @@ def _await_peer(logical_address, expect_present, label):
         time.sleep(LIFECYCLE_POLL_SECONDS)
 
 
+def _device_inventory():
+    '''Return (readable, count, sorted_logical_addresses) from the published getDeviceList method.
+
+    readable is False when the reply could not be read as a JSON-RPC result reporting success,
+    which is deliberately distinct from an empty inventory.
+    '''
+    response = send_curl_command(HdmiCecSinkApis.get_device_list)
+    if not response or response.startswith("< No response"):
+        return False, None, None
+    try:
+        result = _result_object(response)
+    except json.JSONDecodeError:
+        return False, None, None
+    if result.get("success") is not True:
+        return False, None, None
+    device_list = result.get("deviceList")
+    if not isinstance(device_list, list):
+        return False, None, None
+    addresses = sorted(
+        device["logicalAddress"]
+        for device in device_list
+        if isinstance(device, dict) and isinstance(device.get("logicalAddress"), int)
+    )
+    return True, result.get("numberofdevices"), addresses
+
 def run_test():
     """Walk one test-only peer through appear / announce / mutate / depart, on membership.
 
@@ -276,11 +303,14 @@ def run_test():
     An earlier revision could make none of those claims. It asserted only after_count <= mid_count
     and argued at length that a growth assertion was impossible because the peer being added,
     "GameConsole", was ALREADY in the baseline topology so the add could legitimately be a no-op.
-    That was true of that fixture, and it was the fixture that was wrong: the same collision meant
-    the paired removal took away a BASELINE peer, leaving every later case in the suite a network
-    one short. The three fixtures now name "L3TestPeer", which the baseline does not declare, so
-    the add is a real transition, the removal restores exactly what the add created, and both
-    directions become assertable.
+    That premise was simply untrue of this tree: Device_Config_Add_Network.yaml declares six peers -
+    SAMSUNG, YAMAHA, DENON, PANASONIC, LG and SONY beneath VTV - and GameConsole is not one of them,
+    which is why it leaves port 4 of the audio system free for exactly this triple. So the add IS a
+    real transition, the removal takes away exactly what the add created, and both directions are
+    assertable. All three fixtures - Device_Add.yaml, Device_Status.yaml and Device_Remove.yaml -
+    name "GameConsole", the same name ADDED_PEER_NAME carries, and
+    Init_Devicelist_Populate.verify_topology_consistency() is what keeps a claim about the topology
+    checkable rather than a comment.
     WHAT IS NOT OBSERVABLE: the OnDeviceRemoved notification. A curl request/response cannot
     subscribe to a Thunder event. Its CONSEQUENCE is observable and is what is asserted -
     removeDevice() decrements m_numberOfDevices (HdmiCecSinkImplementation.cpp:2490) and clears the
@@ -327,27 +357,27 @@ def run_test():
         )
         log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
         return False
-    log_warning(f"Initial device list: {before}")
+    log_warning(
+        f"Initial device list: numberofdevices={before_count}, "
+        f"logical addresses {before_addresses}"
+    )
 
-    # THE PRECONDITION THAT MAKES "PRESENT AFTER THE ADD" MEAN ANYTHING. GameConsole is not part
+    # THE PRECONDITION THAT MAKES "PRESENT AFTER THE ADD" MEAN ANYTHING. The added peer is not part
     # of the seeded topology, so its address must be absent before Act 1 runs. If it is already
     # there the add is a no-op, and every assertion below would hold while proving nothing - so
     # this is reported as the precondition failure it is rather than tolerated. The likeliest
     # cause is a previous run of this case that did not reach its removal step, which leaves the
     # peer in the emulator's map for the next run to find.
-    try:
-        before_result = _result_object(before)
-    except json.JSONDecodeError:
-        log_error("✖ the initial getDeviceList reply is not valid JSON")
-        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
-        return False
-
-    if before_result.get("success") is not True:
-        log_error("✖ the initial getDeviceList did not report success")
-        log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
-        return False
-
-    if _device_entry(before_result, ADDED_PEER_LOGICAL_ADDRESS) is not None:
+    #
+    # The membership test is taken from the reference sample _device_inventory() already returned
+    # rather than from a second getDeviceList read. One sample keeps the precondition, the count
+    # logged above and the count compared at the end of the lifecycle all describing the SAME
+    # observation; a second read could disagree with the first the moment a ping round lands
+    # between them, and would report a precondition failure against a list the counts never saw.
+    # _device_inventory() has already folded "no response", "not JSON" and "did not report
+    # success" into readable=False, which the block above reports, so nothing is lost by not
+    # re-parsing here.
+    if ADDED_PEER_LOGICAL_ADDRESS in before_addresses:
         log_error(
             f"✖ logical address {ADDED_PEER_LOGICAL_ADDRESS} is already in the device list "
             f"before the add, so adding {ADDED_PEER_NAME!r} cannot be observed as a population "
@@ -521,7 +551,8 @@ def run_test():
         log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
         return False
 
-    before_count = before_result.get("numberofdevices")
+    # before_count is the one the before-probe already read and validated as an integer; it is not
+    # re-derived here, because the reference sample is a single observation by design.
     mid_count = mid_result.get("numberofdevices")
     after_count = after_result.get("numberofdevices")
 
@@ -560,9 +591,5 @@ def run_test():
         f"{ADDED_PEER_LOGICAL_ADDRESS} and is absent after the removal"
     )
     elapsed_time = time.perf_counter() - start_time
-    msg = "TCID27_Device_Add_Remove_Discovery_Flow Passed ✅"
-    if os.environ.get("HDMICEC_TIMING_ENABLED"):
-        log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-    else:
-        log_success(msg)
+    log_success(log_with_timing("TCID27_Device_Add_Remove_Discovery_Flow Passed ✅", elapsed_time))
     return True

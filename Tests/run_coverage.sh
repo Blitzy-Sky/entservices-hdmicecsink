@@ -465,11 +465,11 @@ VALGRIND_BIN="$(resolve_tool valgrind)"
 GCOV_BIN="$(resolve_tool gcov)"
 ID_BIN="$(resolve_tool id)"
 TIMEOUT_BIN="$(resolve_tool timeout)"
-# stat is how the ancestry of every artifact path is checked (owner, mode, type) before a byte
-# is written to it -- see assert_safe_ancestry.  It is resolved HERE, with the other primitives,
-# because it was previously referenced there and nowhere assigned: `stat` was on PATH throughout
-# and the run still died with "stat was not found on PATH", because the guard was testing an
-# empty variable rather than the tool.
+# `stat` is how the ancestry of every artifact path is checked (owner, mode, type) before a byte is
+# written to it, so it is MANDATORY rather than advisory: path_meta() refuses to write anything
+# without it.  It must therefore be resolved here with the rest of the tooling - it was previously
+# only ever read, never assigned, so that refusal fired on every run.  Same coreutils group as find
+# and mktemp above, and the same treatment as in the sibling source-plugin runner.
 STAT_BIN="$(resolve_tool stat)"
 readonly LCOV_BIN GENHTML_BIN FIND_BIN MKTEMP_BIN VALGRIND_BIN GCOV_BIN ID_BIN TIMEOUT_BIN STAT_BIN
 
@@ -1055,7 +1055,7 @@ cleanup_lcov_home() {
     return 0
 }
 
-prepare_lcov_home() {
+make_private_lcov_home() {
     [ -n "$LCOV_HOME" ] && return 0
     [ -n "$MKTEMP_BIN" ] || die "mktemp is not available; it is required to create a private HOME for lcov"
     local parent="${TMPDIR:-/tmp}"
@@ -1091,14 +1091,13 @@ genhtml_run() {
     HOME="$LCOV_HOME" "$GENHTML_BIN" "$@"
 }
 
-# Every lcov and genhtml invocation in this script goes through a wrapper.  Calling either
-# binary directly would read the real $HOME/.lcovrc and is a defect.
-#
-# Both spellings exist because both are in use across this file, and these two DELEGATE rather
-# than reimplement so there is exactly ONE place where HOME is chosen and exactly one guard
-# against being called before the private HOME exists.  They previously named a variable,
-# LCOV_HOME_DIR, that is set nowhere: with `set -euo pipefail` in force every one of the seven
-# call sites below would have aborted on an unbound variable the moment it ran.
+# Every lcov and genhtml invocation in this script goes through these two wrappers.  Calling
+# either binary directly would read the real $HOME/.lcovrc and is a defect.
+# Both spellings occur in the body below, so they are one implementation with two names rather
+# than two implementations: these delegate to lcov_run/genhtml_run above, which is what keeps the
+# "was the private HOME created first" guard on every call.  They previously set HOME from
+# LCOV_HOME_DIR, a name nothing in this script ever assigns, so every call through them ran with
+# an EMPTY HOME - which defeats the guard and, under `set -u`, aborts the run outright.
 run_lcov()    { lcov_run "$@"; }
 run_genhtml() { genhtml_run "$@"; }
 
@@ -2101,10 +2100,10 @@ capture_coverage() {
 
     # Ensure the private, empty HOME the lcov steps below run with is in place.  Idempotent: it
     # is also prepared in main() before the first lcov call of the run, and again per level so
-    # that a level running in its own subshell has one regardless.  See prepare_lcov_home: the
+    # that a level running in its own subshell has one regardless.  See make_private_lcov_home: the
     # real $HOME is never touched, /etc/lcovrc and every other shared configuration is left
     # strictly alone, and no path in the home directory is read or written at all.
-    prepare_lcov_home
+    make_private_lcov_home
 
     assert_safe_artifact_path "$raw" file
     assert_safe_artifact_path "$filtered" file
@@ -2513,32 +2512,21 @@ gate_exempt_reason() {
             log "        an out-of-process host or a production change, both out of scope."
             ;;
         l2/plugin/HdmiCecSinkImplementation.h)
-            # The analysis lives in the L2_GATE_EXEMPT header block above; it is restated here
-            # because a reason a run does not PRINT is a reason a reader cannot check, and the
-            # run was emitting "no documented reason is recorded" for this entry.
-            log "        Reason: the port-map operations cannot be reached through the L2 frame path"
-            log "        while the shared CEC mock (entservices-testframework/Tests/mocks/HdmiCec.h,"
-            log "        an out-of-scope dependency) carries two incompatible PhysicalAddress"
-            log "        representations:"
-            log "          - that mock's PhysicalAddress::getByteValue(index) returns the RAW WIRE"
-            log "            BYTE str[index], where ccec's real PhysicalAddress returns a NIBBLE, so"
-            log "            addChild and getRoute -- which both require getByteValue(0) to equal"
-            log "            m_portID + 1, a value in 1..3 -- see 17 for an announced 1.1.0.0 and 32"
-            log "            for a 2.0.0.0, and never match;"
-            log "          - a port can therefore never be CLAIMED: the only write to"
-            log "            HdmiPortMap::m_logicalAddr is reached solely from addChild's"
-            log "            'physical_addr == m_physicalAddr' arm, and the mock's four-argument"
-            log "            constructor stores FOUR bytes where a frame-derived address stores TWO,"
-            log "            against an exact vector compare."
-            log "        Measured confirmation: across a full L2 run, addChild logged ZERO invocations."
-            log "        This repository's own L1 suite measures the SAME file at 100.0% (172/172),"
-            log "        covering addChild, removeChild and getRoute in full, by constructing"
-            log "        HdmiPortMap directly instead of decoding frames.  Raising the L2 figure needs"
-            log "        two changes to that out-of-scope mock -- initialise AbortReason::impl to"
-            log "        nullptr, and pack PhysicalAddress as two nibble-packed bytes -- so the gap is"
-            log "        REPORTED WITH THE CHANGE IT WOULD REQUIRE, not worked around.  No exclusion"
-            log "        glob was added and COVERAGE_MIN was not lowered: the file keeps its real"
-            log "        70.8% and stays in the denominator."
+            log "        Reason: the port-map members of this header cannot be reached at L2, because"
+            log "        HdmiPortMap::addChild/removeChild/getRoute only run once the map has learned"
+            log "        its own logical address, and at L2 the frames that would teach it are decoded"
+            log "        by the SHARED CEC MOCK.  entservices-testframework/Tests/mocks/HdmiCec.h"
+            log "        carries a PhysicalAddress representation that is incompatible with the one the"
+            log "        production header expects, so the announced address never matches and the"
+            log "        chain is never registered; the four route-map cases in this repository's L2"
+            log "        file are DISABLED_ for exactly that reason and say so in place."
+            log "        The required change is a single-representation PhysicalAddress in that mock"
+            log "        header.  It is a read-only authority for this pass (AAP Sec. 0.10.2), so the"
+            log "        change is REPORTED, NOT MADE, and no in-scope file can substitute for it -"
+            log "        the object is built inside the mock's own decoder, ahead of any test seam."
+            log "        This repository's own L1 suite measures the SAME header at 100% (172/172),"
+            log "        so the header is fully tested -- it is this level that cannot reach it.  No"
+            log "        exclusion glob was added and COVERAGE_MIN was not lowered."
             ;;
         *)
             warn "no documented reason is recorded for the exemption '$path' at ${level^^}."
@@ -2627,7 +2615,7 @@ run_level() {
     # not the capture.  main() has already done this for the run; it is repeated here (and is
     # idempotent) so that a home configuration which reappears between levels cannot be in
     # effect for the level that follows it.
-    prepare_lcov_home
+    make_private_lcov_home
     zero_counters "$level"
     run_suite "$level"
     verify_fresh_counters "$level"
@@ -2855,6 +2843,14 @@ main() {
     validate_timeout SUITE_TIMEOUT_L2 "$SUITE_TIMEOUT_L2"
     validate_timeout HOOK_TIMEOUT     "$HOOK_TIMEOUT"
 
+    # Minted HERE when the caller named no root, before the validation below inspects it and
+    # before the configuration banner or any level resolves a directory underneath it.  Without
+    # this call the documented default - "left unset, the root is minted with mktemp -d" - never
+    # happens, and the very next check rejects the empty value as a relative path, so every
+    # invocation that does not export ARTIFACT_ROOT dies before running a single test.  Same
+    # placement as the sibling source-plugin runner, so the two behave identically.
+    mint_artifact_root
+
     # ARTIFACT_ROOT is validated before it is used, because every level's report directory is
     # derived from it and republishing a report removes the previous one with `rm -rf`.  A
     # relative value would resolve against whatever directory this run happens to be in, and
@@ -2885,7 +2881,7 @@ main() {
     # lcov cannot parse breaks `lcov --version` itself, so probing first would misreport a
     # working lcov as a broken one -- and the counter-zeroing step would have failed with a
     # bare lcov error before the capture ever ran.
-    prepare_lcov_home
+    make_private_lcov_home
     check_lcov_usable
 
     log "repository  : $REPO_ROOT"

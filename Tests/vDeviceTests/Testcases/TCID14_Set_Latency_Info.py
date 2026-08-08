@@ -48,7 +48,6 @@
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -100,11 +99,7 @@ def run_test():
     try:
         if json.loads(curl_response) == expected_output_response:
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID14_Set_Latency_Info Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID14_Set_Latency_Info Passed ✅", elapsed_time))
             return True
         else:
             log_error("TCID14_Set_Latency_Info Failed ❌")

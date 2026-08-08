@@ -34,7 +34,6 @@
 
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -93,11 +92,7 @@ def run_test():
             and result.get("enabled") is True
         ):
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID01_Get_Enabled_Status Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID01_Get_Enabled_Status Passed ✅", elapsed_time))
             return True
         else:
             log_warning(f"Actual  : {json.dumps(parsed, indent=2, sort_keys=True)}")

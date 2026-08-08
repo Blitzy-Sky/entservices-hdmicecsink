@@ -6,17 +6,27 @@
  * @testcase TCID33_Process_Yaml_Health_Check
  * @details The BREADTH pass of this suite, and the only module in it that touches every
  *          inbound-handler emulation fixture the sink's vComponent tree publishes. Where
- *          TCID17-TCID27 each drive one flow in depth, this case DISCOVERS every
- *          Process_*.yaml document under vcomponent_configurations/commands, posts all of
- *          them to the vComponent emulator in a stable sorted order, and proves that the
- *          plugin's readable state survives the whole sweep.
+ *          TCID17-TCID27 each drive one flow in depth, this case posts the 24 reviewed
+ *          Process_*.yaml documents under vcomponent_configurations/commands to the
+ *          vComponent emulator in a stable sorted order, having first proven the directory
+ *          holds exactly those 24 and nothing else, and then proves that the plugin's
+ *          readable state survives the whole sweep.
  *
- *          Three things are asserted, and only three:
- *            1. every discovered fixture is ACCEPTED by the vComponent (HTTP 200);
- *            2. org.rdk.HdmiCecSink.getDeviceList answers with a well-formed envelope
- *               before and after the sweep, and again after each of the four fixtures whose
- *               effect reaches the device list;
- *            3. org.rdk.HdmiCecSink.getActiveSource stays answerable across the five
+ *          Five things are asserted, and only five:
+ *            1. the Process_*.yaml tree matches the approved inventory EXACTLY in both
+ *               directions, every entry is a regular file, and every entry carries a declared
+ *               expectation - so a deleted document is a named failure rather than a
+ *               shorter pass, and an unreviewed one is never posted;
+ *            2. every Device_*.yaml document in the same tree has a declared status - either a
+ *               named consuming module, verified to actually reference the filename, or a
+ *               recorded reason for being retained without one - so a fixture cannot sit in
+ *               the tree unconsumed and unexplained, which is indistinguishable from one
+ *               whose consumer was deleted;
+ *            3. every fixture on the sweep is ACCEPTED by the vComponent (HTTP 200);
+ *            4. org.rdk.HdmiCecSink.getDeviceList answers with a well-formed envelope
+ *               before and after the sweep, and the initiator encoded in each of the six
+ *               registering fixtures' own payloads appears in the device list afterwards;
+ *            5. org.rdk.HdmiCecSink.getActiveSource stays answerable across the six
  *               fixtures that move the active-source and routing state.
  *
  *          WHAT IS NOT ASSERTED MATTERS AS MUCH. A handler whose only effect is an outbound
@@ -66,19 +76,25 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - Every discovered Process_*.yaml fixture is accepted with HTTP 200, getDeviceList stays
- *    healthy before and after the sweep, getActiveSource stays answerable across the routing
- *    fixtures, and the post-sweep device count is not lower than the pre-sweep count.
+ *  - The fixture tree matches the approved inventory exactly, every approved Process_*.yaml
+ *    fixture is accepted with HTTP 200, getDeviceList stays healthy before and after the
+ *    sweep, each registering fixture's own initiator appears in the device list,
+ *    getActiveSource stays answerable across the routing fixtures, and the post-sweep device
+ *    count is not lower than the pre-sweep count.
  *
  * @pass_criteria
- *  - At least one fixture is discovered, the topology document is accepted, both health
+ *  - Both inventory verifications pass, the topology document is accepted, both health
  *    checks are healthy, both snapshots are captured, there is no failed post and no
  *    state-check failure, post_count >= pre_count, and run_test() returns True.
  *
  * @failure_criteria
- *  - The commands directory is absent, no fixture is discovered, the topology configuration
- *    is rejected, either health check is unhealthy, a snapshot is unavailable, any post is
- *    rejected, any state check fails, the device count regresses, or run_test() returns False.
+ *  - The commands directory is absent, the Process_*.yaml inventory does not match the
+ *    approved list, a Device_*.yaml document has no declared status or its declared consumer
+ *    no longer posts it, a fixture is not a regular file, a fixture carries no declared
+ *    expectation, the topology
+ *    configuration is rejected, either health check is unhealthy, a snapshot is unavailable,
+ *    any post is rejected, any state check fails, the device count regresses, or run_test()
+ *    returns False.
  */
 """
 
@@ -86,6 +102,8 @@
 import json
 import time
 import os
+import re
+import stat
 from pathlib import Path
 
 from utils import (
@@ -106,46 +124,23 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 
 # Every name in the utils import above has a call site, log_with_timing included: it applies the
 # HDMICEC_TIMING_ENABLED decoration and the pass path routes its message through it, which retired
-# this module's own inline copy of that gate.
+# this module's own inline copy of that gate. The three pacing constants are the three settle
+# windows the sweep uses - one frame, one full pipeline, and one fixture with no state-visible
+# outcome - and they are imported rather than written as literals so that a change to the suite's
+# pacing reaches this module too.
 #
 # pathlib is this module's alone. Every other case posts a FIXED list of document names, so no path
-# is ever walked; this one derives its work from the directory, which is what makes it the breadth
-# pass rather than another flow case. `re` reads a fixture's payload so a membership expectation can
-# be DERIVED from the frame's own initiator nibble instead of restated here - the same technique
-# Init_Devicelist_Populate.verify_seed_payload_consistency() uses on the seed payloads.
-
-# ── THE INVENTORY THIS SWEEP IS REQUIRED TO FIND ─────────────────────────────────────────────────
-# An earlier revision accepted ANY non-empty discovery, so a fixture deleted from the tree, renamed,
-# or added without a thought about what it should do was invisible: the sweep simply got shorter or
-# longer and still passed. Declaring the inventory is what makes a change to it a test failure that
-# names the difference. This list is deliberately WRITTEN OUT rather than derived - deriving it from
-# the directory would reproduce exactly the blindness being fixed.
-EXPECTED_PROCESS_FIXTURES = frozenset({
-    "Process_Abort.yaml",
-    "Process_Active_Source.yaml",
-    "Process_CEC_Version.yaml",
-    "Process_Device_Vendor_ID.yaml",
-    "Process_Feature_Abort.yaml",
-    "Process_Get_CEC_Version.yaml",
-    "Process_Give_Device_Power_Status.yaml",
-    "Process_Give_Device_Vendor_ID.yaml",
-    "Process_Give_Features.yaml",
-    "Process_Give_OSD_Name.yaml",
-    "Process_Give_Physical_Address.yaml",
-    "Process_In_Active_Source.yaml",
-    "Process_Polling.yaml",
-    "Process_Report_Physical_Address.yaml",
-    "Process_Report_Power_Status.yaml",
-    "Process_Request_Active_Source.yaml",
-    "Process_Request_Current_Latency.yaml",
-    "Process_Routing_Change.yaml",
-    "Process_Routing_Information.yaml",
-    "Process_Set_OSD_Name.yaml",
-    "Process_Set_Stream_Path.yaml",
-    "Process_Standby.yaml",
-    "Process_User_Control_Pressed.yaml",
-    "Process_User_Control_Released.yaml",
-})
+# is ever walked; this one reads the directory to compare it against the inventory below, which is
+# what makes it the breadth pass rather than another flow case. `re` reads a fixture's payload so a
+# membership expectation can be DERIVED from the frame's own initiator nibble instead of restated
+# here - the same technique Init_Devicelist_Populate.verify_seed_payload_consistency() uses on the
+# seed payloads. `stat` classifies each fixture by st_mode, so a symlink or a directory wearing a
+# fixture's name is refused rather than posted.
+#
+# THE INVENTORY IS DECLARED EXACTLY ONCE, as APPROVED_PROCESS_FIXTURES below, and
+# EXPECTED_PROCESS_FIXTURES is derived from it. It used to be written out three times over - twice
+# as a frozenset and once as the tuple - which is three copies of twenty-four filenames that a
+# rename could put out of step with each other while every one of them still looked authoritative.
 
 # ── WHAT EACH FIXTURE IS EXPECTED TO DO, ONE ENTRY PER FIXTURE ───────────────────────────────────
 # Three expectation kinds, and every fixture carries at least one EXPLICITLY. An earlier revision
@@ -348,7 +343,7 @@ def _discovered_process_fixtures(commands_dir):
 def _verify_fixture_inventory(commands_dir):
     """True when the fixture tree matches APPROVED_PROCESS_FIXTURES exactly, file types included.
 
-    Four independent conditions, each reported with its own diagnostic so a reader is told which
+    Five independent conditions, each reported with its own diagnostic so a reader is told which
     one failed rather than being handed a set difference:
 
       * every approved document is present;
@@ -356,12 +351,17 @@ def _verify_fixture_inventory(commands_dir):
         rather than as whatever it points at, and a directory or a FIFO bearing the name is
         likewise refused;
       * nothing else in the tree claims to be a Process_*.yaml, at any depth;
-      * commands_dir is itself a real directory and not a symlink to one.
+      * commands_dir is itself a real directory and not a symlink to one;
+      * FIXTURE_EXPECTATIONS carries an entry for every approved document and for nothing else,
+        which is the condition that makes it impossible to add a fixture to the tree without
+        deciding what posting it is supposed to prove. Checked here rather than raised at import,
+        so that SuitManager can still load and register this module and report the failure as a
+        case result instead of dying during discovery.
 
     Args:
         commands_dir: pathlib.Path of the vcomponent command-document directory.
     Returns:
-        True when all four hold; False with the reason already logged otherwise.
+        True when all five hold; False with the reason already logged otherwise.
     """
     directory_info = os.lstat(str(commands_dir))
     if not stat.S_ISDIR(directory_info.st_mode):
@@ -406,12 +406,28 @@ def _verify_fixture_inventory(commands_dir):
             "to APPROVED_PROCESS_FIXTURES deliberately, with the document reviewed, or remove it"
         )
 
-    if missing or wrong_type or unexpected:
+    untabled = sorted(EXPECTED_PROCESS_FIXTURES - set(FIXTURE_EXPECTATIONS))
+    unapproved_table_entries = sorted(set(FIXTURE_EXPECTATIONS) - EXPECTED_PROCESS_FIXTURES)
+    if untabled:
+        log_error(
+            f"✖ {len(untabled)} approved fixture(s) carry no entry in FIXTURE_EXPECTATIONS: "
+            f"{', '.join(untabled)}. The sweep would post them and check nothing, which reads as "
+            "a pass for a handler nothing was claimed about"
+        )
+    if unapproved_table_entries:
+        log_error(
+            f"✖ {len(unapproved_table_entries)} FIXTURE_EXPECTATIONS entr(ies) name a document "
+            f"that is not approved: {', '.join(unapproved_table_entries)}. The expectation is "
+            "unreachable, which usually means a fixture was renamed in one place only"
+        )
+
+    if missing or wrong_type or unexpected or untabled or unapproved_table_entries:
         return False
 
     log_success(
         f"✔ the fixture inventory matches exactly: {len(APPROVED_PROCESS_FIXTURES)} approved "
-        "Process_*.yaml documents, all regular files, none unapproved"
+        "Process_*.yaml documents, all regular files, none unapproved, each with a declared "
+        "expectation"
     )
     return True
 
@@ -438,32 +454,247 @@ def _verify_fixture_inventory(commands_dir):
 # Adding, renaming or removing a fixture is therefore a deliberate two-file change: the
 # document and this list. That is the intended cost. The 24 entries are the complete set of
 # Process_*.yaml documents in the tree, one per inbound CEC opcode this suite exercises.
-EXPECTED_PROCESS_FIXTURES = frozenset({
-    "Process_Abort.yaml",
-    "Process_Active_Source.yaml",
-    "Process_CEC_Version.yaml",
-    "Process_Device_Vendor_ID.yaml",
-    "Process_Feature_Abort.yaml",
-    "Process_Get_CEC_Version.yaml",
-    "Process_Give_Device_Power_Status.yaml",
-    "Process_Give_Device_Vendor_ID.yaml",
-    "Process_Give_Features.yaml",
-    "Process_Give_OSD_Name.yaml",
-    "Process_Give_Physical_Address.yaml",
-    "Process_In_Active_Source.yaml",
-    "Process_Polling.yaml",
-    "Process_Report_Physical_Address.yaml",
-    "Process_Report_Power_Status.yaml",
-    "Process_Request_Active_Source.yaml",
-    "Process_Request_Current_Latency.yaml",
-    "Process_Routing_Change.yaml",
-    "Process_Routing_Information.yaml",
-    "Process_Set_OSD_Name.yaml",
-    "Process_Set_Stream_Path.yaml",
-    "Process_Standby.yaml",
-    "Process_User_Control_Pressed.yaml",
-    "Process_User_Control_Released.yaml",
-})
+#
+# DERIVED FROM THE TUPLE ABOVE, never written out again. The tuple carries the reviewed order and
+# is what _verify_fixture_inventory walks; this frozenset is the same names as a set, for the
+# equality comparisons against the directory sweep and against FIXTURE_EXPECTATIONS' keys.
+EXPECTED_PROCESS_FIXTURES = frozenset(APPROVED_PROCESS_FIXTURES)
+
+# ── THE TWO EXPECTATION SETS THE SWEEP CONSULTS, DERIVED FROM THE TABLE ──────────────────────────
+# Neither is written out by hand. FIXTURE_EXPECTATIONS is the single place a fixture's expectation
+# is decided, so restating the membership here would let the table and the sweep disagree - and the
+# sweep would win silently, checking nothing for a fixture whose table entry says it registers a
+# device. Sorted for a stable, diffable console record.
+FIXTURES_THAT_REGISTER_A_DEVICE = tuple(sorted(
+    name for name, (kinds, _reason) in FIXTURE_EXPECTATIONS.items() if "registers" in kinds
+))
+FIXTURES_THAT_MOVE_ACTIVE_SOURCE = tuple(sorted(
+    name for name, (kinds, _reason) in FIXTURE_EXPECTATIONS.items() if "active_source" in kinds
+))
+
+
+# ── THE OTHER HALF OF THE FIXTURE TREE: THE Device_*.yaml FAMILY ─────────────────────────────────
+#
+# Every command document in this directory now has a declared status, which is the point of the two
+# tables below. Thirty of the fifty-three Device_*.yaml documents had NO consumer at all: no module
+# posted them, nothing named them, and nothing recorded whether that was deliberate. An unconsumed
+# fixture is not harmless - it is indistinguishable from a fixture whose consumer was deleted or
+# renamed, so real lost coverage looks exactly like a document that was never meant to be posted.
+#
+# They are NOT removed. Every one of them is a reviewed emulator command that a future case may
+# legitimately reach for, and this pass does not delete test assets. What they get instead is an
+# explicit status, checked against the tree by _verify_device_fixture_inventory below: either a named
+# consuming module, verified to actually reference the filename, or a recorded reason for being
+# retained without one.
+#
+# DEVICE_FIXTURE_CONSUMERS - posted by the module named. The check reads that module and requires the
+# filename to appear in it, so a rename on either side is a named failure rather than a silent orphan.
+DEVICE_FIXTURE_CONSUMERS = {
+    "Device_Add.yaml": "TCID27_Device_Add_Remove_Discovery_Flow",
+    "Device_Config_Add_Network.yaml": "Init_Devicelist_Populate",
+    "Device_Image_View_On.yaml": "TCID25_Standby_Coordination_Flow",
+    "Device_In_Active_Source.yaml": "TCID18_Set_Active_Source_Flow",
+    "Device_Initiate_Arc.yaml": "TCID20_ARC_Initiation_Flow",
+    "Device_Initiate_Arc_Broadcast.yaml": "TCID20_ARC_Initiation_Flow",
+    "Device_Initiate_Arc_Invalid_Initiator.yaml": "TCID20_ARC_Initiation_Flow",
+    "Device_Remove.yaml": "TCID27_Device_Add_Remove_Discovery_Flow",
+    "Device_Report_Audio_Status.yaml": "TCID24_Audio_Status_And_Power_Flow",
+    "Device_Report_Audio_Status_Muted.yaml": "TCID24_Audio_Status_And_Power_Flow",
+    "Device_Report_Power_Status.yaml": "TCID24_Audio_Status_And_Power_Flow",
+    "Device_Report_Short_Audio_Descriptor.yaml": "TCID23_Short_Audio_Descriptor_Flow",
+    "Device_Set_System_Audio_Mode.yaml": "TCID22_System_Audio_Mode_Flow",
+    "Device_Set_System_Audio_Mode_Off.yaml": "TCID22_System_Audio_Mode_Flow",
+    "Device_Standby_Emulation.yaml": "TCID25_Standby_Coordination_Flow",
+    "Device_Status.yaml": "TCID27_Device_Add_Remove_Discovery_Flow",
+    "Device_Terminate_Arc.yaml": "TCID21_ARC_Termination_Flow",
+    "Device_Terminate_Arc_Broadcast.yaml": "TCID21_ARC_Termination_Flow",
+    "Device_Text_View_On.yaml": "TCID25_Standby_Coordination_Flow",
+    "Device_User_Control_Pressed.yaml": "TCID26_User_Control_Pressed_Released_Flow",
+    "Device_User_Control_Pressed_Boundary.yaml": "TCID26_User_Control_Pressed_Released_Flow",
+    "Device_User_Control_Pressed_Min.yaml": "TCID26_User_Control_Pressed_Released_Flow",
+    "Device_User_Control_Released.yaml": "TCID26_User_Control_Pressed_Released_Flow",
+}
+
+# DEVICE_FIXTURES_RETAINED - kept deliberately, posted by nothing, each with its reason. Three
+# reasons account for all of them:
+#
+#   * ALTERNATIVE FRAMING. The document injects an opcode this suite already covers, in the other
+#     framing - directed where the Process_*.yaml equivalent is broadcast, or the reverse. Both
+#     framings are worth having, because several sink handlers filter on destination, but only one
+#     of each pair is on the sweep and duplicating it would inject the same frame twice.
+#   * EMULATOR CONTROL, NOT A CEC FRAME. The document drives the vComponent itself - its device map,
+#     its bus state, its fault injection - rather than putting a frame on the bus. Nothing on the
+#     inbound-handler sweep applies, and the fault-injection trio in particular would leave the
+#     emulator in a state later cases inherit, so posting them from a breadth pass is exactly wrong.
+#   * NEGATIVE VARIANT AWAITING A CONSUMER. A deliberate off-nominal framing whose paired case does
+#     not exist in this suite, recorded so the document is not mistaken for a live fixture.
+DEVICE_FIXTURES_RETAINED = {
+    "Device_Abort.yaml":
+        "alternative framing: Process_Abort.yaml is the one on the sweep",
+    "Device_Bus_Status.yaml":
+        "emulator control: sets the emulated bus state, puts no frame on the bus",
+    "Device_CEC_Message.yaml":
+        "alternative framing: injects <CEC Version> from SAMSUNG; Process_CEC_Version.yaml is on "
+        "the sweep",
+    "Device_CEC_Message_Userdef.yaml":
+        "alternative framing: injects <Active Source> as a user-defined message; "
+        "Process_Active_Source.yaml is on the sweep and TCID17/TCID18 drive that flow",
+    "Device_CEC_Version.yaml":
+        "alternative framing: Process_CEC_Version.yaml is the one on the sweep",
+    "Device_Config.yaml":
+        "emulator control, and superseded: Device_Config_Add_Network.yaml is the topology this "
+        "suite configures, declaring the six peers rather than an empty map",
+    "Device_Device_Vendor_ID.yaml":
+        "alternative framing: Process_Device_Vendor_ID.yaml is the one on the sweep",
+    "Device_Feature_Abort.yaml":
+        "alternative framing: Process_Feature_Abort.yaml is the one on the sweep",
+    "Device_Get_CEC_Version.yaml":
+        "alternative framing: Process_Get_CEC_Version.yaml is the one on the sweep",
+    "Device_Get_Menu_Language.yaml":
+        "alternative framing: the sink answers <Get Menu Language> with an outbound frame this "
+        "transport cannot read, and TCID13_Set_Menu_Language covers the readable half",
+    "Device_Get_Power_Status.yaml":
+        "alternative framing: Process_Give_Device_Power_Status.yaml is the one on the sweep",
+    "Device_Give_Device_Vendor_ID.yaml":
+        "alternative framing: Process_Give_Device_Vendor_ID.yaml is the one on the sweep",
+    "Device_Give_Features.yaml":
+        "alternative framing: Process_Give_Features.yaml is the one on the sweep",
+    "Device_Give_OSD_Name.yaml":
+        "alternative framing: Process_Give_OSD_Name.yaml is the one on the sweep",
+    "Device_Give_Physical_Address.yaml":
+        "alternative framing: Process_Give_Physical_Address.yaml is the one on the sweep",
+    "Device_Polling.yaml":
+        "alternative framing: Process_Polling.yaml is the one on the sweep",
+    "Device_Print.yaml":
+        "emulator control: prints the emulated device map, puts no frame on the bus. The sink's own "
+        "printDeviceList is what TCID09_Print_Devicelist exercises",
+    "Device_Report_Physical_Address.yaml":
+        "alternative framing: the seeding equivalent lives in DeviceListConfig/ per peer, and "
+        "Process_Report_Physical_Address.yaml is the one on the sweep",
+    "Device_Request_Active_Source.yaml":
+        "alternative framing: Process_Request_Active_Source.yaml is the one on the sweep, and "
+        "TCID17_Request_Active_Source_Flow drives that flow",
+    "Device_Request_Current_Latency.yaml":
+        "alternative framing: Process_Request_Current_Latency.yaml is the one on the sweep, and "
+        "TCID14_Set_Latency_Info covers the readable half",
+    "Device_Request_Current_Latency_Mismatch.yaml":
+        "negative variant awaiting a consumer: a <Request Current Latency> naming a physical "
+        "address that is not the sink's, which the handler drops with no readable consequence",
+    "Device_Request_Inactive_Source.yaml":
+        "alternative framing: Process_In_Active_Source.yaml is the one on the sweep, and "
+        "TCID18_Set_Active_Source_Flow drives that flow through Device_In_Active_Source.yaml",
+    "Device_Routing_Change.yaml":
+        "alternative framing: Process_Routing_Change.yaml is the one on the sweep, and "
+        "TCID19_Active_Path_Routing_Change_Flow drives that flow",
+    "Device_Routing_Information.yaml":
+        "alternative framing: Process_Routing_Information.yaml is the one on the sweep, and "
+        "TCID19_Active_Path_Routing_Change_Flow drives that flow",
+    "Device_Set_Menu_Language.yaml":
+        "alternative framing: TCID13_Set_Menu_Language drives the language flow through the "
+        "plugin's own setMenuLanguage rather than by injecting the inbound frame",
+    "Device_Set_OSD_String.yaml":
+        "negative variant awaiting a consumer: <Set OSD String> is a display request the sink has "
+        "no handler for, so it has no observable consequence at any level",
+    "Device_Set_Stream_Path.yaml":
+        "alternative framing: Process_Set_Stream_Path.yaml is the one on the sweep, and "
+        "TCID19_Active_Path_Routing_Change_Flow drives that flow",
+    "Device_Setapi_Logic_Fail.yaml":
+        "emulator control, fault injection: forces a busy bus so logical-address setup fails. Not "
+        "posted from a breadth pass, because it leaves the emulator in a state later cases inherit",
+    "Device_Setapi_Open_Fail.yaml":
+        "emulator control, fault injection: marks the target faulted so the HAL open fails. Same "
+        "reason - the residual would reach every case that follows",
+    "Device_Setapi_Open_Pass.yaml":
+        "emulator control: clears the fault the two documents above inject, so it is only "
+        "meaningful as their paired cleanup",
+}
+
+
+def _verify_device_fixture_inventory(commands_dir):
+    """True when every Device_*.yaml document has a declared status matching the tree.
+
+    THE CHECK THAT MAKES AN ORPHAN FIXTURE IMPOSSIBLE. Four conditions, each reported on its own:
+
+      * the two tables are disjoint - a document cannot be both posted and retained-unposted;
+      * the documents on disk are exactly the union of the two tables, so a fixture added without a
+        status is named and a fixture named without a document is named too;
+      * every declared document is a REGULAR FILE, by os.lstat, so a symlink or a directory wearing
+        a fixture's name is refused rather than treated as one;
+      * every consumer named in DEVICE_FIXTURE_CONSUMERS exists as a module and actually references
+        the filename - which is what turns "this fixture has a consumer" from a comment into a fact.
+
+    Args:
+        commands_dir: pathlib.Path of the vcomponent command-document directory.
+    Returns:
+        True when all four hold; False with the reason already logged otherwise.
+    """
+    problems = []
+
+    both = sorted(set(DEVICE_FIXTURE_CONSUMERS) & set(DEVICE_FIXTURES_RETAINED))
+    if both:
+        problems.append(
+            f"{len(both)} document(s) are declared both posted and retained-unposted: "
+            f"{', '.join(both)}"
+        )
+
+    declared = set(DEVICE_FIXTURE_CONSUMERS) | set(DEVICE_FIXTURES_RETAINED)
+    on_disk = {path.name for path in commands_dir.glob("Device_*.yaml")}
+
+    undeclared = sorted(on_disk - declared)
+    if undeclared:
+        problems.append(
+            f"{len(undeclared)} Device_*.yaml document(s) carry no declared status: "
+            f"{', '.join(sanitise_for_log(name, max_chars=128) for name in undeclared)}. An "
+            "unconsumed fixture is indistinguishable from one whose consumer was deleted, so each "
+            "needs either a named consumer or a recorded reason for being retained"
+        )
+    absent = sorted(declared - on_disk)
+    if absent:
+        problems.append(
+            f"{len(absent)} declared Device_*.yaml document(s) are not in the tree: "
+            f"{', '.join(absent)}"
+        )
+
+    wrong_type = []
+    for name in sorted(declared & on_disk):
+        info = os.lstat(str(commands_dir / name))
+        if not stat.S_ISREG(info.st_mode):
+            wrong_type.append(f"{name} ({stat.filemode(info.st_mode)})")
+    if wrong_type:
+        problems.append(
+            f"{len(wrong_type)} declared document(s) are not regular files: "
+            f"{', '.join(wrong_type)}"
+        )
+
+    # The consuming module may be a root module or a case module, so both locations are searched.
+    # Reading the file rather than importing it keeps this check static and free of import order.
+    suite_dir = commands_dir.parent.parent
+    for name, consumer in sorted(DEVICE_FIXTURE_CONSUMERS.items()):
+        candidates = [suite_dir / f"{consumer}.py", suite_dir / "Testcases" / f"{consumer}.py"]
+        module_path = next((path for path in candidates if path.is_file()), None)
+        if module_path is None:
+            problems.append(
+                f"{name} names consumer {consumer}, but no such module exists beside this suite "
+                "or under Testcases/"
+            )
+            continue
+        if name not in module_path.read_text(encoding="utf-8"):
+            problems.append(
+                f"{name} names consumer {consumer}, but that module does not reference the "
+                "filename - either the fixture was renamed or the consumer stopped posting it"
+            )
+
+    if problems:
+        for problem in problems:
+            log_error(f"✖ {problem}")
+        return False
+
+    log_success(
+        f"✔ every Device_*.yaml document has a declared status: "
+        f"{len(DEVICE_FIXTURE_CONSUMERS)} posted by a verified consumer, "
+        f"{len(DEVICE_FIXTURES_RETAINED)} retained with a recorded reason"
+    )
+    return True
 
 
 def _post_yaml(yaml_name):
@@ -561,7 +792,19 @@ def _get_device_snapshot():
         if not isinstance(result, dict):
             return None
 
+        # success is required, and so is an integer count, because both are what make the
+        # snapshot comparable to another one. A reply that reports success false, or that omits
+        # numberofdevices, is an answer the sweep cannot measure anything against, so it is
+        # reported as NO SNAPSHOT here rather than handed upwards as a snapshot with a hole in
+        # it - which is what let an earlier revision compare -1 against -1 and call that a
+        # steady device count.
+        if result.get("success") is not True:
+            return None
+
         number = result.get("numberofdevices")
+        if not isinstance(number, int):
+            return None
+
         devices = result.get("deviceList", [])
         if not isinstance(devices, list):
             devices = []
@@ -572,11 +815,57 @@ def _get_device_snapshot():
                 if isinstance(la, int):
                     logicals.add(la)
         return {
-            "number": number if isinstance(number, int) else None,
+            "number": number,
             "logicals": logicals,
         }
     except json.JSONDecodeError:
         return None
+
+
+def _wait_for_snapshot(predicate, timeout_seconds):
+    """Poll getDeviceList until a usable snapshot satisfies predicate, bounded by timeout_seconds.
+
+    A BOUNDED POLL, NOT A SLEEP. Both directions of every state change this module observes are
+    discovered by the plugin on its own schedule - a frame has to cross the vComponent, the driver
+    receive callback, the read queue, the read thread and the decoder before a handler runs at all -
+    so a fixed pause is a guess at how long that takes and a poll is a measurement. It returns the
+    instant the wanted state is observed, and on expiry it reports the LAST sample rather than the
+    first, so the diagnostic describes the state the device actually settled in.
+
+    Args:
+        predicate: Callable taking one snapshot mapping and returning True when it is the wanted
+                   state. Pass `lambda snap: True` to wait only for a usable snapshot.
+        timeout_seconds: Poll ceiling in seconds. Never waited out on success.
+    Returns:
+        (True, snapshot) as soon as a usable snapshot satisfies predicate; (False, last) on expiry,
+        where last is the final snapshot taken or None when none was ever usable.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    last = None
+    while True:
+        snapshot = _get_device_snapshot()
+        if snapshot is not None:
+            last = snapshot
+            if predicate(snapshot):
+                return True, snapshot
+        if time.monotonic() >= deadline:
+            return False, last
+        time.sleep(POLL_INTERVAL_S)
+
+
+def _health_check():
+    """True when getDeviceList answers with a usable snapshot within the health budget.
+
+    The liveness probe the sweep is bracketed by. "Usable" is _get_device_snapshot's contract -
+    success true, an integer numberofdevices and a deviceList array - so this asks whether the
+    plugin is still answering the question, and deliberately asserts nothing about the answer:
+    which devices are present depends on the seeded topology and on which flow cases ran before
+    this one.
+    Returns:
+        True when a usable snapshot arrives inside HEALTH_TIMEOUT_S, otherwise False.
+    """
+    healthy, _snapshot = _wait_for_snapshot(lambda snapshot: True, HEALTH_TIMEOUT_S)
+    return healthy
 
 
 def _get_active_source_ok():
@@ -634,18 +923,36 @@ def run_test():
         log_error("TCID33_Process_Yaml_Health_Check Failed: commands directory not found")
         return False
 
-    # rglob so a nested layout is still swept, sorted() so the order is stable and the console
-    # record is diffable. The Process_ prefix confines the sweep to the inbound-handler
-    # documents: the DeviceListConfig/Payload_*.yaml seeding documents share this tree and are
-    # deliberately NOT matched, belonging to the bootstrap module's topology rather than here.
-    yaml_files = sorted(
-        p.relative_to(commands_dir).as_posix()
-        for p in commands_dir.rglob("Process_*.yaml")
-    )
-
-    if not yaml_files:
-        log_error("TCID33_Process_Yaml_Health_Check Failed: no Process_*.yaml files found")
+    # THE SWEEP IS THE APPROVED INVENTORY, VERIFIED AGAINST THE TREE - not whatever the tree
+    # happens to hold. _verify_fixture_inventory compares the two for EQUALITY in both directions,
+    # refuses anything that is not a regular file, and requires every approved document to carry a
+    # declared expectation, so a deleted fixture is a named failure rather than a shorter pass and
+    # an unreviewed one is never posted. The Process_ prefix is what confines the inventory to the
+    # inbound-handler documents: the DeviceListConfig/Payload_*.yaml seeding documents share this
+    # tree and are deliberately outside it, belonging to the bootstrap module's topology.
+    if not _verify_fixture_inventory(commands_dir):
+        log_error("TCID33_Process_Yaml_Health_Check Failed: the fixture inventory is not intact")
         return False
+
+    # The Device_*.yaml half of the same tree. Checked here rather than in a module of its own,
+    # because this is the case that owns the fixture inventory, and checked BEFORE anything is posted
+    # for the same reason the sweep's inventory is: a fixture without a declared status is a defect
+    # in the tree, not in the plugin, and it costs nothing to say so before the device is touched.
+    if not _verify_device_fixture_inventory(commands_dir):
+        log_error(
+            "TCID33_Process_Yaml_Health_Check Failed: a Device_*.yaml document has no declared "
+            "status, or a declared consumer no longer posts it"
+        )
+        return False
+
+    # Sorted, so the posting order is stable and the console record is diffable between runs.
+    discovered = sorted(APPROVED_PROCESS_FIXTURES)
+    log_info(
+        f"Sweeping {len(discovered)} approved inbound-handler fixtures: "
+        f"{len(FIXTURES_THAT_REGISTER_A_DEVICE)} are expected to register their initiator, "
+        f"{len(FIXTURES_THAT_MOVE_ACTIVE_SOURCE)} to move active-source or routing state, and the "
+        "rest are acceptance-only, each with its reason stated as it is posted"
+    )
 
     # Re-establish the known topology before measuring anything. Its root emulated peer is the
     # audio system at logical address 5, physical address 2.0.0.0, carrying seven ports with the
@@ -679,29 +986,56 @@ def run_test():
         f"Pre-sweep: {pre_snapshot['number']} devices at {sorted(pre_snapshot['logicals'])}"
     )
 
-    failures = []
+    # The two verdict ledgers. Both are collected across the WHOLE sweep and reported afterwards
+    # rather than returning on the first one, because a run record naming every fixture that failed
+    # is worth more than one naming the earliest: the sweep is the breadth pass, and "these four
+    # handlers are unreachable" is a different finding from "this one is".
+    failed_posts = []
+    state_check_failures = []
 
     for yaml_name in discovered:
         kinds, reason = FIXTURE_EXPECTATIONS[yaml_name]
         if not _post_yaml(yaml_name):
-            failures.append(f"{yaml_name}: the vComponent refused the post")
+            failed_posts.append(f"{yaml_name}: the vComponent refused the post")
             continue
 
-        if yaml_name in should_touch_device_list:
-            # Longer window for the full pipeline:
-            # vComponent callback → DriverReceiveCallback → rQueue
-            # → read thread → MessageDecoder → HdmiCecSinkProcessor::process() → addDevice()
-            time.sleep(1.5)
-            snap = _get_device_snapshot()
-            if snap is None:
-                state_check_failures.append(f"{yaml_name}: snapshot unavailable")
-            # Note: State-level verification requires special LA injection files;
-            # basic acceptance is validated by successful HTTP 200 response above
+        if yaml_name in FIXTURES_THAT_REGISTER_A_DEVICE:
+            # The registration expectation, DERIVED from the document rather than restated: the
+            # handler calls addDevice(header.from), so the initiator encoded in the fixture's own
+            # payload must appear in getDeviceList afterwards. Bounded-polled over the longer
+            # budget because the frame travels the full pipeline first - vComponent callback →
+            # DriverReceiveCallback → rQueue → read thread → MessageDecoder →
+            # HdmiCecSinkProcessor::process() → addDevice().
+            initiator, why_not = _fixture_initiator(yaml_name)
+            if initiator is None:
+                state_check_failures.append(f"{yaml_name}: {why_not}")
+            else:
+                registered, last = _wait_for_snapshot(
+                    lambda snapshot, address=initiator: address in snapshot["logicals"],
+                    REGISTER_TIMEOUT_S,
+                )
+                if not registered:
+                    observed = (
+                        f"last seen: {sorted(last['logicals'])}" if last is not None
+                        else "getDeviceList never returned a usable snapshot"
+                    )
+                    state_check_failures.append(
+                        f"{yaml_name}: initiator {initiator} did not appear in the device list "
+                        f"within {REGISTER_TIMEOUT_S:.0f}s ({observed})"
+                    )
         else:
-            # Short window for non-state-check YAMLs.
-            time.sleep(0.2)
+            # Nothing to read for this one, so the settle is the short window: the post is the
+            # whole claim, and the reason it is the whole claim is printed beside it rather than
+            # left for a reader to infer from the absence of an assertion.
+            time.sleep(CEC_SHORT_PACING_SECONDS)
+            if "smoke" in kinds:
+                log_info(f"  {yaml_name}: acceptance is the entire claim - {reason}")
 
-        if yaml_name in should_keep_active_source_api_healthy:
+        if yaml_name in FIXTURES_THAT_MOVE_ACTIVE_SOURCE:
+            # An API-health probe rather than a value assertion, for the reason
+            # _get_active_source_ok documents. The settle here is the pipeline window: the routing
+            # and active-source handlers run at the far end of the same path.
+            time.sleep(CEC_PIPELINE_PACING_SECONDS)
             if not _get_active_source_ok():
                 state_check_failures.append(f"{yaml_name}: getActiveSource API unhealthy")
 
@@ -714,8 +1048,12 @@ def run_test():
         log_error("TCID33_Process_Yaml_Health_Check Failed: unable to capture post device snapshot")
         return False
 
-    pre_num = pre_snapshot["number"] if isinstance(pre_snapshot["number"], int) else -1
-    post_num = post_snapshot["number"] if isinstance(post_snapshot["number"], int) else -1
+    # Both counts are integers by _get_device_snapshot's contract - a reply without an integer
+    # numberofdevices is no snapshot at all and was reported as such above - so no substitute value
+    # is needed or wanted here. An earlier revision defaulted each side to -1, which made an
+    # omission on both sides compare equal and pass the direction check below.
+    pre_num = pre_snapshot["number"]
+    post_num = post_snapshot["number"]
     log_info(f"Device count pre={pre_num} post={post_num}")
 
     if failed_posts:
@@ -728,26 +1066,33 @@ def run_test():
         log_error("TCID33_Process_Yaml_Health_Check Failed")
         return False
 
-    log_info("Non-observable handlers (event-only/outbound-only) remain acceptance-based in this TC.")
-    log_info("For strict proof, add implementation counters or parse plugin logs per handler.")
+    # Restated at the end of the transcript, because a reader who only sees the summary should not
+    # infer more than was claimed: for the acceptance-only fixtures the handler's whole effect is an
+    # outbound CEC frame or a Thunder notification, and a one-shot curl exchange can observe
+    # neither. That is a property of THIS transport, not a gap in what was checked - the same
+    # handlers are asserted directly by the plugin's own L1 and L2 suites, which can subscribe to a
+    # notification and can read the mock's outbound queue.
+    log_info(
+        f"{len(discovered) - len(FIXTURES_THAT_REGISTER_A_DEVICE)} of {len(discovered)} fixtures "
+        "were acceptance-only over this transport; each reason was printed as the fixture was "
+        "posted"
+    )
 
     # DIRECTION, never magnitude. The count depends on the seeded topology and on which flow
     # cases ran before this one, so any fixed number written here would be wrong. What a sweep of
     # inbound handlers must not do is LOSE devices: a count that grew is the legitimate result of
-    # registering peers, a count that fell means the runtime went unstable under the sweep. Both
-    # snapshots read -1 when the plugin omits the count, so an omission on both sides is not
-    # mistaken for a regression.
+    # registering peers, a count that fell means the runtime went unstable under the sweep.
     if post_num < pre_num:
         log_warning("Post device count lower than pre-count; treating as unstable runtime")
         log_error("TCID33_Process_Yaml_Health_Check Failed")
         return False
 
     elapsed_time = time.perf_counter() - start_time
-    msg = f"TCID33_Process_Yaml_Health_Check Passed ✅ ({len(yaml_files)} process YAMLs posted + observable checks)"
-    if os.environ.get("HDMICEC_TIMING_ENABLED"):
-        log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-    else:
-        log_success(msg)
+    log_success(log_with_timing(
+        f"TCID33_Process_Yaml_Health_Check Passed ✅ ({len(discovered)} process YAMLs posted + "
+        "observable checks)",
+        elapsed_time,
+    ))
     return True
 
 

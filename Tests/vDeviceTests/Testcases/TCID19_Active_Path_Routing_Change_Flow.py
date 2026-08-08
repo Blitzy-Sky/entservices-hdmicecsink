@@ -252,29 +252,11 @@ def _published_request(argv):
     return decoded
 
 
-def _acknowledged(response, label):
-    '''True when a raw reply is a JSON-RPC result reporting success; logs the reason when not.
-
-    The envelope is proven to be a mapping before any member is read, so a body that parses to a
-    list or a scalar is reported rather than raising AttributeError out of run_test().
-    '''
-    if not response:
-        log_error(f"✖ {label} command not sent")
-        return False
-    if response.startswith("< No response"):
-        log_error(f"✖ no response from WPEFramework for {label}")
-        return False
-    try:
-        envelope = json.loads(response)
-    except json.JSONDecodeError:
-        log_error(f"✖ {label} reply is not valid JSON")
-        return False
-    result = envelope.get("result") if isinstance(envelope, dict) else None
-    if not isinstance(result, dict) or result.get("success") is not True:
-        log_error(f"✖ {label} did not acknowledge success: {response}")
-        return False
-    log_success(f"✔ {label} acknowledged")
-    return True
+# _acknowledged() is defined once, below run_test()'s helpers, and every caller in this module -
+# cleanup() included - resolves it at call time. A second definition used to sit here as well;
+# because a module body executes top to bottom, the later definition bound the name and this one
+# never ran, so the two could drift apart unnoticed. The surviving definition is the one that was
+# already in force at runtime, so removing the shadowed copy changes no behaviour.
 
 
 # The route block observed before this case arranged anything, handed to cleanup().
@@ -541,7 +523,7 @@ def run_test():
     ):
         log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
         return False
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     cleared = _probe_route("after clearing the active source")
     if cleared is None:
@@ -578,7 +560,7 @@ def run_test():
     ):
         log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
         return False
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     after_path = _probe_route("after setActivePath")
     if after_path is None:
@@ -609,7 +591,7 @@ def run_test():
     ):
         log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
         return False
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     on_tv = _probe_route("after routing to the television")
     if on_tv is None:
@@ -648,7 +630,7 @@ def run_test():
     ):
         log_error("TCID19_Active_Path_Routing_Change_Flow Failed ❌")
         return False
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     between_inputs = _probe_route("after routing between HDMI inputs")
     if between_inputs is None:
@@ -684,11 +666,11 @@ def run_test():
     log_info("Emulating peer-driven routing traffic towards the sink")
 
     ok1 = _post_hdmicec("Process_Routing_Change.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
     ok2 = _post_hdmicec("Process_Routing_Information.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
     ok3 = _post_hdmicec("Process_Set_Stream_Path.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     # All three are REQUIRED, and the check comes after all three rather than between them: a
     # missing document or a refused path returns (0, diagnostic) from send_vcomponent_command, so
@@ -721,11 +703,7 @@ def run_test():
     )
 
     elapsed_time = time.perf_counter() - start_time
-    msg = "TCID19_Active_Path_Routing_Change_Flow Passed ✅"
-    if os.environ.get("HDMICEC_TIMING_ENABLED"):
-        log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-    else:
-        log_success(msg)
+    log_success(log_with_timing("TCID19_Active_Path_Routing_Change_Flow Passed ✅", elapsed_time))
     return True
 
 

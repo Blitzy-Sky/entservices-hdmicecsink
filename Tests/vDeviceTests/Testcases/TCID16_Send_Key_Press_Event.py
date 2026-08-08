@@ -81,6 +81,51 @@ from utils import (
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
 
+def _result_object(response_text):
+    """Return the JSON-RPC result mapping from a response body, or an empty mapping.
+
+    A JSON-RPC error envelope carries "error" instead of "result", and a malformed body could
+    carry a non-object "result" or not be an object at all. Every such case collapses to {} so
+    the caller reports a MISSING FIELD rather than raising AttributeError out of run_test(). A
+    body that is not JSON at all still raises json.JSONDecodeError, which run_test() handles as
+    the documented failure. Three call sites share this, which is why it is factored out.
+    Args:
+        response_text: Raw response string as returned by utils.send_curl_command
+    Returns:
+        The "result" mapping when the body is a JSON object carrying one, otherwise {}.
+    """
+    body = json.loads(response_text)
+    if not isinstance(body, dict):
+        return {}
+    result = body.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+def _device_inventory():
+    '''Return (readable, count, sorted_logical_addresses) from the published getDeviceList method.
+
+    readable is False when the reply could not be read as a JSON-RPC result reporting success,
+    which is deliberately distinct from an empty inventory.
+    '''
+    response = send_curl_command(HdmiCecSinkApis.get_device_list)
+    if not response or response.startswith("< No response"):
+        return False, None, None
+    try:
+        result = _result_object(response)
+    except json.JSONDecodeError:
+        return False, None, None
+    if result.get("success") is not True:
+        return False, None, None
+    device_list = result.get("deviceList")
+    if not isinstance(device_list, list):
+        return False, None, None
+    addresses = sorted(
+        device["logicalAddress"]
+        for device in device_list
+        if isinstance(device, dict) and isinstance(device.get("logicalAddress"), int)
+    )
+    return True, result.get("numberofdevices"), addresses
+
 def run_test():
     '''Dispatch one sendKeyPressEvent call and verify the success acknowledgement.
     Returns:

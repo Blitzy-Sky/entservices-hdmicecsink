@@ -239,11 +239,7 @@ def run_test():
         # requiring True is measured.
         if after_result.get("success") is True and isinstance(connected_after, bool):
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID22_System_Audio_Mode_Flow Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID22_System_Audio_Mode_Flow Passed ✅", elapsed_time))
             return True
 
         log_warning(f"Actual  : {after}")

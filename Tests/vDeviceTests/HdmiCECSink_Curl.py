@@ -255,9 +255,12 @@ set_active_source = [
 #     every other address gets OnDeviceAdded alone.
 #
 # Other logical addresses ARE occupied in this topology - the DeviceListConfig/ payloads seed
-# peers as initiators 1, 3, 4, 5, 10 and 11, so a command sent to 4 (SONY, PlaybackDevice) would
-# reach a real peer once Init_Devicelist_Populate.py has injected its ReportPhysicalAddress
-# document. Address 5 is preferred because it needs no such injection to be there.
+# peers as initiators 1 (DENON), 2 (LG), 3 (SAMSUNG), 4 (SONY), 5 (YAMAHA) and 8 (PANASONIC), so a
+# command sent to 4 would reach a real peer once Init_Devicelist_Populate.py has injected its
+# ReportPhysicalAddress document. Address 5 is preferred because it needs no such injection to be
+# there. Every address in that list is fixed by Device_Config_Add_Network.yaml together with the
+# vComponent's per-role address pools, and Init_Devicelist_Populate.verify_topology_consistency()
+# is what keeps this comment and those documents from drifting apart.
 send_key_press_event = [
     "curl",
     "--max-time", "5",

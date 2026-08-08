@@ -51,7 +51,6 @@
 """
 
 import time
-import os
 import json
 from utils import (
     send_curl_command,
@@ -122,11 +121,7 @@ def run_test():
             and vendor_id != ""
         ):
             elapsed_time = time.perf_counter() - start_time
-            msg = "TCID04_Get_Vendor_ID Passed ✅"
-            if os.environ.get("HDMICEC_TIMING_ENABLED"):
-                log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-            else:
-                log_success(msg)
+            log_success(log_with_timing("TCID04_Get_Vendor_ID Passed ✅", elapsed_time))
             return True
 
         log_warning("Expected: result.success True and a non-empty string result.vendorid")

@@ -259,11 +259,7 @@ def run_test():
 
     if flow_ok and cleanup_ok:
         elapsed_time = time.perf_counter() - start_time
-        msg = "TCID21_ARC_Termination_Flow Passed ✅"
-        if os.environ.get("HDMICEC_TIMING_ENABLED"):
-            log_success(f"{msg} time consumed: {elapsed_time:.3f}s")
-        else:
-            log_success(msg)
+        log_success(log_with_timing("TCID21_ARC_Termination_Flow Passed ✅", elapsed_time))
         return True
 
     log_error("TCID21_ARC_Termination_Flow Failed ❌")
@@ -336,7 +332,6 @@ def _run_arc_termination_flow():
         "  gate arm A (header 0x5F, broadcast destination) injected; expected to be discarded "
         f"by the handler - post accepted: {ok_broadcast}"
     )
-    return True, result.get("numberofdevices"), addresses
 
     # The verdict on that delivery is deliberately NOT taken here. ACT 3 below is the disable that
     # makes the TCID20/TCID21 pair state-neutral, and returning before it would leak an enabled ARC
@@ -354,11 +349,24 @@ def _run_arc_termination_flow():
     if not curl_response:
         log_error("✖ setupArcRouting disable command not sent")
         return False
-    if response.startswith("< No response"):
+    if curl_response.startswith("< No response"):
         log_error("✖ setupArcRouting disable returned no response from WPEFramework")
         return False
     log_success("✔ curl command sent")
     log_warning(f"Response: {curl_response}")
+
+    # The deferred delivery verdict from ACT 1, taken here for the same reason as ACT 2's below:
+    # ACT 1's comment declares this post REQUIRED rather than advisory - it is the only frame in
+    # this case that clears both arms of the gate and so the only one that represents an actual
+    # termination - and taking the verdict before the disable had been issued would leave an
+    # enabled ARC behind for every case that follows.
+    if not ok_positive:
+        log_error(
+            "✖ the positive <Terminate ARC> frame was not delivered to the bus, so this case "
+            "never exercised a termination at all"
+        )
+        log_error("TCID21_ARC_Termination_Flow Failed ❌")
+        return False
 
     # The deferred delivery verdict from ACT 2, taken now that the disable above has been issued
     # so no path can leak an enabled ARC. It is reported before the unchanged-state reading
@@ -382,7 +390,7 @@ def _run_arc_termination_flow():
     log_warning(f"Final audio connection: {after}")
 
     try:
-        if _result_object(response).get("success") is not True:
+        if _result_object(curl_response).get("success") is not True:
             log_error("✖ setupArcRouting disable did not acknowledge success")
             return False
 
