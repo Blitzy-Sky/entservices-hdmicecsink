@@ -7,21 +7,29 @@
  * @details Drives ONE Audio Return Channel INITIATION end to end and then probes the two arms
  *          of the handler's admission gate with frames engineered to fail exactly one arm
  *          each. Six steps, in this order:
- *            1. before-probe - org.rdk.HdmiCecSink.getAudioDeviceConnectedStatus, read for
- *               context and logged beside the after-probe rather than asserted;
+ *            1. BEFORE-PROBE, ASSERTED - org.rdk.HdmiCecSink.getDeviceList records the discovered
+ *               inventory and org.rdk.HdmiCecSink.getAudioDeviceConnectedStatus must read connected
+ *               True. Both are preconditions of the flow rather than context: without the audio
+ *               system at logical address 5 the admission gate below can never be satisfied, so
+ *               every injection would be discarded unread and the case would pass having exercised
+ *               nothing;
  *            2. ENABLE - org.rdk.HdmiCecSink.setupARCRouting with {"enabled": true}, the sink's
- *               own request to bring ARC up (SetupARCRouting, IHdmiCecSink.h:328);
+ *               own request to bring ARC up (Exchange::IHdmiCecSink::SetupARCRouting);
  *            3. POSITIVE INJECTION - Device_Initiate_Arc.yaml delivers the audio system's
- *               <Initiate ARC> to HdmiCecSinkProcessor::process(const InitiateArc&, const
- *               Header&) at HdmiCecSinkImplementation.cpp:508;
+ *               <Initiate ARC> to HdmiCecSinkProcessor::process(const InitiateArc &, const
+ *               Header &);
  *            4. NEGATIVE ARM A - Device_Initiate_Arc_Broadcast.yaml, same initiator, broadcast
  *               destination;
  *            5. NEGATIVE ARM B - Device_Initiate_Arc_Invalid_Initiator.yaml, directed
  *               destination, wrong initiator;
- *            6. after-probe - the same connected-status read, logged beside the first.
+ *            6. AFTER-PROBE, ASSERTED - connected must still read True, on a bounded poll, and
+ *               getDeviceList must report the same device count and the same set of logical
+ *               addresses as step 1. ARC initiation moves the ARC state machine, not the inventory,
+ *               so a handler that registered a device from a REJECTED frame, or dropped one while
+ *               initiating, fails here.
  *
  *          THE ADMISSION GATE IS WHY THE THREE FIXTURES DIFFER BY ONE BYTE. The handler opens
- *          with a single two-arm rejection at HdmiCecSinkImplementation.cpp:510 -
+ *          with a single two-arm rejection -
  *          `if((!(header.from.toInt() == 0x5)) || (header.to.toInt() ==
  *          LogicalAddress::BROADCAST)) return;` - so an <Initiate ARC> is admitted only when it
  *          comes FROM logical address 5, the audio system, AND is DIRECTED rather than
@@ -84,27 +92,31 @@
  * @expected_result
  *  - setupARCRouting acknowledges the enable request, and the directed <Initiate ARC> frame is
  *    injected and accepted by the emulator.
- *  - The two gate-arm frames are injected and are expected to be DISCARDED by the handler. That
- *    expectation is stated and logged, not asserted, for the reason given in the details
- *    section above.
- *  - THE ARC HANDSHAKE ITSELF IS NOT ASSERTED, because it is not observable from this
- *    transport. A successful initiation publishes arcInitiationEvent (ArcInitiationEvent,
- *    IHdmiCecSink.h:71), a Thunder notification delivered to registered COM-RPC/JSON-RPC
- *    subscribers rather than to a one-shot curl request/response, and no getter on the
- *    interface reports the ARC routing state.
- *  - The ARC state is left ENABLED for TCID21_ARC_Termination_Flow.
+ *  - The two gate-arm frames are injected - their DELIVERY is required - and are expected to be
+ *    DISCARDED by the handler. The discard itself is stated and logged, not asserted, because the
+ *    gate is a bare return that publishes no counter, state or notification.
+ *  - THE ARC HANDSHAKE ITSELF IS NOT ASSERTED, because it is not observable from this transport. A
+ *    successful initiation publishes the arcInitiationEvent notification, delivered to registered
+ *    COM-RPC/JSON-RPC subscribers rather than to a one-shot curl request/response, and no getter on
+ *    the interface reports the ARC routing state.
+ *  - The invariants of step 6 hold: the audio system stays discovered and the device inventory is
+ *    the same count and the same address set observed in step 1.
+ *  - The ARC state is left ENABLED for TCID21_ARC_Termination_Flow, which restores it from both its
+ *    finally block and its cleanup() hook.
  *
  * @pass_criteria
  *  - EVERY vComponent post returns HTTP 200 - the <Initiate ARC> injection and both gate-arm
- *    injections alike - setupARCRouting acknowledges result.success as True, the after-probe
- *    parses with result.success True and a boolean result.connected, and run_test() returns True.
+ *    injections alike - setupARCRouting acknowledges result.success as True, the audio-connected
+ *    flag reads True both before and after the exchange, the device inventory is unchanged across
+ *    it, and run_test() returns True.
  *
  * @failure_criteria
- *  - A request is not dispatched, a response is the no-response sentinel, ANY vComponent post
- *    does not return HTTP 200 - including either gate-arm frame, whose non-delivery would leave
- *    this case claiming to have exercised a rejection arm it never reached - the enable call does
- *    not acknowledge success, the after-probe reports success other than True or a non-boolean
- *    connected, a JSON parsing error occurs, or run_test() returns False.
+ *  - A request is not dispatched, a response is the no-response sentinel, ANY vComponent post does
+ *    not return HTTP 200 - including either gate-arm frame, whose non-delivery would leave this case
+ *    claiming to have exercised a rejection arm it never reached - the enable call does not
+ *    acknowledge success, the audio-connected flag does not read True on either side, the device
+ *    inventory becomes unreadable or changes across the exchange, a JSON parsing error occurs, or
+ *    run_test() returns False.
  */
 """
 
@@ -114,6 +126,7 @@ import json
 from utils import (
     send_curl_command,
     send_vcomponent_command,
+    device_inventory,
     sanitise_for_log,
     HDMICEC_CMD_BASE,
     log_info,
@@ -161,32 +174,6 @@ AUDIO_SYSTEM_LOGICAL_ADDRESS = 5
 # for: each loop leaves on the first satisfying reading and reports honestly on expiry.
 OBSERVE_TIMEOUT_S = 8.0
 OBSERVE_POLL_S = 0.25
-
-
-def _device_inventory():
-    '''Return (readable, count, sorted_logical_addresses) from the published getDeviceList method.
-
-    readable is False when the reply could not be read as a JSON-RPC result reporting success,
-    which is deliberately distinct from an empty inventory.
-    '''
-    response = send_curl_command(HdmiCecSinkApis.get_device_list)
-    if not response or response.startswith("< No response"):
-        return False, None, None
-    try:
-        result = _result_object(response)
-    except json.JSONDecodeError:
-        return False, None, None
-    if result.get("success") is not True:
-        return False, None, None
-    device_list = result.get("deviceList")
-    if not isinstance(device_list, list):
-        return False, None, None
-    addresses = sorted(
-        device["logicalAddress"]
-        for device in device_list
-        if isinstance(device, dict) and isinstance(device.get("logicalAddress"), int)
-    )
-    return True, result.get("numberofdevices"), addresses
 
 
 def _audio_connected():
@@ -237,7 +224,14 @@ def run_test():
     start_time = time.perf_counter()
 
     # ── BEFORE: the invariants this flow must preserve ──────────────────────────────────────────
-    inventory_readable, before_count, before_addresses = _device_inventory()
+    # utils.device_inventory is the suite's ONE reader of the CEC population. This module used
+    # to carry its own copy, which accepted a JSON boolean as a logical address because bool is
+    # a subclass of int - so a peer reported as {"logicalAddress": false} would have been
+    # counted as the television's own address 0. The shared helper refuses that and returns the
+    # addresses as a frozenset, so the comparison below is order-insensitive by construction.
+    inventory_readable, before_count, before_addresses = device_inventory(
+        HdmiCecSinkApis.get_device_list
+    )
     if not inventory_readable:
         log_error("✖ the device inventory could not be read before the ARC exchange")
         log_error("TCID20_ARC_Initiation_Flow Failed ❌")
@@ -262,7 +256,7 @@ def run_test():
         log_error("TCID20_ARC_Initiation_Flow Failed ❌")
         return False
     log_info(
-        f"Before: {before_count} devices at {before_addresses}, audio connected={connected_before}"
+        f"Before: {before_count} devices at {sorted(before_addresses)}, audio connected={connected_before}"
     )
 
     # ── ACT 1 - ENABLE ─────────────────────────────────────────────────────────────────────────
@@ -287,94 +281,6 @@ def run_test():
         return False
     log_warning(f"Response: {curl_response}")
 
-    # ACT 2 - POSITIVE INJECTION, THE ONE POST THIS CASE REQUIRES. Device_Initiate_Arc.yaml
-    # carries payload ["0x50","0xC0"]: header 0x50 is initiator 5 to destination 0, opcode 0xC0
-    # is <Initiate ARC>. That header is the only one of the three fixtures that clears both arms
-    # of the gate at HdmiCecSinkImplementation.cpp:510, so this is the frame that represents an
-    # actual initiation and its post is required rather than advisory. Naming a file that does
-    # not exist would make send_vcomponent_command return (0, "YAML file not found: ..."), which
-    # would otherwise read as a passing ARC case that never injected anything - hence the check.
-    ok_positive = _post_hdmicec("Device_Initiate_Arc.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-
-    if not ok_positive:
-        log_error("✖ required vComponent ARC initiation post failed")
-        return False
-
-    # ACT 3 - THE TWO GATE ARMS. DELIVERY IS REQUIRED; THE HANDLER'S VERDICT IS NOT ASSERTED.
-    #
-    # Each fixture below differs from the positive one in its HEADER BYTE ONLY, so each isolates
-    # a single arm of the rejection at HdmiCecSinkImplementation.cpp:510 with the other arm held
-    # constant. Both are expected to be accepted by the emulator and then discarded by the
-    # handler.
-    #
-    # THE TWO OUTCOMES ARE SEPARATE, AND ONLY ONE OF THEM IS THIS TRANSPORT'S BUSINESS:
-    #   * whether the frame was INJECTED - an HTTP 200 from the vComponent - is a fact about
-    #     delivery, and it is now REQUIRED. A misnamed document, an unreadable fixture or an
-    #     unreachable emulator each return (0, diagnostic) from send_vcomponent_command, and with
-    #     that outcome tolerated this case would report having exercised both gate arms while
-    #     injecting neither frame. Since a frame that never reached the bus also cannot change the
-    #     connected flag, the unchanged-state reading below would hold for the wrong reason - the
-    #     same trap the positive injection above is already guarded against.
-    #   * whether the HANDLER accepted or discarded it is NOT asserted, and that remains the
-    #     honest reporting line of this module. The gate is a bare `return`: it increments no
-    #     counter, changes no state and raises no notification, so a rejection leaves nothing this
-    #     transport can read. Requiring a non-200 would be worse still - it would assert the
-    #     opposite of what should happen, since the emulator is expected to accept a well-formed
-    #     frame regardless of what the plugin then does with it.
-    #
-    # So a 200 required below is evidence that the frame was INJECTED. It is not, and must not be
-    # read as, evidence of an ARC initiation.
-    ok_broadcast = _post_hdmicec("Device_Initiate_Arc_Broadcast.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-    log_info(
-        "  gate arm A (header 0x5F, broadcast destination) injected; expected to be discarded "
-        f"by the handler - post accepted: {ok_broadcast}"
-    )
-
-    ok_invalid_initiator = _post_hdmicec("Device_Initiate_Arc_Invalid_Initiator.yaml")
-    time.sleep(CEC_FRAME_PACING_SECONDS)
-    log_info(
-        "  gate arm B (header 0x40, initiator is not the audio system) injected; expected to be "
-        f"discarded by the handler - post accepted: {ok_invalid_initiator}"
-    )
-
-    if not ok_broadcast:
-        log_error(
-            "✖ the broadcast-destination gate-arm frame was not delivered to the bus, so this "
-            "case cannot claim to have exercised that arm of the rejection"
-        )
-        log_error("TCID20_ARC_Initiation_Flow Failed ❌")
-        return False
-
-    if not ok_invalid_initiator:
-        log_error(
-            "✖ the invalid-initiator gate-arm frame was not delivered to the bus, so this case "
-            "cannot claim to have exercised that arm of the rejection"
-        )
-        log_error("TCID20_ARC_Initiation_Flow Failed ❌")
-        return False
-
-    # After-probe: the same read as the before-probe, so the pair can be compared in the log.
-    after = send_curl_command(HdmiCecSinkApis.get_audio_device_connected_status)
-    if not after:
-        log_error("✖ final getAudioDeviceConnectedStatus command not sent")
-        return False
-    if after.startswith("< No response"):
-        log_error("✖ final getAudioDeviceConnectedStatus returned no response")
-        return False
-    log_warning(f"Final audio connection: {after}")
-
-    # SHARED STATE LEFT BEHIND, ON PURPOSE. A teardown would sit exactly here - the disabling
-    # counterpart of Act 1, setupARCRouting with {"enabled": false}, which HdmiCECSink_Curl.py
-    # publishes as the `false` half of its setup_arc_routing pair - and it is absent by design
-    # rather than by omission. TCID21_ARC_Termination_Flow is the paired consumer that terminates
-    # what this case initiates, and SuitManager.py runs it immediately after this one, so
-    # restoring here would leave that case nothing to terminate and would silently convert it
-    # into a no-op. This module is consequently NOT self-restoring; the ORDERED PAIR is. Do not
-    # add a teardown here without moving the termination coverage somewhere it can still be
-    # reached.
-
     try:
         if _result_object(curl_response).get("success") is not True:
             log_error("✖ setupArcRouting did not acknowledge success")
@@ -386,19 +292,19 @@ def run_test():
         return False
     log_success("✔ setupARCRouting(enabled=true) acknowledged")
 
-    # ── ACT 2 and 3 - EVERY INJECTION IS REQUIRED ──────────────────────────────────────────────
+    # ── ACT 2 - THE ONE ORDERED INJECTION SEQUENCE, EVERY POST REQUIRED ────────────────────────
     # Device_Initiate_Arc.yaml carries ["0x50","0xC0"]: header 0x50 is initiator 5 to destination 0,
     # opcode 0xC0 is <Initiate ARC>. That header is the only one of the three that clears both arms
-    # of the gate at HdmiCecSinkImplementation.cpp:510, so it represents an actual initiation.
+    # of the gate in process(const InitiateArc &, const Header &), so it represents an actual
+    # initiation.
     #
     # The other two differ from it in the HEADER BYTE ONLY, each isolating one arm of that gate with
     # the other held constant: 0x5F is broadcast-destination, 0x40 has an initiator that is not the
-    # audio system. An earlier revision posted them WITHOUT requiring the post to succeed, on the
-    # grounds that the handler's rejection is unobservable. The rejection is indeed unobservable -
-    # the gate is a bare return - but whether the frame was DELIVERED is not, and that is what a
-    # 200 asserts. A silently missing fixture would otherwise leave a green ARC case that injected
-    # nothing, which is precisely the failure being fixed here. So all three posts are required,
-    # and each is checked where it is made so a refusal names the document that was refused.
+    # audio system. Their REJECTION is unobservable - the gate is a bare return, publishing no
+    # counter, state or notification - but their DELIVERY is, and that is what a 200 asserts. Without
+    # it a silently missing fixture would leave a green ARC case that injected nothing. So all three
+    # posts are required, and each is checked where it is made so a refusal names the document that
+    # was refused.
     for yaml_name, description in (
         ("Device_Initiate_Arc.yaml", "the admitted <Initiate ARC> from the audio system"),
         ("Device_Initiate_Arc_Broadcast.yaml", "gate arm A: broadcast destination"),
@@ -409,6 +315,9 @@ def run_test():
             log_error("TCID20_ARC_Initiation_Flow Failed ❌")
             return False
         log_success(f"✔ delivered {description}")
+        # The suite's fixed cadence between injected frames: the sink processes each on its own
+        # listener thread, and the ordered arms must not overtake one another on the bus.
+        time.sleep(CEC_FRAME_PACING_SECONDS)
 
     # ── AFTER: the invariants must still hold ──────────────────────────────────────────────────
     # The two rejected frames must change nothing, and the admitted one must not disturb the device
@@ -424,7 +333,9 @@ def run_test():
         log_error("TCID20_ARC_Initiation_Flow Failed ❌")
         return False
 
-    after_readable, after_count, after_addresses = _device_inventory()
+    after_readable, after_count, after_addresses = device_inventory(
+        HdmiCecSinkApis.get_device_list
+    )
     if not after_readable:
         log_error("✖ the device inventory became unreadable after the ARC exchange")
         log_error("TCID20_ARC_Initiation_Flow Failed ❌")
@@ -432,12 +343,13 @@ def run_test():
     if (after_count, after_addresses) != (before_count, before_addresses):
         log_error(
             f"✖ the ARC exchange disturbed the device inventory: "
-            f"{before_count}/{before_addresses} -> {after_count}/{after_addresses}"
+            f"{before_count}/{sorted(before_addresses)} -> "
+            f"{after_count}/{sorted(after_addresses)}"
         )
         log_error("TCID20_ARC_Initiation_Flow Failed ❌")
         return False
     log_success(
-        f"✔ invariants hold: {after_count} devices at {after_addresses}, audio connected=True"
+        f"✔ invariants hold: {after_count} devices at {sorted(after_addresses)}, audio connected=True"
     )
 
     elapsed_time = time.perf_counter() - start_time
@@ -445,21 +357,29 @@ def run_test():
     return True
 
 
-# THE RESTORE IS THE PAIR'S, AND IT IS GUARANTEED RATHER THAN HOPED FOR.
+# THE RESTORE IS THE PAIR'S, AND IT IS NOW CHECKED RATHER THAN ASSERTED.
 #
 # A teardown would sit exactly here - setupARCRouting with {"enabled": false}, which
 # HdmiCECSink_Curl.py publishes as the `false` half of its setup_arc_routing pair - and it is absent
 # by design. TCID21_ARC_Termination_Flow is the paired consumer that terminates what this case
 # initiates; disabling ARC here would leave that case nothing to terminate and silently convert it
-# into a no-op.
+# into a no-op. SuitManager runs each case's cleanup() immediately after that case, so a hook here
+# would fire BEFORE TCID21 ever ran - which is why the deferral is real and not laziness.
 #
-# What makes the pair reliable rather than merely ordered: the restore lives in TCID21's cleanup()
-# hook, and SuitManager runs cleanup() for every registered case unconditionally - INCLUDING a case
-# it skipped because its producer failed. So if this initiation fails and TCID21 never runs as a
-# test, ARC is still disabled afterwards. The dependency is declared in
-# SuitManager.TEST_DEPENDENCIES rather than left to registration order alone.
+# What used to make the pair "reliable" was this paragraph asserting that the restore "lives in
+# TCID21's cleanup() hook". It did not: TCID21 published no cleanup() at all, so
+# getattr(module, "cleanup", None) returned None and SuitManager had nothing to run. The one path
+# the argument depended on - this initiation failing, TCID21 being SKIPPED for an unmet dependency,
+# and its run_test() finally clause therefore never executing - left ARC ENABLED for every case
+# that follows while two files said the opposite.
+#
+# The deferral is now DECLARED, in the machine-readable form below, and SuitManager validates it
+# before the device is touched: the named restorer must be registered, must publish a callable
+# cleanup(), and must run after this case. A missing hook is a registration failure with a
+# diagnostic, not a comment that has quietly stopped being true.
+RESTORED_BY = "TCID21_ARC_Termination_Flow"
 #
 # The initial ARC state needs no capture: m_currentArcRoutingState is ARC_STATE_ARC_TERMINATED from
-# construction (:635), Init_Devicelist_Populate does not touch ARC, and no case registered before
-# this one calls setupARCRouting - so "terminated" is the state at entry by construction, which is
-# exactly what TCID21's cleanup() re-establishes.
+# construction, Init_Devicelist_Populate does not touch ARC, and no case registered before this one
+# calls setupARCRouting - so "terminated" is the state at entry by construction, which is exactly
+# what TCID21's finally block and cleanup() hook re-establish.

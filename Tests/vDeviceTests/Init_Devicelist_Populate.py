@@ -17,8 +17,9 @@
  *          TOPOLOGY ORIENTATION - the single thing most easily got wrong in this directory.
  *          The device under test is the SINK: the television itself, which owns CEC logical
  *          address 0. Every peer configured and seeded below is therefore a SOURCE-role
- *          device sitting beneath that television - an audio system, two playback devices, a
- *          tuner and a recording device. No virtual television is created here and no
+ *          device sitting beneath that television - one audio system, two playback devices, one
+ *          tuner and two recording devices, six in all. No virtual television is created here
+ *          and no
  *          TV-rooted network is posted. That shape belongs to the source plugin's suite,
  *          whose device under test is a source and whose emulated root is consequently a TV.
  *
@@ -154,12 +155,12 @@ BOOTSTRAP_RPA_YAML = next(
 # must equal the initiator nibble of all three payloads' header bytes, and the expected vendor
 # identifier must equal the three operand bytes of the DeviceVendorID payload - otherwise the
 # frames register one address while the verification looks for another, and the peer silently
-# never verifies. That is exactly what had happened to PANASONIC: it was seeded at address 8
-# while all three of its payloads carried initiator 0xB (address 11) and declared it a Tuner at
-# port 6, which is also what Device_Config_Add_Network.yaml declares. Address 8 is Playback
-# Device 2, not a tuner, so the address was the wrong one of the three: PANASONIC is now seeded
-# at 6 - Tuner 2, since Tuner 1 at address 3 is taken by SAMSUNG - and its payload headers were
-# changed to match (0x6F broadcast, 0x60 directed to the television).
+# never verifies, because a wait for an address nothing announced can only time out. Three
+# statements have to agree for every peer: this table, the peer's three payload documents, and
+# the network declaration in Device_Config_Add_Network.yaml. Where they disagree, the network
+# declaration wins - it is what the emulator allocates addresses from - and
+# verify_topology_consistency() is what proves the other two still match it before the first
+# frame is injected.
 #
 # THIS TABLE IS DERIVED FROM ONE AUTHORITATIVE TOPOLOGY AND MUST MATCH IT EXACTLY. The
 # emulated network is declared in vcomponent_configurations/commands/Device_Config_Add_Network.yaml,
@@ -209,13 +210,12 @@ PEER_SEEDS = (
     # per role, so RecordingDevice draws from (1, 2, 9), Tuner from (3, 6, 7, 10), PlaybackDevice
     # from (4, 8, 11) and AudioSystem has exactly one address, 5.
     #
-    # AN EARLIER REVISION OF THIS TABLE HAD DRIFTED FROM THAT TREE and the drift was silent in
-    # both directions: DENON was seeded at 2, SONY at 9, PANASONIC at 11 and LG at 10, so four of
-    # the six peers announced one address while the verification waited for another - a wait that
-    # simply times out - and LG additionally carried five fields where every consumer unpacks six,
-    # which made verify_seed_payload_consistency() raise before it could report anything at all.
-    # The entries are now generated from the tree above, and verify_topology_consistency() proves
-    # the payload documents still agree with it.
+    # EVERY ENTRY IS DERIVED FROM THE TREE ABOVE, and every entry carries SIX fields because that
+    # is what each consumer unpacks - a five-field entry makes verify_seed_payload_consistency()
+    # raise before it can report anything. Drift between this table and the tree is silent in both
+    # directions: a peer seeded at one address while its payloads announce another announces one
+    # address while the verification waits for a different one, and that wait can only time out.
+    # verify_topology_consistency() is the check that keeps the two in step.
     #
     # ADDRESSING CONTRACT for the referenced payload documents: see the note above this table.
     #
@@ -300,12 +300,11 @@ BOOTSTRAP_CEC_VERSION_YAML = "DeviceListConfig/Payload_CECVersion.yaml"
 # occupy beneath the sink television.
 NETWORK_CONFIG_YAML = "Device_Config_Add_Network.yaml"
 
-# No secondary seed path is declared here, and that is deliberate rather than an omission. A
-# tuple of Device_Give_*.yaml documents used to sit at this point and was posted when the
-# injected triplet had not produced the address. Those documents are directed requests TO the
-# television - header 0x50, initiator 5, destination 0 - so they ask the device under test for
-# its own details and can never make a peer appear. The reasoning is recorded in full at the
-# point where the ladder was removed, in the bootstrap seed loop below.
+# No secondary seed path is declared here, and that is deliberate rather than an omission. Do NOT
+# add a tuple of Device_Give_*.yaml documents to be posted when the injected triplet has not
+# produced the address: those documents are directed requests TO the television - header 0x50,
+# initiator 5, destination 0 - so they ask the device under test for its own details and can never
+# make a peer appear. The reasoning is recorded in full at the bootstrap seed loop below.
 
 # How long the middleware's own poll-based discovery is given before seeding begins, and how
 # often it is sampled while waiting.
@@ -357,12 +356,12 @@ MIN_DEVICES_ENV = "Init_Devicelist_Populate_MIN_DEVICES"
 # The ONLY accepted spellings for the strict gate, compared case-insensitively after stripping
 # surrounding whitespace.
 #
-# The previous test was `os.environ.get(STRICT_MULTI_ENV, "0") == "1"`, and its failure mode was
-# the dangerous direction: any value that was not exactly "1" - "true", "yes", "ON", " 1", or a
-# plain typo - silently selected the LENIENT mode. An operator who believed strict checking was
-# on would have got a bootstrap-mode pass in which every peer shortfall is a note rather than a
-# failure, and nothing in the output would have said so. A gate that can be disabled by a typo
-# is not a gate, so an unrecognised value is now refused by name instead of being interpreted.
+# AN UNRECOGNISED VALUE IS REFUSED BY NAME RATHER THAN INTERPRETED, and the asymmetry is why. A
+# test such as `os.environ.get(STRICT_MULTI_ENV, "0") == "1"` fails in the dangerous direction:
+# "true", "yes", "ON", " 1" and any typo all select the LENIENT mode, so an operator who believed
+# strict checking was on would get a bootstrap-mode pass in which every peer shortfall is a note
+# rather than a failure, with nothing in the output saying so. A gate that a typo can disable is
+# not a gate.
 _TRUE_SPELLINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_SPELLINGS = frozenset({"0", "false", "no", "off"})
 
@@ -408,14 +407,14 @@ def _post(yaml_name):
     return http_code == 200
 
 
-# The two gate resolvers used to exist twice in this module, in two different shapes: an early
-# pair returning `value or None` and a later pair returning `(ok, value)`.  Python bound the
-# name to the LATER definition, so the early pair was dead and the two early call sites were
-# reading a 2-tuple as a bool - which made strict mode unconditionally on - and calling
-# _resolve_min_devices with no argument, which its live signature does not accept.  The early
-# pair is removed rather than the later one: the later pair validates everything the early pair
-# did, additionally handles the empty-string spelling and the strict-mode interaction, and is
-# what the module's own Step 3 call sites already use.  Both call sites now use that one shape.
+# EACH GATE RESOLVER IS DEFINED EXACTLY ONCE, AND RETURNS `(ok, value)`.  Do not add a second
+# definition of either name in another shape.  Python binds a name to the LAST definition, so a
+# duplicate silently wins and every caller written against the other shape misreads it: a caller
+# reading a 2-tuple as a bool sees it as always truthy, which would turn strict mode
+# unconditionally on, and a caller invoking _resolve_min_devices with no argument does not match
+# this signature at all.  The `(ok, value)` shape is the one to keep: it validates what a
+# `value or None` shape does, and additionally handles the empty-string spelling and the
+# strict-mode interaction.  Every call site in this module uses that one shape.
 
 
 
@@ -638,12 +637,26 @@ def _wait_for_device_list_to_settle(timeout_s=4.0, reread_interval_s=0.4, settle
     that is already stable costs one request; reread_interval_s is the interval between two
     readings of that observable state, and timeout_s is a failure deadline that is returned rather
     than hidden.
+
+    The deadline is MONOTONIC, the per-request budget is what remains of it, and the poll sleep is
+    capped by it - the same three properties as _wait_for_device and _wait_for_la above, and for
+    the same reasons. This helper had none of them: it measured with time.time(), so a clock step
+    could extend or expire the wait arbitrarily; it handed each request the full default transport
+    budget, so one slow read could outlive the whole 4 second deadline; and it consulted the
+    deadline only BETWEEN polls, so the advertised timeout was notional. It is the settle gate in
+    front of every seeding step, so an overrun here is charged to every case that follows.
     """
-    deadline = time.time() + timeout_s
+    deadline = time.monotonic() + timeout_s
     previous = None
     stable = 0
+    attempted = False
     while True:
-        result = _get_device_list()
+        remaining = deadline - time.monotonic()
+        if attempted and remaining < _MIN_REQUEST_BUDGET_SECONDS:
+            return False
+
+        attempted = True
+        result = _get_device_list(timeout=max(1, int(remaining)))
         if result and result.get("success") is True:
             current = sorted(_build_la_map(result.get("deviceList", [])).keys())
             if previous is not None and current == previous:
@@ -653,9 +666,10 @@ def _wait_for_device_list_to_settle(timeout_s=4.0, reread_interval_s=0.4, settle
             else:
                 stable = 0
             previous = current
-        if time.time() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return False
-        time.sleep(reread_interval_s)
+        time.sleep(min(reread_interval_s, remaining))
 
 
 def _seed_device(la, expected_name, rpa_yaml, osd_yaml, vid_yaml, attempts=3):
@@ -1168,7 +1182,13 @@ def run_test():
         )
         return False
 
-    time.sleep(1)
+    # NO FIXED PAUSE HERE.  A literal time.sleep(1) used to sit at this point, waiting for
+    # nothing nameable: the state it was covering for - the middleware's poll thread having
+    # discovered its peers - is observable through getDeviceList, and the loop immediately below
+    # polls exactly that against a monotonic deadline, reading before it waits.  So the second
+    # was spent whether or not it was needed, and when it was not enough the loop below covered
+    # the difference anyway.  Removing it makes the wait entirely condition-driven and gives the
+    # discovery window back its full budget.
 
     # ── Step 2: inject CEC payload frames ────────────────────────────────────
     log_info(
@@ -1239,16 +1259,15 @@ def run_test():
                 break
 
             # NO SECONDARY SEED PATH HERE, AND THAT IS THE DECISION RECORDED AT THE CONSTANT
-            # BLOCK ABOVE, NOT AN OMISSION.  A ladder that posted the Device_Give_*.yaml
-            # documents used to sit at this point.  Those documents are directed requests TO the
-            # television - header 0x50, initiator 5, destination 0 - so they ask the DEVICE UNDER
-            # TEST for its own physical address, OSD name and vendor id.  Nothing in that exchange
-            # can make a PEER appear in the device list, which is the only thing this loop is
-            # trying to achieve, so the ladder could never do what its own log line claimed and
-            # only lengthened each failing attempt by three posts and their pacing.  It was
-            # removed with the tuple that named it; this note replaces it so a reader does not
-            # reintroduce it.  What remains is the injected triplet above, retried
-            # MAX_SEED_ATTEMPTS times, which announces the peer as the peer itself would.
+            # BLOCK ABOVE, NOT AN OMISSION.  Do NOT add a ladder that posts the Device_Give_*.yaml
+            # documents at this point.  Those documents are directed requests TO the television -
+            # header 0x50, initiator 5, destination 0 - so they ask the DEVICE UNDER TEST for its
+            # own physical address, OSD name and vendor id.  Nothing in that exchange can make a
+            # PEER appear in the device list, which is the only thing this loop is trying to
+            # achieve, so such a ladder cannot do what it would appear to do and would only
+            # lengthen each failing attempt by three posts and their pacing.  What belongs here is
+            # the injected triplet above, retried MAX_SEED_ATTEMPTS times, which announces the peer
+            # as the peer itself would.
         else:
             log_error(
                 "Init_Devicelist_Populate Failed ❌: middleware did not learn "

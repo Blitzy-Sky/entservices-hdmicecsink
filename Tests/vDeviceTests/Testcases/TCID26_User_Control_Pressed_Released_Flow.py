@@ -162,12 +162,12 @@ def _result_object(response_text):
 # Process_User_Control_Pressed and Process_User_Control_Released, header 0x40, initiator 4 -
 # and the sink handlers would accept either, because process(UserControlPressed) and
 # process(UserControlReleased) apply no destination filter. So this is a genuine choice, and
-# it is settled by the topology rather than by taste: Init_Devicelist_Populate seeds the
-# audio system at logical address 5 as this suite's bootstrap peer, and HdmiCECSink_Curl.py
-# records that logical address 4 has no peer in that topology. Injecting from 5 therefore
-# models a frame from a peer that actually exists and matches the address the outbound
-# constants target, which keeps both legs of this flow describing one conversation with one
-# device. Injecting from 4 would model a frame from nothing.
+# it is settled by the topology rather than by taste: Init_Devicelist_Populate seeds the audio
+# system at logical address 5 as this suite's bootstrap peer, and the sink's outbound key-event
+# constants in HdmiCECSink_Curl.py target that same address. Injecting from 5 therefore keeps
+# both legs of this flow describing one conversation with one device. Address 4 also holds a
+# seeded peer - the SONY playback device - so a frame from 4 would be legitimate too; it would
+# simply describe a second device, which is not what this sweep is comparing.
 #
 # One family is used throughout for that reason. Do not mix the two sets below: the point of
 # the sweep is that the three documents differ ONLY in their key-code operand, so changing
@@ -511,8 +511,8 @@ def _run_user_control_flow():
     # ── THE OUTBOUND TARGET, DERIVED FROM THE CONSTANTS THIS MODULE SENDS ────────────────────────
     # Both constants must name the same logical address, or the release would not close the press.
     # The value is read out of the constants rather than written here, so it cannot drift from
-    # them, and the topology is then required to actually contain that peer - which is the
-    # precondition this module's commentary describes in prose and previously never checked.
+    # them, and the topology is then required to actually contain that peer - the precondition this
+    # module's commentary describes in prose, checked rather than assumed.
     targets = {}
     for argv, label in (
         (HdmiCecSinkApis.send_user_control_pressed, "sendUserControlPressed"),
@@ -639,14 +639,13 @@ def _run_user_control_flow():
         log_success(f"✔ delivered the press carrying {description} and the release closing it")
 
     # ── CLOSING OBSERVATION - AN INVARIANT, NOT A LIVENESS CHECK ─────────────────────────────────
-    # An earlier revision read getDeviceList here purely as liveness and declined to compare the
-    # count, on the grounds that "asserting a direction would be a guess". Equality is not a guess:
-    # neither process(UserControlPressed) nor process(UserControlReleased) calls addDevice or
-    # touches deviceList at all (HdmiCecSinkImplementation.cpp:295-305), and every injected frame
-    # initiates from an address the suite already seeded, so the inventory MUST be identical. That
-    # makes this a real invariant - six frames that added, dropped or renumbered a peer would be a
-    # genuine regression - and it is polled on a bounded monotonic budget so a busy plugin is
-    # waited for rather than raced.
+    # Equality, not liveness, and not a guess at a direction: neither
+    # HdmiCecSinkProcessor::process(const UserControlPressed &, const Header &) nor its
+    # UserControlReleased counterpart calls addDevice or touches deviceList at all, and every
+    # injected frame initiates from an address the suite already seeded, so the inventory MUST be
+    # identical. That makes this a real invariant - six frames that added, dropped or renumbered a
+    # peer would be a genuine regression - and it is polled on a bounded monotonic budget so a busy
+    # plugin is waited for rather than raced.
     log_info("Reading the device list as the closing inventory invariant")
     deadline = time.monotonic() + OBSERVE_TIMEOUT_S
     while True:

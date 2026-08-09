@@ -37,10 +37,14 @@
  *  - The dump itself lands in the plugin log and is not inspected by this testcase.
  *
  * @pass_criteria
- *  - result.success is True, result.printed is a boolean, and run_test() returns True.
+ *  - result.success is True, result.printed is exactly True, and run_test() returns True.
+ *    PrintDeviceList assigns both members true unconditionally
+ *    (HdmiCecSinkImplementation.cpp:1446-1452), so True is the only value either can legally
+ *    carry and requiring it is a measured claim rather than an optimistic one.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - An empty or sentinel response, a body that is not a JSON object, success not True, printed
+ *    missing or anything other than True, a JSON parsing error, or run_test() returns False.
  */
 """
 
@@ -49,6 +53,7 @@ import time
 import json
 from utils import (
     send_curl_command,
+    sanitise_for_log,
     log_info,
     log_success,
     log_error,
@@ -92,12 +97,30 @@ def run_test():
             result = {}
         has_success = result.get("success") is True
 
-        # printed is TYPE-asserted rather than required to be True: it is the plugin's own
-        # report of whether it dumped, and it is reported even when the device list holds no
-        # present device, so a True value would attest to nothing this case can verify.
+        # BOTH MEMBERS ARE REQUIRED TO BE EXACTLY True, and that is a measured claim rather than
+        # an optimistic one. HdmiCecSinkImplementation::PrintDeviceList
+        # (HdmiCecSinkImplementation.cpp:1446-1452) calls printDeviceList() and then assigns
+        # `printed = true; success = true;` unconditionally, with no branch that can produce
+        # anything else and no early return in front of them. So on this API `printed` has exactly
+        # one legal value, and False - or a missing member, or a non-boolean - can only mean the
+        # reply is not the reply this method produces.
+        #
+        # An earlier revision type-asserted it instead, reasoning that the flag "is reported even
+        # when the device list holds no present device, so a True value would attest to nothing".
+        # That is true of what the flag MEANS and irrelevant to what it must BE: accepting False
+        # for a field production cannot set to False turns the only falsifiable half of this
+        # single-API case into a shape check, and a plugin that regressed the member to False
+        # would have passed.
         printed_flag = result.get("printed")
-        has_printed_flag = isinstance(printed_flag, bool)
+        has_printed_flag = printed_flag is True
         log_info(f"Reported printed flag: {printed_flag}")
+        if not has_printed_flag:
+            log_error(
+                "✖ printDeviceList reported printed="
+                f"{sanitise_for_log(printed_flag, max_chars=64)}; PrintDeviceList assigns it "
+                "true unconditionally (HdmiCecSinkImplementation.cpp:1448), so any other value "
+                "means this is not that method's reply"
+            )
 
         if has_success and has_printed_flag:
             elapsed_time = time.perf_counter() - start_time

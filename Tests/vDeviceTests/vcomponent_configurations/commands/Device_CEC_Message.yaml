@@ -21,39 +21,27 @@
 # A single CEC frame injected onto the emulated bus: a <CEC Version> reply from the SAMSUNG tuner
 # to the television that is the device under test.
 #
-# THIS DOCUMENT USED TO BE THE ONE SYMBOLIC FIXTURE IN THIS DIRECTORY, and it was converted to raw
-# bytes because the symbolic form could not carry the operand the frame requires. The reasoning is
-# recorded here rather than lost, because the earlier form was deliberate and the conversion has to
-# be defensible.
+# RAW BYTES, NOT THE EMULATOR'S SYMBOLIC FORM, AND THAT IS NOT A STYLE CHOICE. A symbolic document
+# names an opcode and lets the emulator synthesise the bytes, but its command parser synthesises
+# operands for exactly three opcodes - CEC_ACTIVE_SOURCE and CEC_INACTIVE_SOURCE from the
+# initiator's own allocated physical address, and CEC_SET_OSD_NAME from an osd_name field
+# (rdk-halif-test-hdmi_cec/vcomponent/src/vcHdmiCec.c, ParseCommand). <CEC Version> is not among
+# them, so a symbolic form of this frame would go out as a bare header and opcode. That is not a
+# weaker test but an empty one: CECVersion's operand is the whole content of the message, so
+# process(const CECVersion &, const Header &) would have nothing to record.
 #
-# The symbolic form named an opcode and let the emulator synthesise the bytes. Its command parser
-# synthesises operands for exactly three opcodes - CEC_ACTIVE_SOURCE and CEC_INACTIVE_SOURCE, from
-# the initiator's own allocated physical address, and CEC_SET_OSD_NAME, from an osd_name field in
-# the document (rdk-halif-test-hdmi_cec/vcomponent/src/vcHdmiCec.c ParseCommand). <CEC Version> is
-# not among them, so the document's "cec_version" payload entry was never serialised and the frame
-# went out as a bare header and opcode. A <CEC Version> without its version byte is not a weaker
-# test; CECVersion's operand is the whole content of the message, so the frame carried nothing and
-# process(CECVersion) had nothing to record.
-#
-# Two further problems came with the same form, and both were silent. The parser reads the
-# initiator from a field named "initiator" and this document supplied "source", so the initiator
-# never resolved. And it addressed "VAUDIO", a device that only existed while the map was wrongly
-# rooted at an audio system; an endpoint absent from the device map does not raise, it just stops
-# the parse. Either fault alone left the post returning HTTP 200 with nothing on the bus.
-#
-# Nothing was lost by converting. The symbolic path is not reachable from any document in this tree
-# on the vendored emulator at all: ParseCommand resolves the opcode from the "hdmicec/command"
-# field, every document here sets that field to "cec_message", and "cec_message" is not a token in
-# the emulator's opcode table (vcCommand.c gOpCodeStrVal), so the symbolic branch rejects the
-# opcode before it reaches the operand code. Raw bytes are also the only form that cannot omit an
-# operand by accident, whichever emulator generation is in front of them.
+# The symbolic path is in any case unreachable from every document in this tree on the vendored
+# emulator: ParseCommand resolves the opcode from the "hdmicec/command" field, every document here
+# sets that field to "cec_message", and "cec_message" is not a token in the emulator's opcode table
+# (vcCommand.c, gOpCodeStrVal), so the symbolic branch rejects the opcode before the operand code is
+# reached. Raw bytes are also the only form that cannot omit an operand by accident, whichever
+# emulator generation is in front of them.
 #
 # NOT A DUPLICATE OF Device_CEC_Version.yaml. That document is the audio system's reply, from
-# logical address 5. This one is the tuner's, from logical address 3, which preserves the SAMSUNG
-# source the symbolic form named and keeps a second peer's version exercisable. process(CECVersion)
-# (HdmiCecSinkImplementation.cpp:229-241) calls addDevice(header.from) and then
-# deviceList[3].update(msg.version), so the two documents drive the same handler for two different
-# entries in the device list.
+# logical address 5. This one is the tuner's, from logical address 3, which keeps a second peer's
+# version exercisable. process(const CECVersion &, const Header &) calls addDevice(header.from) and
+# then deviceList[3].update(msg.version), so the two documents drive the same handler for two
+# different entries in the device list.
 #
 # Payload, byte by byte:
 #   0x30  header = (initiator << 4) | destination = (TUNER1 3 << 4) | TV 0. SAMSUNG is logical

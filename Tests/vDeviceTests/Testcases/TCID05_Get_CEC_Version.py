@@ -4,271 +4,267 @@
  * @brief L3 HDMI CEC Sink functional testcase.
  *
  * @testcase TCID05_Get_CEC_Version
- * @details Exercises the HDMI CEC Sink plugin's CEC-version surface at device level over
- *          JSON-RPC and validates the reply against the plugin's published-method contract.
- *          A registered reader would answer {"CECVersion": "<version>", "success": true}, so
- *          this case inspects exactly result.CECVersion and result.success - and asserts their
- *          ABSENCE, because org.rdk.HdmiCecSink.getCecVersion is not a registered JSON-RPC
- *          method. HdmiCECSink_Curl.py records four independent confirmations of that and
- *          names its command accordingly (get_cec_version_unregistered); the mechanism is that
- *          the method is absent from IHdmiCecSink.h's published set and therefore from
- *          Exchange::JHdmiCecSink::Register, the plugin's only JSON-RPC registration path.
+ * @details Exercises the sink's CEC-version surface where that surface is observable - on the
+ *          emulated CEC bus and in the published device list - because the plugin publishes no
+ *          getCecVersion JSON-RPC method. HdmiCECSink_Curl.py records the evidence for that and
+ *          therefore carries no command constant for it. Three steps:
+ *            1. a DIRECTED <Get CEC Version> from the audio system at logical address 5 is
+ *               injected (Device_Get_CEC_Version.yaml, payload 0x50 0x9F). Directed framing is
+ *               the only framing HdmiCecSinkProcessor::process(const GetCECVersion &, const
+ *               Header &) accepts - it returns early when the destination is BROADCAST - so this
+ *               is the framing that reaches the sink's own responder;
+ *            2. a DIRECTED <CEC Version> carrying operand 0x05 from the same peer is injected
+ *               (Device_CEC_Version.yaml, payload 0x50 0x9E 0x05). HdmiCecSinkProcessor::process
+ *               (const CECVersion &, const Header &) calls addDevice(5) and then
+ *               deviceList[5].update(msg.version), which is the only path that records a peer's
+ *               CEC version;
+ *            3. org.rdk.HdmiCecSink.getDeviceList is polled until address 5's entry reports the
+ *               version that operand denotes. GetDeviceList publishes it as the entry's
+ *               "cecVersion" member, rendered by Version::toString(), and that renderer maps
+ *               operand 0x05 to the exact string "Version 1.4"
+ *               (hdmicec/ccec/include/ccec/Operands.hpp, class Version).
  *
- *          This module gives the method name its first device-level exercise. Its L1
- *          counterpart, HdmiCecSinkInitializedEventDsTest.DISABLED_getCecVersion in
- *          ../../L1Tests/tests/test_HdmiCecSink.cpp, is AAP Directive 5 defect #5 and remains
- *          disabled: this module does NOT repair it and makes no claim that it does. The
- *          analysis recorded above that test measured the invocation returning 22
- *          (Core::ERROR_UNKNOWN_METHOD) with an empty response, so the cause is the missing
- *          published method, not the commented-out RFC expectation beside it. Publishing the
- *          method is a production change - a getCecVersion declaration on
- *          Exchange::IHdmiCecSink so ThunderTools generates its binding, plus a plugin
- *          implementation so Register() publishes it - which AAP Directive 6 requires be
- *          reported rather than made. It is reported here and deliberately left unmade.
+ *          THE VERDICT IS AN EXACT VALUE, not a shape. The version read back is not the device's
+ *          own capability - which is provisioned and may legitimately be 1.4 or 2.0 - but the
+ *          value this case itself injected as an operand, so pinning it is a derived assertion
+ *          rather than an assumption about the environment. The sink's response to step 1 travels
+ *          on the bus rather than in a JSON-RPC reply, so its DELIVERY is asserted (the
+ *          vComponent must accept the document) and its content is not claimed; step 2 carries
+ *          the verdict.
  *
- *          The case is consequently a regression tripwire in the opposite direction too: if
- *          the method is ever published, this test fails and states exactly what to change.
- *          Where the CEC version IS observable device-side: the <Give CEC Version> exchange in
- *          vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml, and the
- *          device records returned by getDeviceList (see TCID02_Get_Devicelist).
+ *          IDEMPOTENT BY CONSTRUCTION, which is what lets a case that writes to the bus sit
+ *          inside the suite's opening observation block. Init_Devicelist_Populate.py already
+ *          seeds the same peer, the same opcode and the same operand, and process(CECVersion)
+ *          re-enters addDevice() for an address that is already present, so positions 06 through
+ *          09 observe exactly the device they would have observed without this case. Nothing else
+ *          is written and nothing has to be restored.
  *
- *          Read-only and self-contained: one JSON-RPC query, no device state written, no
- *          shared state to capture or restore, no sleep, and no service started or emulated.
+ *          BLOCKED, AND REPORTED RATHER THAN MADE: a JSON-RPC reader for the sink's OWN CEC
+ *          version would need a getCecVersion declaration on Exchange::IHdmiCecSink so
+ *          ThunderTools generates the binding, plus a plugin implementation so Register()
+ *          publishes it. Both are production changes, which AAP Directive 6 requires be reported
+ *          instead. The sink L1 suite's DISABLED_getCecVersion has the same cause and stays
+ *          disabled; this module neither repairs it nor claims to.
  *
  * @precondition
- *  - Required plugin is active and reachable via JSON-RPC endpoint.
- *  - Target environment is ready for HDMI CEC emulation/command execution.
+ *  - The org.rdk.HdmiCecSink plugin is active and reachable over the JSON-RPC endpoint.
+ *  - The vComponent HTTP API is reachable, so the two CEC documents below can be injected.
+ *  - Init_Devicelist_Populate has seeded the emulated topology, including the YAMAHA audio
+ *    system at CEC logical address 5 - the peer both injected frames come from.
+ *  - AUTHORED, NOT EXECUTED in this repository: no CI workflow runs this suite, and nothing
+ *    described here has been observed against a live device or emulator.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSink_Curl.py
- *  - SuitManager.py
- *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - endpoint resolution, the shell-free curl dispatcher and the vComponent poster
+ *  - HdmiCECSink_Curl.py - the get_device_list command definition
+ *  - SuitManager.py - registers this case at position 5 and runs it
+ *  - vcomponent_configurations/commands/Device_Get_CEC_Version.yaml
+ *  - vcomponent_configurations/commands/Device_CEC_Version.yaml
  *
  * @expected_result
- *  - The dispatcher reports org.rdk.HdmiCecSink.getCecVersion as unavailable: the reply
- *    carries an "error" member and no "result" member, and no CECVersion value comes back.
+ *  - Both CEC documents are accepted by the vComponent (HTTP 200), so both frames reach the bus.
+ *  - org.rdk.HdmiCecSink.getDeviceList answers with result.success True and a deviceList entry
+ *    for logical address 5 whose cecVersion is exactly "Version 1.4", the rendering of the
+ *    operand injected in step 2.
  *
  * @pass_criteria
- *  - The reply is a JSON-RPC 2.0 envelope answering the id this case sent, carries an "error"
- *    object and no "result" member, and that error's code is one of exactly two values:
- *    -32601, or 22. Those are the two renderings of a single framework status,
- *    Core::ERROR_UNKNOWN_KEY - the status Thunder's dispatcher returns when no registered
- *    handler matches the method name - so together they are the dispatcher saying the method
- *    does not exist, and no third code says it.
- *  - Should the method ever be published, these criteria invert to result.success being True
- *    and result.CECVersion being a non-empty string; the tripwire branch in run_test() says so
- *    in its diagnostic rather than leaving the next reader to work it out.
+ *  - Both vComponent posts return HTTP 200; getDeviceList answers with result.success True; the
+ *    deviceList carries an entry for logical address 5; that entry's cecVersion equals
+ *    "Version 1.4"; and run_test() returns True.
  *
  * @failure_criteria
- *  - A CECVersion payload is returned (the published surface changed), the command was not
- *    dispatched, no response arrived, a JSON parsing error occurred, the reply is not a
- *    JSON-RPC 2.0 envelope, the reply answers a different request id, the error member carries
- *    no integer code, or the code is ANY value other than -32601 or 22. That last clause is
- *    what keeps a different fault from being read as this one: -32603 (internal error), -32602
- *    (invalid parameters), -32604 (privileged), -32000 (timeout) and 2 (ERROR_UNAVAILABLE - the
- *    service absent, which is this case's precondition rather than its subject) are all
- *    refusals, and none of them is evidence that the METHOD is unpublished.
+ *  - Either vComponent post returns anything other than HTTP 200 - which would leave this case
+ *    claiming a bus exchange it never made - getDeviceList is not dispatched, the reply is the
+ *    no-response sentinel, the body is not a JSON-RPC envelope carrying an object result,
+ *    result.success is not True, address 5 is absent from the deviceList, its cecVersion is
+ *    missing or is any other value, a JSON parsing error occurs, or run_test() returns False.
  */
 """
 
 
 import time
-
-
 import json
-# log_with_timing is imported and not called, deliberately: it is part of the six-symbol import
-# set every Band A test case in this suite family carries (28 of the 33 source-plugin cases
-# import it and none call it), and the timing line below is emitted through log_success so that
-# every case's output lines up. pyflakes reports the unused name; the suite convention wins and
-# the tension is recorded here rather than resolved silently in either direction.
+
 from utils import (
     send_curl_command,
-    expected_request_id,
+    send_vcomponent_command,
     sanitise_for_log,
+    HDMICEC_CMD_BASE,
     log_info,
     log_success,
     log_error,
     log_warning,
-    log_with_timing
+    log_with_timing,
+    CEC_FRAME_PACING_SECONDS,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
+
+
+# The peer both frames come from. Address 5 is the audio system in this suite's topology, and it
+# is the address Init_Devicelist_Populate seeds a CEC version for, which is what makes step 2 an
+# idempotent repetition rather than a new device.
+AUDIO_SYSTEM_LOGICAL_ADDRESS = 5
+
+# The two documents, and the single reason they are the directed pair rather than the broadcast
+# one: process(GetCECVersion) returns early on a BROADCAST destination, and a frame the emulator
+# accepts but the plugin discards would leave this case green having exercised nothing.
+GET_CEC_VERSION_YAML = "Device_Get_CEC_Version.yaml"      # 0x50 0x9F      - from 5, directed to 0
+CEC_VERSION_YAML = "Device_CEC_Version.yaml"              # 0x50 0x9E 0x05 - from 5, directed to 0
+
+# The expected readback, derived from the operand this case injects rather than from the device.
+# Version::toString() (hdmicec/ccec/include/ccec/Operands.hpp) maps the one operand byte through a
+# name table, so 0x05 (V_1_4) renders as "Version 1.4" - with the word, and not as "1.4".
+CEC_VERSION_OPERAND = 0x05
+EXPECTED_CEC_VERSION = "Version 1.4"
+
+# Bounded budget for the readback. A poll interval is the gap between two observations, never a
+# duration anything waits for: the loop leaves on the first reading that satisfies it and reports
+# what it last saw when the budget expires.
+READBACK_TIMEOUT_SECONDS = 10.0
+READBACK_POLL_SECONDS = 0.25
+
+
+def _post_hdmicec(yaml_file):
+    """Post a HdmiCec vComponent YAML command and report whether it was accepted.
+
+    HTTP 200 is the only acceptance, and utils.send_vcomponent_command is fail-closed about it: a
+    missing document, a refused path, a curl failure and the "applied the YAML then closed the
+    connection without answering" case all arrive here as code 0 rather than being laundered into
+    a synthetic 200. The body is logged verbatim and never parsed, because on those paths it
+    carries curl's diagnosis rather than a response document.
+    Args:
+        yaml_file: Document name relative to the suite's command fixture directory.
+    Returns:
+        True only when the vComponent answered HTTP 200.
+    """
+    http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{yaml_file}")
+    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {sanitise_for_log(body)}")
+    return http_code == 200
+
+
+def _result_object(response_text):
+    """Return the JSON-RPC result mapping from a response body, or an empty mapping.
+
+    A refusal carries "error" instead of "result", and a malformed body could carry a non-object
+    result or not be an object at all. Every such case collapses to {} so the caller reports a
+    missing field instead of raising AttributeError out of run_test(). A body that is not JSON at
+    all still raises json.JSONDecodeError, which run_test() handles as the documented failure.
+    Args:
+        response_text: Raw response string as returned by utils.send_curl_command.
+    Returns:
+        The "result" mapping when the body is a JSON object carrying one, otherwise {}.
+    """
+    body = json.loads(response_text)
+    if not isinstance(body, dict):
+        return {}
+    result = body.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+def _device_entry(result, logical_address):
+    """Return the deviceList entry for one logical address, or None when it is absent."""
+    device_list = result.get("deviceList")
+    if not isinstance(device_list, list):
+        return None
+    for device in device_list:
+        if isinstance(device, dict) and device.get("logicalAddress") == logical_address:
+            return device
+    return None
+
+
+def _await_recorded_version():
+    """Poll getDeviceList until address 5 reports the injected version, bounded.
+
+    Returns the LAST sample rather than only a verdict, so a failure can report the value that
+    was actually present instead of only that the expected one was missing.
+    Returns:
+        A (settled, entry, detail) triple: whether the expected version was observed, the peer's
+        last observed entry (or None), and a diagnostic naming what the last reading contained.
+    """
+    deadline = time.time() + READBACK_TIMEOUT_SECONDS
+    entry = None
+    detail = "getDeviceList was never read"
+    while True:
+        response = send_curl_command(HdmiCecSinkApis.get_device_list)
+        if not response:
+            detail = "getDeviceList was not dispatched"
+        elif response.startswith("< No response"):
+            detail = "getDeviceList got no response from WPEFramework"
+        else:
+            result = _result_object(response)
+            if result.get("success") is not True:
+                detail = f"getDeviceList did not report success; body={response!r}"
+            else:
+                entry = _device_entry(result, AUDIO_SYSTEM_LOGICAL_ADDRESS)
+                if entry is None:
+                    detail = (
+                        f"logical address {AUDIO_SYSTEM_LOGICAL_ADDRESS} is absent from the "
+                        f"device list; body={response!r}"
+                    )
+                else:
+                    observed = entry.get("cecVersion")
+                    if observed == EXPECTED_CEC_VERSION:
+                        log_warning(f"  device list: {sanitise_for_log(response, max_chars=2048)}")
+                        return True, entry, f"cecVersion {observed!r}"
+                    detail = (
+                        f"address {AUDIO_SYSTEM_LOGICAL_ADDRESS} reports cecVersion "
+                        f"{sanitise_for_log(observed, max_chars=64)}, not "
+                        f"{EXPECTED_CEC_VERSION!r}"
+                    )
+        if time.time() >= deadline:
+            return False, entry, detail
+        time.sleep(READBACK_POLL_SECONDS)
 
 
 def run_test():
     start_time = time.perf_counter()
 
-    log_info("Executing the curl command get CEC version")
-
-    curl_response = send_curl_command(
-        HdmiCecSinkApis.get_cec_version_unregistered
+    log_info(
+        "Injecting a directed <Get CEC Version> and a directed <CEC Version> from logical "
+        f"address {AUDIO_SYSTEM_LOGICAL_ADDRESS}, then reading the recorded version back"
     )
 
-    if not curl_response:
-        log_error("✖ curl command not sent")
-        return False
-
-    # Both guards are needed and neither is redundant. The falsy guard above is the suite's
-    # conventional first check and covers a dependency that stops honouring its contract; the
-    # one below is the guard that actually fires today, because send_curl_command reports every
-    # transport, tokenisation and parse failure as the TRUTHY utils.NO_RESPONSE_SENTINEL string
-    # ("< No response from WPEFramework >"). That distinction is load-bearing for this
-    # particular case: an unreachable endpoint must never be mistaken for a dispatcher
-    # rejecting the method, which is exactly what this test treats as a pass.
-    if curl_response.startswith("< No response"):
-        log_error("✖ no response from WPEFramework")
-        return False
-
-    log_success("✔ curl command sent")
-    log_warning(f"Response: {sanitise_for_log(curl_response, max_chars=2048)}")
-
-    try:
-        parsed = json.loads(curl_response)
-
-        # ENVELOPE AND CORRELATION, CHECKED HERE AND NOT ONLY UPSTREAM. utils.send_curl_command
-        # already requires curl to have exited zero, the HTTP status to have been 2xx, the body
-        # to have been exactly one syntactically valid JSON-RPC envelope, and the id to match
-        # the one sent - so a caller that only needs a reply is safe without this block. This
-        # case needs more than a reply: its verdict is the assertion "the dispatcher rejected
-        # THIS call because the method does not exist", and an error object belonging to some
-        # other request, or arriving in something that is not a JSON-RPC envelope at all, would
-        # satisfy the code check below while saying nothing about this method. So the two
-        # properties the verdict rests on are asserted where the verdict is formed.
-        if not isinstance(parsed, dict):
-            log_error(
-                "✖ the reply is valid JSON but not a JSON-RPC envelope "
-                f"({type(parsed).__name__}), so no error member can be attributed to this call"
-            )
-            log_error("TCID05_Get_CEC_Version Failed ❌")
-            return False
-
-        if parsed.get("jsonrpc") != "2.0":
-            log_error(
-                "✖ the reply does not declare jsonrpc 2.0 "
-                f"(jsonrpc={sanitise_for_log(parsed.get('jsonrpc'), max_chars=32)}), so it is "
-                "not a response this case can read a rejection out of"
-            )
-            log_error("TCID05_Get_CEC_Version Failed ❌")
-            return False
-
-        sent_id = expected_request_id(HdmiCecSinkApis.get_cec_version_unregistered)
-        if sent_id is None:
-            log_error(
-                "✖ get_cec_version_unregistered carries no readable JSON-RPC id, so the reply "
-                "cannot be correlated to the call this case makes"
-            )
-            log_error("TCID05_Get_CEC_Version Failed ❌")
-            return False
-        if str(parsed.get("id")) != str(sent_id):
-            log_error(
-                f"✖ the reply answers request id "
-                f"{sanitise_for_log(parsed.get('id'), max_chars=32)}, not the {sent_id} this "
-                "case sent, so its error member describes a different call"
-            )
-            log_error("TCID05_Get_CEC_Version Failed ❌")
-            return False
-
-        result = parsed.get("result", {})
-        error = parsed.get("error")
-
-        # A JSON-RPC 2.0 reply carries "result" or "error", never both, so the presence of a
-        # result member is what says the method answered at all. Membership is tested on the
-        # envelope rather than on the value so that an off-contract payload type still counts
-        # as an answer, and result_fields keeps the field reads below from raising on one.
-        answered_with_result = "result" in parsed
-        result_fields = result if isinstance(result, dict) else {}
-
-        # The published shape would be {"CECVersion": "<version>", "success": true} - the exact
-        # reply the disabled L1 test expects. The version is read for logging and never pinned
-        # to "1.4": that literal is only the plugin's static default
-        # (HdmiCecSinkImplementation.cpp:103), overridable through the RFC parameter
-        # Device.DeviceInfo.X_RDKCENTRAL-COM_RFC.Feature.HdmiCecSink.CECVersion that
-        # getCecVersion() reads, so a 2.0-provisioned device would legitimately report 2.0 and
-        # pinning the literal would fail such a device for being correctly provisioned.
-        reported_version = result_fields.get("CECVersion")
-        version_payload_returned = (
-            result_fields.get("success") is True
-            and isinstance(reported_version, str)
-            and reported_version.strip() != ""
+    if not _post_hdmicec(GET_CEC_VERSION_YAML):
+        log_error(
+            f"✖ {GET_CEC_VERSION_YAML} was not accepted by the vComponent, so the sink's "
+            "<Get CEC Version> responder was never reached"
         )
-
-        # The contract under test. A result member and an error member are mutually exclusive,
-        # so requiring the error and the absence of the result states "the dispatcher has no
-        # such method" once, without a second predicate that could never fire.
-        rejected = isinstance(error, dict) and not answered_with_result
-
-        if rejected:
-            # THE ACCEPTED CODES ARE THE TWO RENDERINGS OF ONE FRAMEWORK STATUS, AND NOTHING
-            # ELSE. Thunder's plugin dispatcher initialises its result to Core::ERROR_UNKNOWN_KEY
-            # and returns it when no registered handler matches the method name
-            # (Thunder/Source/plugins/JSONRPC.h:605), and Core::JSONRPC::Error::Info::SetError
-            # maps that status to the canonical JSON-RPC -32601 "Method not found"
-            # (Thunder/Source/core/JSONRPC.h, the ERROR_UNKNOWN_KEY case of the switch). The
-            # value of ERROR_UNKNOWN_KEY is 22 (Thunder/Source/core/Portability.h:850), which is
-            # the raw status the L1 measurement recorded from an in-process invocation where no
-            # SetError mapping is applied. So -32601 and 22 are the same statement made on two
-            # surfaces, and no third code says it.
-            #
-            # (The symbol in the earlier note here was wrong and is corrected: Thunder has no
-            # Core::ERROR_UNKNOWN_METHOD - grep of the vendored tree finds none - and 22 is
-            # ERROR_UNKNOWN_KEY.)
-            #
-            # ANY OTHER CODE IS A DIFFERENT FAULT AND FAILS. -32603 is an internal error, -32602
-            # invalid parameters, -32604 a privilege refusal, -32000 a timeout, and 2
-            # (ERROR_UNAVAILABLE) is the service not being there at all - which is the
-            # precondition of this case rather than its subject. Treating those as "the method
-            # does not exist" is how a deactivated plugin, a malformed request or an unreachable
-            # service would report this case as passing, so each of them ends it as a failure
-            # naming the code that was actually returned.
-            method_not_found_codes = (-32601, 22)
-            error_code = error.get("code")
-            if not isinstance(error_code, int) or isinstance(error_code, bool):
-                log_error(
-                    "✖ the reply's error member carries no integer code "
-                    f"(code={sanitise_for_log(error_code, max_chars=64)}), so the dispatcher's "
-                    "reason for refusing cannot be established"
-                )
-                log_error("TCID05_Get_CEC_Version Failed ❌")
-                return False
-            if error_code not in method_not_found_codes:
-                log_error(
-                    f"✖ JSON-RPC error code {error_code} is not one of "
-                    f"{method_not_found_codes}, the two renderings of ERROR_UNKNOWN_KEY. The "
-                    "call was refused for some other reason - a deactivated plugin, an invalid "
-                    "request or an unavailable service - and this case asserts specifically "
-                    "that the METHOD is unpublished, so that is not the contract under test. "
-                    f"Error text: {sanitise_for_log(error.get('message'), max_chars=256)}"
-                )
-                log_error("TCID05_Get_CEC_Version Failed ❌")
-                return False
-
-            log_success(
-                f"✔ the dispatcher reported the method as unknown (code {error_code})"
-            )
-            elapsed_time = time.perf_counter() - start_time
-            log_success(log_with_timing("TCID05_Get_CEC_Version Passed ✅", elapsed_time))
-            return True
-
-        if answered_with_result:
-            if version_payload_returned:
-                log_warning(
-                    f"CECVersion reported as {reported_version!r} with success true: "
-                    "org.rdk.HdmiCecSink.getCecVersion now answers as a published method. "
-                    "Rename get_cec_version_unregistered back to get_cec_version in "
-                    "HdmiCECSink_Curl.py, invert the assertion above, and re-enable "
-                    "DISABLED_getCecVersion in ../../L1Tests/tests/test_HdmiCecSink.cpp."
-                )
-            else:
-                log_warning(
-                    "The dispatcher answered with a result member that is not the published "
-                    f"shape (CECVersion={reported_version!r}, "
-                    f"success={result_fields.get('success')!r}), so neither the documented "
-                    "rejection nor a usable version reading was obtained."
-                )
-        log_warning(f"Actual  : {json.dumps(parsed, indent=2, sort_keys=True)}")
         log_error("TCID05_Get_CEC_Version Failed ❌")
         return False
+    log_success("✔ directed <Get CEC Version> injected")
+
+    # Inter-frame pacing, the one timed construct here: the bus carries no per-frame observable
+    # that could be polled instead, and the two frames are read by two different handlers.
+    time.sleep(CEC_FRAME_PACING_SECONDS)
+
+    if not _post_hdmicec(CEC_VERSION_YAML):
+        log_error(
+            f"✖ {CEC_VERSION_YAML} was not accepted by the vComponent, so no version was "
+            "presented to process(CECVersion) and there is nothing to read back"
+        )
+        log_error("TCID05_Get_CEC_Version Failed ❌")
+        return False
+    log_success(f"✔ directed <CEC Version> injected (operand 0x{CEC_VERSION_OPERAND:02X})")
+
+    try:
+        settled, entry, detail = _await_recorded_version()
     except json.JSONDecodeError:
         log_error("Invalid JSON response")
         log_error("TCID05_Get_CEC_Version Failed ❌")
         return False
+
+    if not settled:
+        log_error(
+            f"✖ the injected CEC version was not recorded within {READBACK_TIMEOUT_SECONDS:.0f} s "
+            f"- {detail}"
+        )
+        log_error("TCID05_Get_CEC_Version Failed ❌")
+        return False
+
+    log_info(
+        f"Address {AUDIO_SYSTEM_LOGICAL_ADDRESS} reports {detail}, matching the injected operand"
+    )
+    log_warning(f"Peer entry: {json.dumps(entry, indent=2, sort_keys=True)}")
+    elapsed_time = time.perf_counter() - start_time
+    log_success(log_with_timing("TCID05_Get_CEC_Version Passed ✅", elapsed_time))
+    return True

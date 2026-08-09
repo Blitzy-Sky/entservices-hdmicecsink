@@ -26,9 +26,13 @@
  *  - All test case modules listed in SUITES are present under the Testcases/ directory.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSink_Curl.py
- *  - Testcases/*.py
+ *  - utils.py - the only module this one imports: endpoint resolution, the JSON-RPC dispatcher,
+ *    the readiness waiter and the logging helpers
+ *  - Init_Devicelist_Populate.py - loaded by name through SUITE_INIT_MODULES and run once before
+ *    the first case; a False return aborts the suite
+ *  - Testcases/TCID*.py - the 33 registered case modules, imported by name from the tests list
+ *  - HdmiCECSink_Curl.py is a dependency of those cases rather than of this module, which builds
+ *    no request of its own beyond the controller calls it composes through utils.py
  *
  * @expected_result
  *  - All registered test cases are executed in order, every declared producer/consumer
@@ -52,9 +56,14 @@ import time
 from pathlib import Path
 import os
 
+# utils.await_plugin_ready is deliberately NOT imported here. It observes the controller state
+# alone, and this runner needs both that state and the plugin's own declared readiness_probe to
+# hold - see wait_for_plugin_ready below, which observes exactly those two things and is what
+# run_suite calls. Importing the weaker helper alongside the stronger one only invites the wrong
+# one to be reached for.
 from utils import (
-    await_plugin_ready,
     log_error,
+    sanitise_for_log,
     log_info,
     log_success,
     log_warning,
@@ -95,12 +104,13 @@ SUITES = {
         #     run first so the device is observed before it is written to. 05
         #     (Get_CEC_Version) is the one exception and is called out here rather than left to
         #     be discovered: it injects a directed <Get CEC Version> and a directed
-        #     <CEC Version> onto the emulated bus, because the plugin publishes no
-        #     getCecVersion method and the bus is the only place that surface is observable.
-        #     What it writes is idempotent and identical to what Init_Devicelist_Populate.py
-        #     already seeded - the same peer, opcode and operand, recorded by the same handler -
-        #     so it leaves 06 through 09 exactly the device they would otherwise have seen, and
-        #     its position inside this block is free rather than constrained;
+        #     <CEC Version> onto the emulated bus and then reads the recorded version back out of
+        #     getDeviceList, because the plugin publishes no getCecVersion method and the bus is
+        #     the only place that surface is observable. What it writes is idempotent and
+        #     identical to what Init_Devicelist_Populate.py already seeded - the same peer,
+        #     opcode and operand, recorded by the same handler - so it leaves 06 through 09
+        #     exactly the device they would otherwise have seen, and its position inside this
+        #     block is free rather than constrained;
         #   * 10-16 are the single-API writes, and 11 (Set_Vendor_ID) must precede 12
         #     (Verify_Vendor_ID_Readback) because 12 reads back exactly what 11 wrote;
         #   * 17-27 are the multi-message flows, and 20 (ARC_Initiation_Flow) must precede 21
@@ -187,11 +197,23 @@ SUITES = {
 # No edge is declared for any other case, deliberately. TCID32_Invalid_ARC_Routing_Nochange is
 # the case a reader is most likely to expect here, and its @precondition states the opposite:
 # it "neither depends on that value nor changes it, because it compares two observations
-# instead of pinning one". Declaring an edge it disclaims would make this map fiction. Every
-# other residual coupling in the suite - a case that changes OSD name, vendor identity, power
-# state, active source or the device list and is observed by a later case - is removed at the
-# source instead, by making the case restore what it changed in its own finally / cleanup(),
-# which is the other half of the same requirement.
+# instead of pinning one". Declaring an edge it disclaims would make this map fiction.
+#
+# WHAT THE MAP DOES NOT COVER, stated rather than implied. Other residual couplings exist and are
+# handled in two different ways, only one of which is a restoration:
+#   * RESTORED AT THE SOURCE. TCID28 and TCID29 capture the vendor identifier and the OSD name on
+#     entry and put them back in their cleanup() hooks; TCID31 restores the enabled flag the same
+#     way; TCID17 and TCID19 restore the active source and the route they arranged; TCID21 takes
+#     ARC back down. Those six modules are the ones that publish a cleanup(), and their residuals
+#     therefore do not reach a later case at all.
+#   * DECLARED, NOT RESTORED, because no inverse operation exists to call.
+#     TCID15_Send_Standby_Message broadcasts <Standby> and the interface publishes no wake;
+#     TCID18_Set_Active_Source_Flow deliberately leaves the television holding the active source,
+#     which TCID19 then overwrites as its own first act; TCID33 leaves the topology as its sweep
+#     left it and runs last so nothing inherits it. Each of those modules names its residual in its
+#     own documentation. They are not edges in this map because the later case does not REQUIRE the
+#     residual - it re-establishes what it needs - and an edge would claim a dependency that the
+#     consumer disclaims.
 #
 # A producer must be registered EARLIER than its consumer in "tests"; resolve_dependencies()
 # enforces that, so a forward or circular edge is a startup error rather than a silent skip.
@@ -282,14 +304,235 @@ def load_test_cases(suite_name):
         sys.path.insert(0, module_dir)
 
     test_cases = []
+    modules = {}
     for module_name in suite_config["tests"]:
         module = importlib.import_module(module_name)
+        modules[module_name] = module
         cleanup_fn = getattr(module, "cleanup", None)
         if cleanup_fn is not None and not callable(cleanup_fn):
             raise TypeError(f"{module_name}.cleanup exists but is not callable")
         test_cases.append((module_name, module.run_test, cleanup_fn))
 
+    # Checked here, while the modules are in hand and before the caller touches the device.
+    enforce_restoration_contract(suite_name, modules)
+
     return suite_config["banner"], test_cases
+
+
+# ------------------------------------------------------------------------------------
+# THE RESTORATION CONTRACT, AND WHY IT IS A REGISTRY RATHER THAN A CONVENTION.
+#
+# `getattr(module, "cleanup", None)` is a permissive lookup: a module that should restore state
+# and simply has no hook is indistinguishable from one that needs none, and the runner reports
+# both as "nothing to do". That permissiveness let a real gap sit in this suite unnoticed while
+# THREE files asserted the opposite - TCID20 stated that "the restore lives in TCID21's cleanup()
+# hook", TCID21's own @details described that hook, and TCID27 and TCID33 each named a restoration
+# mechanism (a finally clause, a re-declared topology) that did not exist. None of those claims was
+# checkable by anything, so all of them could stop being true silently.
+#
+# This registry makes the posture of a case a DECLARED, VALIDATED property. Each entry is one of:
+#
+#   RESTORES_ITSELF   the module must publish a callable cleanup(). Its own state changes are its
+#                     own to undo.
+#   restorer name     the module defers restoration to the NAMED case, which must be registered,
+#                     must publish a callable cleanup(), and must run AFTER it. This is the shape
+#                     of a producer/consumer pair such as TCID20 -> TCID21, where a hook on the
+#                     producer would fire before the consumer ever ran and destroy it.
+#   READ_ONLY         the module changes no device state. Verified mechanically, not trusted: the
+#                     check below refuses a READ_ONLY module that publishes a cleanup() or names a
+#                     restorer, either of which contradicts the classification.
+#
+# WHAT THIS REGISTRY DOES NOT CLAIM, stated because an omission here would read downstream as
+# coverage. It enumerates the cases whose restoration posture has been ESTABLISHED. Cases absent
+# from it invoke at least one mutating API or post at least one vComponent document, and their
+# posture has NOT been established - they are listed in UNCLASSIFIED_MUTATING_CASES below and
+# named in a warning at start-up, so the gap is visible rather than implied. Classifying them is
+# open work, not a completed audit.
+#
+# Two forward guards keep the registry from drifting out of date in the direction it can:
+#   * a module that publishes cleanup() must be registered as RESTORES_ITSELF - so a new hook
+#     cannot be added without the registry learning about it;
+#   * a module that declares RESTORED_BY must be registered with that same restorer - so the
+#     declaration and the registry cannot disagree.
+# ------------------------------------------------------------------------------------
+RESTORES_ITSELF = "__self__"
+READ_ONLY = "__read_only__"
+
+RESTORATION_CONTRACT = {
+    # Read-only probes: no setter, no vComponent post. Verified by inspection of every call site
+    # and re-checked by the guards below.
+    "TCID01_Get_Enabled_Status": READ_ONLY,
+    "TCID02_Get_Devicelist": READ_ONLY,
+    "TCID03_Get_OSD_Name": READ_ONLY,
+    "TCID04_Get_Vendor_ID": READ_ONLY,
+    "TCID05_Get_CEC_Version": READ_ONLY,
+    "TCID06_Get_Active_Source": READ_ONLY,
+    "TCID07_Get_Active_Route": READ_ONLY,
+    "TCID08_Get_Audio_Device_Connected_Status": READ_ONLY,
+    "TCID09_Print_Devicelist": READ_ONLY,
+    "TCID12_Verify_Vendor_ID_Readback": READ_ONLY,
+    # Self-restoring: each captures what it found, or records that it disturbed a known invariant,
+    # and puts it back in its own hook.
+    "TCID17_Request_Active_Source_Flow": RESTORES_ITSELF,
+    "TCID18_Set_Active_Source_Flow": RESTORES_ITSELF,
+    "TCID19_Active_Path_Routing_Change_Flow": RESTORES_ITSELF,
+    "TCID21_ARC_Termination_Flow": RESTORES_ITSELF,
+    "TCID27_Device_Add_Remove_Discovery_Flow": RESTORES_ITSELF,
+    "TCID28_Invalid_VendorID_Nochange": RESTORES_ITSELF,
+    "TCID29_Invalid_OSD_Setnochange": RESTORES_ITSELF,
+    "TCID31_Repeated_Enable_Idempotent": RESTORES_ITSELF,
+    "TCID33_Process_Yaml_Health_Check": RESTORES_ITSELF,
+    # Deferred: the ARC pair. A hook on the producer would disable ARC before the consumer ran.
+    "TCID20_ARC_Initiation_Flow": "TCID21_ARC_Termination_Flow",
+}
+
+# Registered cases that invoke a mutating API or post a vComponent document and whose restoration
+# posture this pass did NOT establish. Named here so the boundary of the registry above is explicit
+# and so start-up says so out loud; each still runs, and each still has its cleanup() called if it
+# ever publishes one.
+#
+# THIS TUPLE IS LOAD-BEARING, NOT A NOTE. enforce_restoration_contract() compares it against the
+# set it derives from the registry, and a difference is a REGISTRATION FAILURE. That is what makes
+# "a case whose restoration posture nobody has established cannot be added silently" true in
+# general rather than only for the cases this pass happened to look at: a new case is unclassified,
+# the derived set no longer matches this tuple, and the suite refuses to start until somebody
+# either classifies it in RESTORATION_CONTRACT or adds it here deliberately.
+UNCLASSIFIED_MUTATING_CASES = (
+    "TCID10_Set_OSD_Name",
+    "TCID11_Set_Vendor_ID",
+    "TCID13_Set_Menu_Language",
+    "TCID14_Set_Latency_Info",
+    "TCID15_Send_Standby_Message",
+    "TCID16_Send_Key_Press_Event",
+    "TCID22_System_Audio_Mode_Flow",
+    "TCID23_Short_Audio_Descriptor_Flow",
+    "TCID24_Audio_Status_And_Power_Flow",
+    "TCID25_Standby_Coordination_Flow",
+    "TCID26_User_Control_Pressed_Released_Flow",
+    "TCID30_Repeated_Disable_Idempotent",
+    "TCID32_Invalid_ARC_Routing_Nochange",
+)
+
+
+def enforce_restoration_contract(suite_name, modules):
+    '''Validate every registered case against RESTORATION_CONTRACT, before the device is touched.
+
+    Args:
+        suite_name: A key of SUITES, used only in messages.
+        modules: {module_name: imported module} for every case registered by the suite, in any
+            order; the declared order is read from SUITES for the "restorer runs later" check.
+    Raises:
+        TypeError: a case's declared posture is not satisfied - a RESTORES_ITSELF case with no
+            callable cleanup(), a deferral naming an unregistered case, a case with no cleanup(),
+            or one that runs no later than the case deferring to it; a READ_ONLY case that
+            publishes a cleanup() or names a restorer; a module publishing cleanup() that the
+            registry does not know about; or a RESTORED_BY declaration the registry contradicts.
+            Raised rather than warned because an unenforceable restoration contract is a defect in
+            the suite, and a run that starts anyway leaves a device in a state nobody can name.
+    '''
+    order = list(SUITES[suite_name]["tests"])
+    position = {name: index for index, name in enumerate(order)}
+    problems = []
+
+    for name in order:
+        module = modules[name]
+        hook = getattr(module, "cleanup", None)
+        declared_restorer = getattr(module, "RESTORED_BY", None)
+        posture = RESTORATION_CONTRACT.get(name)
+
+        # Forward guard 1: a hook the registry does not know about.
+        if callable(hook) and posture != RESTORES_ITSELF:
+            problems.append(
+                f"{name} publishes cleanup() but RESTORATION_CONTRACT records it as "
+                f"{posture!r}; register it as RESTORES_ITSELF so the contract and the code agree"
+            )
+        # Forward guard 2: a declaration the registry contradicts.
+        if declared_restorer is not None and posture != declared_restorer:
+            problems.append(
+                f"{name} declares RESTORED_BY={declared_restorer!r} but RESTORATION_CONTRACT "
+                f"records {posture!r}; the two must name the same restorer"
+            )
+
+        if posture is None:
+            continue  # Unclassified; reported once, below, rather than per case.
+        if posture == READ_ONLY:
+            if callable(hook) or declared_restorer is not None:
+                problems.append(
+                    f"{name} is registered READ_ONLY but names a restoration mechanism, so one of "
+                    "the two is wrong"
+                )
+            continue
+        if posture == RESTORES_ITSELF:
+            if not callable(hook):
+                problems.append(
+                    f"{name} is registered as restoring itself but publishes no callable "
+                    "cleanup(), so nothing would put its state back"
+                )
+            continue
+
+        # A deferral. The named restorer must exist, restore itself, and run later.
+        restorer = posture
+        if restorer not in position:
+            problems.append(
+                f"{name} defers restoration to {restorer!r}, which is not registered in suite "
+                f"{suite_name!r}, so its state would never be restored"
+            )
+            continue
+        if not callable(getattr(modules[restorer], "cleanup", None)):
+            problems.append(
+                f"{name} defers restoration to {restorer!r}, which publishes no callable "
+                "cleanup() - exactly the gap this check exists to catch"
+            )
+        if position[restorer] <= position[name]:
+            problems.append(
+                f"{name} defers restoration to {restorer!r}, which is registered at position "
+                f"{position[restorer]} - at or before {name}'s own position {position[name]}, so "
+                "the restorer would run first and have nothing to restore"
+            )
+
+    if problems:
+        raise TypeError(
+            f"the restoration contract for suite {suite_name!r} is not satisfied:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+    unclassified = [n for n in order if n not in RESTORATION_CONTRACT]
+    unexpected = sorted(set(unclassified) - set(UNCLASSIFIED_MUTATING_CASES))
+    stale = sorted(set(UNCLASSIFIED_MUTATING_CASES) - set(unclassified))
+    if unexpected:
+        problems.append(
+            "these registered case(s) have no declared restoration posture and are not listed in "
+            "UNCLASSIFIED_MUTATING_CASES either, so nothing states whether they leave the device as "
+            "they found it: " + ", ".join(unexpected)
+            + ". Classify each in RESTORATION_CONTRACT, or list it there deliberately."
+        )
+    if stale:
+        problems.append(
+            "UNCLASSIFIED_MUTATING_CASES names case(s) that are now classified or no longer "
+            "registered, so the documented boundary is out of date: " + ", ".join(stale)
+        )
+    if problems:
+        raise TypeError(
+            f"the restoration contract for suite {suite_name!r} is not satisfied:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+    if unclassified:
+        log_warning(
+            f"{len(unclassified)} registered case(s) have no declared restoration posture, so it "
+            "is NOT established that they leave the device as they found it: "
+            + ", ".join(unclassified)
+        )
+        log_warning(
+            "    Each still runs and each still has its cleanup() called if it publishes one. "
+            "Classifying them in RESTORATION_CONTRACT is open work, deliberately not claimed here."
+        )
+    log_info(
+        f"restoration contract satisfied: {sum(1 for p in RESTORATION_CONTRACT.values() if p == RESTORES_ITSELF)} "
+        f"self-restoring, {sum(1 for p in RESTORATION_CONTRACT.values() if p not in (RESTORES_ITSELF, READ_ONLY))} "
+        f"deferred, {sum(1 for p in RESTORATION_CONTRACT.values() if p == READ_ONLY)} read-only, "
+        f"{len(unclassified)} unclassified"
+    )
 
 
 def resolve_dependencies(suite_name):
@@ -467,6 +710,43 @@ def wait_for_settled(probe, timeout_s=SETTLE_TIMEOUT_S, interval_s=SETTLE_POLL_I
         time.sleep(interval_s)
 
 
+# The two accepted spellings of each state, as sets so a reader can see the whole accepted
+# vocabulary in one place.  Anything outside both is a configuration error, not a third state.
+_AUTO_ACTIVATE_TRUE = frozenset({"1", "true", "yes", "on"})
+_AUTO_ACTIVATE_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def _parse_auto_activate(raw):
+    '''Interpret AUTO_ACTIVATE_PLUGINS, or return None when it cannot be read exactly.
+
+    Args:
+        raw: The environment value, or None when the variable is not set at all.
+    Returns:
+        True to activate, False to skip activation, or None when the value is neither - in which
+        case an error naming both accepted vocabularies has already been logged and the caller
+        must refuse to run.
+    '''
+    if raw is None:
+        # Unset is the documented default and is not an error.
+        return True
+    token = raw.strip().casefold()
+    if token in _AUTO_ACTIVATE_TRUE:
+        return True
+    if token in _AUTO_ACTIVATE_FALSE:
+        return False
+    log_error(
+        f"AUTO_ACTIVATE_PLUGINS is set to {sanitise_for_log(raw, 64)}, which is neither a yes nor "
+        "a no.  Accepted: "
+        + ", ".join(sorted(_AUTO_ACTIVATE_TRUE))
+        + " to activate the plugin; "
+        + ", ".join(sorted(_AUTO_ACTIVATE_FALSE))
+        + " to skip activation.  Refusing to run: guessing would decide whether this run "
+        "activates a plugin somebody else may already have configured, and every case's result "
+        "afterwards depends on which way that guess went."
+    )
+    return None
+
+
 def _run_cleanup(tc_name, cleanup_fn):
     '''Run a case's optional cleanup() hook and report whether it completed.
     The hook is restoration, not verdict: its outcome never turns a failing case into a passing
@@ -489,7 +769,16 @@ def _run_cleanup(tc_name, cleanup_fn):
     try:
         outcome = cleanup_fn()
     except Exception as exc:
-        print(f"EXCEPTION in {tc_name}.cleanup(): {exc}")
+        # log_error, not print: the exception text can carry a device response verbatim (a
+        # failed restoration usually names what came back), and a bare print puts whatever
+        # control bytes are in it straight onto the terminal that is this run's only evidence.
+        # log_error applies utils._guard_log_line; sanitise_for_log bounds and escapes the
+        # exception text itself on top of that.  Still inside the captured-output window, so the
+        # message is replayed under this case's banner exactly as before.
+        log_error(
+            f"EXCEPTION in {tc_name}.cleanup(): "
+            f"{sanitise_for_log(f'{type(exc).__name__}: {exc}')}"
+        )
         return False
     # A hook that returns nothing at all has still run to completion; only an explicit falsy
     # return is a restoration failure, so `return None` and `return True` mean the same thing.
@@ -612,22 +901,70 @@ def run_suite(suite_name):
     settle_probe = suite_config.get("settle_probe")
     print(banner)
 
-    # Activation is ON by default; export AUTO_ACTIVATE_PLUGINS=0 (or "false"/"no") to skip it
-    # when the plugin is already activated by other means.
-    auto_activate = os.environ.get("AUTO_ACTIVATE_PLUGINS", "1").lower() not in ("0", "false", "no")
+    # Activation is ON by default; export AUTO_ACTIVATE_PLUGINS=0 to skip it when the plugin is
+    # already activated by other means.
+    #
+    # PARSED STRICTLY, AND A VALUE THAT CANNOT BE READ STOPS THE RUN.
+    #
+    # This used to be `... .lower() not in ("0", "false", "no")`, which is a deny-list: every
+    # spelling outside those three - "off", "FALSE " with a trailing space, "disable", "n", or a
+    # typo such as "flase" - was read as "activate the plugin", the opposite of what the operator
+    # asked for.  In a suite whose entire purpose is to observe a device, being wrong about
+    # whether this run activates the plugin decides what every case afterwards is measuring: with
+    # activation unwanted but performed, the run mutates a device somebody else had already set
+    # up; with it wanted but skipped, every case fails against a plugin that was never up and the
+    # reason appears nowhere.
+    #
+    # Both states are therefore named explicitly, and anything else is refused BEFORE the first
+    # request is issued - so a misspelling costs a diagnostic rather than a whole run whose
+    # meaning is unknown.  Surrounding whitespace is stripped because an exported value picks it
+    # up easily; case is folded because "TRUE" and "true" are plainly the same answer.
+    auto_activate = _parse_auto_activate(os.environ.get("AUTO_ACTIVATE_PLUGINS"))
+    if auto_activate is None:
+        return False
     callsign = SUITE_PLUGIN_CALLSIGNS.get(suite_name)
     if auto_activate and callsign:
         log_info(f"Auto-activating plugin '{callsign}' via curl JSON-RPC at {WPEFRAMEWORK_JSONRPC_URL}")
         if activate_plugin_via_curl(callsign):
             log_success(f"Plugin activated: {callsign}")
             # Controller.1.activate returns once the request is accepted; Initialize() and the
-            # plugin's worker threads come up after it. That readiness is observable through
-            # Controller.1.status, so it is waited for rather than estimated. A plugin already up
-            # costs nothing here, and an expiry is reported instead of being read as success.
-            log_info(f"Waiting for {callsign} to report itself activated...")
-            if not await_plugin_ready(callsign):
+            # plugin's worker threads come up after it. That readiness is observable, so it is
+            # waited for rather than estimated. A plugin already up costs nothing here, and an
+            # expiry is reported instead of being read as success.
+            #
+            # BOTH observables are required, which is why this uses the suite's declared
+            # readiness_probe rather than the controller state alone. A plugin transitions to
+            # "activated" BEFORE its own JSON-RPC surface begins dispatching, so the controller
+            # state on its own would report ready while the first case's very first call still
+            # failed; and the probe on its own would not distinguish a plugin that is up from a
+            # controller that is unreachable. The probe is declared in SUITES so this runner
+            # stays suite agnostic.
+            log_info(
+                f"Waiting for {callsign} to report itself activated and to answer "
+                f"{readiness_probe['method'] if readiness_probe else 'no probe'}..."
+            )
+            ready, ready_elapsed = wait_for_plugin_ready(callsign, readiness_probe)
+            if ready:
+                log_success(f"Plugin {callsign} ready after {ready_elapsed:.2f}s")
+            else:
                 log_warning(
-                    f"Plugin {callsign} did not report state 'activated' before the deadline; "
+                    f"Plugin {callsign} was not both activated and dispatching within "
+                    f"{ready_elapsed:.2f}s; the cases below will run anyway and their own "
+                    "assertions decide the verdict"
+                )
+            # "Activated" and "dispatching its own methods" are two different observables, and a
+            # plugin reaches the first before the second.  readiness_probe is the suite's
+            # declaration of the second, so it is polled here rather than slept through: the wait
+            # returns on the first answering read and reports its own elapsed time, and an expiry
+            # is a warning rather than a verdict because the cases' own assertions decide that.
+            ready, ready_elapsed = wait_for_plugin_ready(callsign, readiness_probe)
+            if ready:
+                log_success(
+                    f"{callsign} answered its readiness probe after {ready_elapsed:.2f}s"
+                )
+            else:
+                log_warning(
+                    f"{callsign} did not answer its readiness probe within {ready_elapsed:.2f}s; "
                     "the cases below will run anyway and their own assertions decide the verdict"
                 )
             # "Activated" and "dispatching its own methods" are two different observables, and a
@@ -644,6 +981,24 @@ def run_suite(suite_name):
                 log_warning(
                     f"{callsign} did not answer its readiness probe within {ready_elapsed:.2f}s; "
                     "the cases below will run anyway and their own assertions decide the verdict"
+                )
+            # "activated" is the framework's word for the request having been accepted; the
+            # plugin is only USABLE once it dispatches its own methods.  readiness_probe is the
+            # observable for that, so it is polled here rather than a fixed post-activation
+            # pause being taken.  An expiry is reported and the cases still run - their own
+            # assertions decide the verdict - because a slow bring-up is not by itself a failure.
+            ready, ready_elapsed = wait_for_plugin_ready(callsign, readiness_probe)
+            if ready:
+                observed = (
+                    f"answered {readiness_probe['method']}" if readiness_probe
+                    else "reported itself activated"
+                )
+                log_success(f"{callsign} {observed} after {ready_elapsed:.2f}s")
+            else:
+                log_warning(
+                    f"{callsign} did not answer its readiness probe within "
+                    f"{PLUGIN_READY_TIMEOUT_S}s (waited {ready_elapsed:.2f}s); the cases below "
+                    "will run anyway and their own assertions decide the verdict"
                 )
         else:
             # Abort rather than run: every case would fail against a plugin that is not up,
@@ -682,13 +1037,18 @@ def run_suite(suite_name):
 
         captured = io.StringIO()
         sys.stdout = captured
+        # Bound BEFORE the try so the read after the finally can never reference an unbound name.
+        # _run_cleanup is the last statement of the try and swallows every Exception, so the only
+        # way past it without assigning is a BaseException - and on that path the value below is
+        # never read, because the exception leaves the loop entirely.
+        cleanup_ok = True
         try:
             if unmet:
                 # NOT RUN, and NOT PASSED. The producer's state was never established, so any
                 # verdict this case could report would be about something else.
                 result = None
                 for producer in unmet:
-                    print(
+                    log_warning(
                         f"SKIPPED {tc_name}: required producer {producer} "
                         f"{outcomes.get(producer, 'did not run')}"
                     )
@@ -699,8 +1059,18 @@ def run_suite(suite_name):
                     # An exception is a FAILURE, never a skip and never a pass. The text goes
                     # into the case's own captured output so it is replayed in place, under that
                     # case's banner.
+                    #
+                    # Routed through log_error rather than print for the same reason as the
+                    # cleanup hook above: a case that fails while handling a device response
+                    # routinely puts that response into the exception, and a log line is
+                    # evidence.  The exception TYPE is named as well, because "EXCEPTION in X:
+                    # " with an empty message - which a bare KeyError or an AssertionError with
+                    # no text produces - said nothing at all about what happened.
                     result = False
-                    print(f"EXCEPTION in {tc_name}: {exc}")
+                    log_error(
+                        f"EXCEPTION in {tc_name}: "
+                        f"{sanitise_for_log(f'{type(exc).__name__}: {exc}')}"
+                    )
             # Restoration runs while output is still captured, so its messages are replayed
             # under this case's banner, and it runs on every path above - pass, fail, exception
             # and skip alike. _run_cleanup swallows nothing but propagates nothing either, so
@@ -715,8 +1085,49 @@ def run_suite(suite_name):
         finally:
             sys.stdout = original_stdout
 
+        # Recorded OUTSIDE the captured-output block so the summary below can name it. Without
+        # this, cleanup_failures stayed empty for every run and the documented rule -- "an
+        # unrestored device is not a clean run" -- was unenforceable, because the verdict at the
+        # end of this function tests a list nothing ever appended to.
+        if not cleanup_ok:
+            cleanup_failures.append(tc_name)
+
         output = captured.getvalue()
+        # REPLAY, not composition - and therefore the one print() in this module that must stay a
+        # print().  Everything in `output` was written by the case through utils' log_* helpers,
+        # so it has already passed _guard_log_line: its control bytes are already rendered as
+        # visible \xNN escapes and its length is already bounded.  Guarding it a second time
+        # would escape those backslashes again and turn readable evidence into noise.  The
+        # invariant this rests on is checked rather than assumed: no module under Testcases/, and
+        # neither HdmiCECSink_Curl.py nor Init_Devicelist_Populate.py, contains a bare print() -
+        # every one of them logs through utils.  A new case that used print() directly would be
+        # the thing to fix, here or there.
         print(output, end="")
+
+        # A FAILED RESTORATION IS RECORDED HERE, and this is the only place it can be.
+        #
+        # cleanup_failures is printed in the summary and folded into the suite verdict by the
+        # return statement below, but nothing ever appended to it: the outcome of _run_cleanup
+        # was computed and then dropped. The consequence was that the two mechanisms built to
+        # make an unrestored device visible - the summary line and the `not cleanup_failures`
+        # term in the verdict - could never fire, so a suite that left the device dirty in every
+        # single case still exited 0 and printed no cleanup line at all. Recording it is what
+        # makes those two mechanisms mean what they say.
+        #
+        # It is recorded SEPARATELY from the case verdict, and deliberately so. _run_cleanup's
+        # own contract is that restoration is not a verdict: a cleanup failure must not turn a
+        # failing case into a passing one or the reverse, so it does not touch passed/failed/
+        # skipped or outcomes[] - which the dependency map reads - and instead fails the SUITE.
+        # A case can therefore legitimately read [PASS] while the run as a whole reads failed,
+        # which is the accurate description of "the case proved what it claimed and then could
+        # not put the device back".
+        if not cleanup_ok:
+            cleanup_failures.append(tc_name)
+            log_error(
+                f"[CLEANUP FAILED] {tc_name} - its cleanup() hook raised or reported failure, so "
+                "the device may not have been restored and the cases that follow may run against "
+                "state this case left behind"
+            )
 
         if unmet:
             skipped += 1
@@ -733,16 +1144,35 @@ def run_suite(suite_name):
             failed_cases.append(tc_name)
             log_error(f"[FAIL] {tc_name}")
 
-        # Between cases, confirm the plugin is still answerable rather than pausing for a fixed
-        # period. The JSON-RPC round trip below is synchronous, so it both separates consecutive
-        # cases by the time the framework actually needs to service a request and reports a plugin
-        # that has stopped responding - which a bare sleep would have hidden until the next case
-        # failed for a reason that looked unrelated.
-        if callsign and send_jsonrpc_command(f"{callsign}.1.getEnabled") is None:
-            log_warning(
-                f"{callsign} did not answer getEnabled after {tc_name}; the cases that follow may "
-                "fail against a plugin that is no longer serving"
-            )
+        # Between cases, wait for the bus to go QUIET rather than pausing for a fixed period.
+        # "Settled" is a property, not a duration: consecutive equal readings of the one piece of
+        # plugin state that inbound CEC traffic changes - the discovered device count - are the
+        # evidence that nothing is still arriving. A quiet bus therefore costs one round trip
+        # instead of a fixed pause, and a bus that never goes quiet is REPORTED rather than
+        # silently slept through and left for the next case to fail against.
+        #
+        # This also subsumes the liveness check it replaces: an unanswered probe cannot satisfy
+        # the settle condition, so a plugin that has stopped serving expires the budget and is
+        # named here, which is strictly more than the single getEnabled round trip established.
+        #
+        # NOT after the last case. There is no following case for the bus to be quiet for, so
+        # settling here would only add the budget to the run's duration - up to SETTLE_TIMEOUT_S
+        # of it if the device is busy shutting down - and report a warning nothing acts on.
+        if settle_probe and index != last_index:
+            settled, settle_elapsed, last_value = wait_for_settled(settle_probe)
+            if settled:
+                log_info(
+                    f"Bus settled after {tc_name} in {settle_elapsed:.2f}s "
+                    f"({settle_probe['result_key']}={last_value})"
+                )
+            else:
+                log_warning(
+                    f"{settle_probe['method']} did not report {SETTLE_STABLE_READS} consecutive "
+                    f"equal readings within {settle_elapsed:.2f}s after {tc_name} "
+                    f"(last {settle_probe['result_key']}={last_value}); the cases that follow may "
+                    "run against a bus that is still changing, or a plugin that is no longer "
+                    "serving"
+                )
 
         # Then let the bus go quiet before the next case observes it.  settle_probe is the suite's
         # declaration of the one piece of plugin state inbound CEC traffic changes, and consecutive
@@ -761,6 +1191,38 @@ def run_suite(suite_name):
                 log_warning(
                     f"Bus had not settled {settle_elapsed:.2f}s after {tc_name} (last probe read "
                     f"{settle_value}); the next case may observe state still in flight"
+                )
+
+        # Then let the bus go quiet before the next case observes it.  settle_probe is the suite's
+        # declaration of the one piece of plugin state inbound CEC traffic changes, and consecutive
+        # equal readings of it are what "settled" means as an observable - so this replaces a fixed
+        # inter-case sleep and returns immediately on a quiet bus.  Skipped after the LAST case,
+        # because nothing follows it that could observe unsettled state, and paying the wait there
+        # would only lengthen the run.
+        if index != last_index:
+            settled, settle_elapsed, settle_value = wait_for_settled(settle_probe)
+            if settled:
+                log_info(
+                    f"Bus settled after {tc_name} in {settle_elapsed:.2f}s (probe read "
+                    f"{settle_value})"
+                )
+            else:
+                log_warning(
+                    f"Bus had not settled {settle_elapsed:.2f}s after {tc_name} (last probe read "
+                    f"{settle_value}); the next case may observe state still in flight"
+                )
+
+        # Then wait for the bus to go QUIET before the next case starts, by polling the state
+        # inbound CEC traffic changes until consecutive readings agree - the bounded-observation
+        # replacement for a fixed inter-case sleep. Skipped after the LAST case, where there is
+        # no next case for it to protect and the wait would be pure dead time.
+        if index != last_index:
+            settled, settle_elapsed, settle_value = wait_for_settled(settle_probe)
+            if settle_probe and not settled:
+                log_warning(
+                    f"the bus had not settled {SETTLE_TIMEOUT_S}s after {tc_name} "
+                    f"(waited {settle_elapsed:.2f}s, last reading {settle_value!r}); the next "
+                    "case starts against traffic that is still arriving"
                 )
 
     log_info(f"\n{'='*60}")

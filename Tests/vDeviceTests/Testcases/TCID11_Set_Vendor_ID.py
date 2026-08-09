@@ -25,11 +25,12 @@
  *          green pair red.
  *
  *          The residual state that leaves behind is safe by suite design rather than by luck.
- *          TCID04_Get_Vendor_ID runs earlier, at position 4, so the device's original
- *          identifier is observed before this case writes over it; and
- *          TCID28_Invalid_VendorID_Nochange re-establishes the same value later, at position
- *          28, from the same sibling constant. No case that follows this one depends on the
- *          pre-existing identifier.
+ *          TCID04_Get_Vendor_ID runs earlier, at position 4, so the device's original identifier
+ *          is observed before this case writes over it; and no case that follows depends on the
+ *          pre-existing identifier. TCID28_Invalid_VendorID_Nochange, at position 28, writes a
+ *          DIFFERENT distinguishing identifier of its own and then restores through its cleanup()
+ *          hook whatever identifier it found on entry - which is this case's value when the suite
+ *          runs in order - so the value written here survives the rest of the suite.
  *
  *          Boundary and malformed-input sweeping of setVendorId is not attempted here. It is
  *          already covered at L1 - setVendorId_Boundary, setVendorId_MinValue,
@@ -72,6 +73,7 @@ import time
 import json
 from utils import (
     send_curl_command,
+    sanitise_for_log,
     log_info,
     log_success,
     log_error,
@@ -79,6 +81,18 @@ from utils import (
     log_with_timing
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
+
+
+# The vendor identifier standing on the device before this case wrote to it.
+#
+# Published here rather than restored here on purpose. This case is the WRITE half of an ordered
+# pair, and the value it writes IS the fixture TCID12_Verify_Vendor_ID_Readback runs against at the
+# next registration position - so a restore performed here would delete that fixture before its
+# only consumer saw it. TCID12 owns the restore instead, and reads this slot to know what to put
+# back; SuitManager.py's TEST_DEPENDENCIES map already declares that pairing, so the coupling is
+# documented rather than implicit. None means the baseline could not be read, in which case TCID12
+# leaves the setting alone rather than writing a guess.
+CAPTURED_VENDOR_ID = None
 
 
 def run_test():
@@ -95,12 +109,42 @@ def run_test():
         }
     }
 
+    # Baseline capture, before anything is written, and published for TCID12 to restore. This is
+    # the only place the pre-write identifier is observable: by the time the reader runs, this case
+    # has already overwritten it.
+    global CAPTURED_VENDOR_ID
+    baseline = send_curl_command(HdmiCecSinkApis.get_vendor_id)
+    if baseline and not baseline.startswith("< No response"):
+        try:
+            baseline_envelope = json.loads(baseline)
+        except json.JSONDecodeError:
+            baseline_envelope = None
+        baseline_result = (
+            baseline_envelope.get("result") if isinstance(baseline_envelope, dict) else None
+        )
+        captured = baseline_result.get("vendorid") if isinstance(baseline_result, dict) else None
+        if isinstance(captured, str) and captured.strip():
+            CAPTURED_VENDOR_ID = captured
+            log_info(
+                "Captured the pre-write vendor identifier for "
+                f"TCID12 to restore: {sanitise_for_log(captured, max_chars=64)}"
+            )
+    if CAPTURED_VENDOR_ID is None:
+        # Not fatal, and not silent. The write and its envelope assertion below are this case's
+        # subject and they do not depend on the baseline; what is lost is only the pair's ability
+        # to leave the setting as it found it, which TCID12 reports rather than guesses at.
+        log_warning(
+            "The pre-write vendor identifier could not be read, so the TCID11/TCID12 pair will "
+            "leave the written value in place and TCID12 will say so"
+        )
+
     log_info("Executing the curl command set vendor id")
 
     # The sibling constant is dispatched verbatim. The vendor identifier lives there and only
-    # there - TCID12_Verify_Vendor_ID_Readback and TCID28_Invalid_VendorID_Nochange resolve the
-    # same definition - so no hex literal and no hand-built payload appears in this module, and
-    # an edit to one side of the pair cannot silently desynchronise the other.
+    # there - TCID12_Verify_Vendor_ID_Readback imports HdmiCECSink_Curl.SET_VENDOR_ID_VALUE to
+    # form its expectation, and TCID28_Invalid_VendorID_Nochange dispatches this same command to
+    # re-establish the value as its baseline - so no hex literal and no hand-built payload appears
+    # in this module, and an edit to one side of the pair cannot silently desynchronise the other.
     curl_response = send_curl_command(
         HdmiCecSinkApis.set_vendor_id
     )
@@ -143,3 +187,8 @@ def run_test():
     # with the plugin under test. The dependency between the two cases is therefore documented
     # rather than accidental, and SuitManager.py's registration list is the mechanism that
     # guarantees the ordering it needs.
+    #
+    # The PAIR is state-neutral even so: this case publishes CAPTURED_VENDOR_ID above and TCID12
+    # restores it from its own cleanup() hook, after it has asserted the written value. So the
+    # restore happens once, at the point where the fixture has finished being useful, rather than
+    # not at all - which is what an earlier revision left, with both halves declining to own it.

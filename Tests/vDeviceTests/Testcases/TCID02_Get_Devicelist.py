@@ -35,12 +35,15 @@
  *    a deviceList array whose entries are consistent with that count.
  *
  * @pass_criteria
- *  - 'success' is True, 'numberofdevices' is an int, at least one device is reported, the
- *    'deviceList' array is consistent with the count, every entry is a dict carrying an
- *    int 'logicalAddress', and run_test() returns True.
+ *  - 'success' is True, 'numberofdevices' is an int that is NOT a bool, at least one device is
+ *    reported, the 'deviceList' array is consistent with the count, every entry is a dict carrying
+ *    a 'logicalAddress' that is an int and not a bool, and run_test() returns True.
  *
  * @failure_criteria
- *  - Response mismatch, command failure, JSON parsing error, or testcase returns False.
+ *  - Response mismatch, command failure, JSON parsing error, or testcase returns False. A boolean
+ *    supplied where a device count or a logical address is required is a mismatch, not a number:
+ *    bool is a subclass of int in Python, so both numeric fields are checked with
+ *    utils.is_plain_int rather than a bare isinstance.
  */
 """
 
@@ -49,6 +52,7 @@ import time
 import json
 from utils import (
     send_curl_command,
+    is_plain_int,
     log_info,
     log_success,
     log_error,
@@ -94,7 +98,11 @@ def run_test():
             result = {}
 
         has_success = result.get("success") is True
-        has_count = isinstance(result.get("numberofdevices"), int)
+        # utils.is_plain_int, not isinstance(..., int): bool is a SUBCLASS of int in Python, so a
+        # bare isinstance check would accept {"numberofdevices": true} as a valid device count -
+        # and, further down, True >= 1 would then satisfy the "at least one device" requirement
+        # as well. Every numeric field in this case is validated through that one predicate.
+        has_count = is_plain_int(result.get("numberofdevices"))
 
         count = result.get("numberofdevices")
         device_list = result.get("deviceList")
@@ -113,7 +121,11 @@ def run_test():
                 if not isinstance(dev, dict):
                     entries_valid = False
                     break
-                if not isinstance(dev.get("logicalAddress"), int):
+                # A logical address is an integer in the published contract; a boolean in that
+                # field is an off-contract reply, and isinstance(False, int) would have let it
+                # through as address 0 - the TV's own address, which is the one value that would
+                # look plausible in a diagnostic.
+                if not is_plain_int(dev.get("logicalAddress")):
                     entries_valid = False
                     break
 
@@ -121,7 +133,7 @@ def run_test():
         # Device_Config_Add_Network.yaml and polls until the audio-system bootstrap peer at
         # logical address 5 appears, aborting the suite when it never does - so an empty
         # device list reaching this case is a regression, not a valid topology.
-        has_devices = isinstance(count, int) and count >= 1
+        has_devices = is_plain_int(count) and count >= 1
 
         if has_success and has_count and has_devices and list_consistent and entries_valid:
             elapsed_time = time.perf_counter() - start_time

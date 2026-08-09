@@ -154,7 +154,6 @@
 
 import time
 import json
-
 from utils import (
     send_curl_command,
     send_vcomponent_command,
@@ -236,17 +235,80 @@ def _ensure_arc_disabled():
     return True, "ARC confirmed disabled"
 
 
+# True once a setupArcRouting(enabled=false) has been ISSUED AND CONFIRMED in this process, so the
+# module-level cleanup() hook below can tell "already restored" from "must restore". Set only on
+# the confirmed path - an unconfirmed attempt leaves it False so the hook tries again, because an
+# attempt that was not acknowledged is not a restoration.
+_arc_disable_confirmed = False
+
+
+def cleanup():
+    """Leave ARC DISABLED - the state the TCID20/TCID21 pair inherited and owes back.
+
+    THIS HOOK IS WHY THE PAIR'S GUARANTEE IS ONE, AND IT WAS MISSING.
+
+    TCID20_ARC_Initiation_Flow deliberately does not restore: it enables ARC and names this module
+    as the restorer, and its own comment states that the restore "lives in TCID21's cleanup() hook,
+    and SuitManager runs cleanup() for every registered case unconditionally - INCLUDING a case it
+    skipped because its producer failed". This module's @details said the same. Neither was true:
+    no cleanup() existed here, so `getattr(module, "cleanup", None)` returned None and SuitManager
+    had nothing to run. The only restoration was the finally clause inside run_test() - which
+    cannot fire on the one path the pair's argument depends on, the path where TCID20's initiation
+    fails, this case is SKIPPED for an unmet dependency, and run_test() is never called at all.
+    ARC was then left ENABLED for every case that follows, and the file said the opposite.
+
+    Idempotent, in both directions: when run_test() already issued and confirmed the disable this
+    reports that and issues nothing, and when it did not, issuing setupArcRouting(false) against
+    an already-disabled ARC is itself idempotent - the same property TCID30 and TCID31 assert for
+    setEnabled.
+
+    NO CAPTURE IS INVOLVED, and that is by construction rather than by omission:
+    m_currentArcRoutingState is initialised to ARC_STATE_ARC_TERMINATED
+    (HdmiCecSinkImplementation.cpp:635), Init_Devicelist_Populate never calls setupARCRouting, and
+    no case registered before TCID20 does either - so "terminated" is the state the pair inherited.
+    There is also no getter for the ARC routing state on the interface, so an observation-based
+    capture is not available to be written.
+
+    Returns:
+        True when there was nothing to do, or the disable was issued AND acknowledged. False when
+        the request was not dispatched, not answered, or not acknowledged - in which case ARC may
+        still be enabled and the message says so.
+    """
+    global _arc_disable_confirmed
+    if _arc_disable_confirmed:
+        log_info("TCID21 cleanup: ARC was already confirmed disabled by run_test(), nothing to do")
+        return True
+
+    log_info("TCID21 cleanup: disabling ARC so the state the pair inherited is restored")
+    ok, detail = _ensure_arc_disabled()
+    if not ok:
+        log_error(
+            "TCID21 cleanup: ARC may still be ENABLED for subsequent cases - "
+            f"{sanitise_for_log(detail)}"
+        )
+        return False
+    _arc_disable_confirmed = True
+    log_success(f"✔ TCID21 cleanup: {detail}")
+    return True
+
+
 def run_test():
     start_time = time.perf_counter()
 
     # The measurement runs inside a try whose finally always restores ARC to disabled, so no
     # exit path - early return or exception - can leave it enabled for the cases that follow.
     # The restoration reports its own verdict, and this case fails if either half fails.
+    #
+    # The module-level cleanup() hook above covers the one path this finally cannot: the run in
+    # which this case is SKIPPED because TCID20's initiation failed, so run_test() is never
+    # entered. The two do not duplicate work - the flag set here is what makes the hook a no-op.
     try:
         flow_ok = _run_arc_termination_flow()
     finally:
+        global _arc_disable_confirmed
         cleanup_ok, cleanup_detail = _ensure_arc_disabled()
         if cleanup_ok:
+            _arc_disable_confirmed = True
             log_info(f"  Cleanup: {cleanup_detail}")
         else:
             # Reported independently of the measurement: a leaked enabled ARC is a different
@@ -299,7 +361,14 @@ def _run_arc_termination_flow():
     # and the sink's own setupARCRouting call is then the local half of the same teardown.
     ok_positive = _post_hdmicec("Device_Terminate_Arc.yaml")
     time.sleep(CEC_FRAME_PACING_SECONDS)
-
+    if not ok_positive:
+        log_error(
+            "✖ the <Terminate ARC> injection was not delivered to the bus, so this case cannot "
+            "claim to have exercised a termination at all - a document that cannot be posted "
+            "returns (0, diagnostic) rather than raising, which would otherwise read as a passing "
+            "ARC case that injected nothing"
+        )
+        return False
 
     # ACT 2 - THE GATE ARM THIS SUITE HAS A FIXTURE FOR. DELIVERY IS REQUIRED; THE HANDLER'S
     # VERDICT IS NOT ASSERTED.
@@ -408,20 +477,24 @@ def _run_arc_termination_flow():
         # HdmiCecSinkImplementation::hdmiCecAudioDeviceConnected, which is set when a peer is
         # discovered at logical address 5 rather than by an ARC termination, so an ARC flow is not
         # what moves it. The sink's own L2 suite asserts the counter-intuitive value for exactly
-        # that reason - EXPECT_FALSE(connected) at ../../L2Tests/tests/HdmiCecSink_L2Test.cpp:1827
-        # over COM-RPC and EXPECT_FALSE(result["connected"].Boolean()) at :2539 over JSON-RPC -
+        # that reason - EXPECT_FALSE(connected) in
+        # ../../L2Tests/tests/HdmiCecSink_L2Test.cpp GetAudioDeviceConnectedStatus_COMRPC and
+        # EXPECT_FALSE(result["connected"].Boolean()) in GetAudioDeviceConnectedStatus_JSONRPC -
         # because no audio system is ever discovered in that in-process host. This suite has
         # never been executed, so pinning the value would fail in one valid environment or the
         # other. `success` is different: the implementation sets it unconditionally, so requiring
         # True is measured.
-        if after_result.get("success") is True and isinstance(connected_after, bool):
-            return True
-
-        log_warning(f"Actual  : {after}")
+        if after_result.get("success") is not True or not isinstance(connected_after, bool):
+            log_error(
+                "✖ the final getAudioDeviceConnectedStatus did not report success with a boolean "
+                f"connected flag: success={after_result.get('success')!r} "
+                f"connected={connected_after!r}"
+            )
+            log_warning(f"Actual  : {after}")
+            return False
     except json.JSONDecodeError:
         log_error("✖ setupArcRouting disable reply is not valid JSON")
         return False
+
     log_success("✔ setupARCRouting(enabled=false) acknowledged")
     return True
-
-    return False

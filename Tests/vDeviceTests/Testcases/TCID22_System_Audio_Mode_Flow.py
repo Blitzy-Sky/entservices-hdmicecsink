@@ -29,8 +29,9 @@
  *          and otherwise logs "Not notifying system audio mode ON event" (:1150-1161), whereas
  *          the OFF arm notifies unconditionally and additionally calls stopArc() when ARC is
  *          still in the initiated state (:1141-1148). The emulator supplies only the ON value by
- *          itself - vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml:82-83
- *          tables <System Audio Mode Request> -> <Set System Audio Mode> [0x01] - so step 3 makes
+ *          itself - the active table in
+ *          vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml carries the row
+ *          <System Audio Mode Request> -> <Set System Audio Mode> [0x01] - so step 3 makes
  *          the ON arm deterministic rather than dependent on that table, and step 4 covers the
  *          arm the emulated peer never produces at all.
  *
@@ -49,7 +50,7 @@
  * @precondition
  *  - A device under test - physical hardware or a QEMU target - is running WPEFramework with
  *    the org.rdk.HdmiCecSink plugin activated and reachable over JSON-RPC.
- *  - Init_Devicelist_Populate has seeded the emulated topology, including the VAUDIO
+ *  - Init_Devicelist_Populate has seeded the emulated topology, including the YAMAHA
  *    AudioSystem peer at CEC logical address 5, and has left HDMI-CEC enabled. Both parts
  *    matter here: without the peer there is nothing for the solicitation to reach, and
  *    Process_SetSystemAudioMode_msg returns early while cecSettingEnabled is not true
@@ -77,14 +78,19 @@
  *
  * @pass_criteria
  *  - Both required YAML posts return HTTP 200, sendAudioDevicePowerOnMessage acknowledges
- *    result.success as True, the after-probe parses with result.success True and a boolean
- *    result.connected, and run_test() returns True.
+ *    result.success as True, getEnabled reports enabled True BEFORE either announcement is
+ *    injected - Process_SetSystemAudioMode_msg returns immediately when cecSettingEnabled is not
+ *    true, so this is what makes the two injections meaningful rather than merely accepted - the
+ *    after-probe parses with result.success True and a boolean result.connected, and run_test()
+ *    returns True.
  *
  * @failure_criteria
  *  - A request is not dispatched, a response is the no-response sentinel, either required
  *    vComponent post does not return HTTP 200, the solicitation does not acknowledge success,
- *    the after-probe reports success other than True or a non-boolean connected, a JSON parsing
- *    error occurs, or run_test() returns False.
+ *    getEnabled does not answer or reports enabled other than True - in which case both
+ *    announcements would have been posted successfully and then discarded before either arm of the
+ *    handler ran - the after-probe reports success other than True or a non-boolean connected, a
+ *    JSON parsing error occurs, or run_test() returns False.
  */
 """
 
@@ -96,6 +102,7 @@ from utils import (
     send_vcomponent_command,
     sanitise_for_log,
     HDMICEC_CMD_BASE,
+    CEC_FRAME_PACING_SECONDS,
     log_info,
     log_success,
     log_error,
@@ -169,7 +176,33 @@ def run_test():
         return False
     log_success("✔ curl command sent")
     log_warning(f"Response: {curl_response}")
-    time.sleep(1)
+
+    # THE GUARD THAT WOULD DISCARD BOTH INJECTIONS IS CHECKED BEFORE THEY ARE MADE.
+    # Process_SetSystemAudioMode_msg opens on `if (cecSettingEnabled != true) return;`
+    # (HdmiCecSinkImplementation.cpp:1133-1137), so with CEC disabled both frames below are
+    # accepted by the emulator, both posts return HTTP 200, and the handler discards each one
+    # before either arm is reached. Nothing downstream can tell that apart from a run in which the
+    # arms executed, because neither arm leaves a reading behind - so without this check the case
+    # could pass having exercised precisely nothing. TCID23 and TCID24 guard their own
+    # solicitations the same way and for the same reason.
+    enabled_probe = send_curl_command(HdmiCecSinkApis.get_enabled)
+    if not enabled_probe or enabled_probe.startswith("< No response"):
+        log_error("✖ getEnabled did not answer, so the handler's own guard cannot be confirmed open")
+        return False
+    try:
+        enabled_now = _result_object(enabled_probe).get("enabled")
+    except json.JSONDecodeError:
+        log_error("✖ getEnabled reply is not valid JSON")
+        return False
+    if enabled_now is not True:
+        log_error(
+            f"✖ HDMI-CEC reads enabled={enabled_now!r}. Process_SetSystemAudioMode_msg returns "
+            "immediately when cecSettingEnabled is not true, so both announcements below would be "
+            "posted successfully and then discarded, and neither arm of the handler would run"
+        )
+        return False
+    log_success("✔ HDMI-CEC is enabled, so the handler will not discard the announcements")
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     # ACT 2 - INBOUND ANNOUNCEMENT, ON VALUE. Device_Set_System_Audio_Mode.yaml carries payload
     # ["0x50","0x72","0x01"]: directed from logical address 5 to 0, opcode 0x72
@@ -179,14 +212,14 @@ def run_test():
     # send_vcomponent_command return (0, "YAML file not found: ..."), silently skipping the
     # injection, which is why both posts' results are required below rather than discarded.
     ok_on = _post_hdmicec("Device_Set_System_Audio_Mode.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     # ACT 3 - INBOUND ANNOUNCEMENT, OFF VALUE. The same opcode with operand 0x00
     # (SYSTEM_AUDIO_MODE_OFF, :62) reaches the opposite arm of the handler, which the emulator's
     # auto-response table never produces on its own. Posted last, so the module ends on the
     # quiescent announcement; see the shared-state note above.
     ok_off = _post_hdmicec("Device_Set_System_Audio_Mode_Off.yaml")
-    time.sleep(1)
+    time.sleep(CEC_FRAME_PACING_SECONDS)
 
     if not (ok_on and ok_off):
         log_error("✖ required vComponent emulation posts failed")
@@ -230,8 +263,9 @@ def run_test():
         # HdmiCecSinkImplementation::getAudioDeviceConnectedStatus (:1331), which reports whether
         # a peer was DISCOVERED at logical address 5 - not whether system audio mode was
         # announced - and the sink's own L2 suite asserts the counter-intuitive value for that
-        # reason: EXPECT_FALSE(connected) at ../../L2Tests/tests/HdmiCecSink_L2Test.cpp:1827 over
-        # COM-RPC and EXPECT_FALSE(result["connected"].Boolean()) at :2539 over JSON-RPC, because
+        # reason: EXPECT_FALSE(connected) in ../../L2Tests/tests/HdmiCecSink_L2Test.cpp
+        # GetAudioDeviceConnectedStatus_COMRPC and EXPECT_FALSE(result["connected"].Boolean()) in
+        # GetAudioDeviceConnectedStatus_JSONRPC, because
         # no audio system is ever discovered in that in-process host. This suite has never been
         # executed, so pinning the value would fail in one valid environment or the other, and
         # the OFF announcement posted last deliberately undoes the transient ON state anyway.

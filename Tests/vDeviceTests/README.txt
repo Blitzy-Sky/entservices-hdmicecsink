@@ -80,7 +80,8 @@ python3 SuitManager.py hdmicecsink
 export HDMICEC_CMD_BASE=/etc/hdmicec/vcomponent_configurations/commands
 python3 SuitManager.py hdmicecsink
 
-# elapsed time appended to every log line
+# elapsed time appended to each case's PASS line (the only messages routed through
+# utils.log_with_timing); every other log line is unchanged
 export HDMICEC_TIMING_ENABLED=1
 python3 SuitManager.py hdmicecsink
 
@@ -121,9 +122,12 @@ outside this list is consulted:
 - JSONRPC_URL                        legacy alias for the key above
 - VCOMPONENT_API_URL                 full vComponent URL, highest precedence
 - HDMICEC_CMD_BASE                   YAML command document root, as described above
-- HDMICEC_TIMING_ENABLED             when set to any non-empty value, appends the elapsed time
-                                     to log messages; it affects logging only and takes no
-                                     part in endpoint or path resolution
+- HDMICEC_TIMING_ENABLED             when set to any non-empty value, appends " time consumed:
+                                     <elapsed>s" to the messages routed through
+                                     utils.log_with_timing - each case's PASS line and the
+                                     suite summary - and to nothing else. SuitManager.py's
+                                     -t / --timing flag sets it for you. It affects logging
+                                     only and takes no part in endpoint or path resolution
 - Init_Devicelist_Populate_STRICT_MULTI   described under Initialization gates below
 - Init_Devicelist_Populate_MIN_DEVICES    described under Initialization gates below
 
@@ -157,10 +161,15 @@ would say so.
   assert nothing and an empty device list would pass; above the peer count it could never be
   satisfied, because this module seeds exactly that many peers. Either is a configuration
   error and fails.
-  In bootstrap mode only the bootstrap peer is mandatory and every other shortfall is
-  reported as a note rather than a failure. In strict mode the minimum is the full peer count
-  and this variable is not applied - but it is still validated, so a misspelling is reported
-  where it was made instead of lying dormant until someone turns strict mode off.
+  In bootstrap mode only the BOOTSTRAP PEER is mandatory - the YAMAHA audio system at CEC
+  logical address 5, which Init_Devicelist_Populate seeds first and selects by address rather
+  than by position, so reordering the seed table cannot silently move it. Every other shortfall
+  is reported as a note rather than a failure. The audio system is the mandatory one because it
+  is the peer the ARC, audio-status and short-audio-descriptor flows all address, and because
+  it roots the sub-tree three of the other five peers hang from. In strict mode the minimum is
+  the full peer count and this variable is not applied - but it is still validated, so a
+  misspelling is reported where it was made instead of lying dormant until someone turns strict
+  mode off.
 
 Prerequisites:
 - A QEMU target, or a real sink device, running WPEFramework with the org.rdk.HdmiCecSink
@@ -217,6 +226,13 @@ Static validation applied to the suite:
 - A suite-manager registration check of the tests list in SuitManager.py against the test
   case modules on disk under Testcases/, applied in both directions, so that neither a
   registered module missing from disk nor an unregistered module on disk goes unnoticed.
+- SuitManager.load_test_cases(), which imports every registered module, binds its run_test and
+  refuses a non-callable cleanup - so a module that imports but publishes no entry point is a
+  startup error rather than a silent skip - together with resolve_dependencies().
+- A symbol-resolution sweep: every HdmiCECSink_Curl attribute and every name imported from
+  utils by a test case is checked to exist in the module it is taken from. Python resolves a
+  module attribute only when it is used, so an unresolvable name would otherwise survive import
+  and surface as an AttributeError at device-execution time.
 - YAML well-formedness parsing of every document under vcomponent_configurations/.
 
 Prerequisites that were not available, and so were not used:

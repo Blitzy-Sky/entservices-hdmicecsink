@@ -31,7 +31,7 @@
  *              logical address 4 announcing 3.0.0.0. process(ActiveSource) calls addDevice(4)
  *              then updateActiveSource(4, msg), which sets deviceList[4].update(3.0.0.0) and
  *              m_currentActiveSource = 4 because 4 differs from the television's own allocated
- *              address (HdmiCecSinkImplementation.cpp:161-162, :2150-2159). GetActiveSource then
+ *              address (HdmiCecSinkImplementation.cpp:159-160, :2150-2159). GetActiveSource then
  *              reports logical address 4 at "3.0.0.0" on port "HDMI2", the port string being
  *              "HDMI" followed by the first address nibble minus one (cpp:1344-1370).
  *            - step 3 calls SetActiveSource, which is setActiveSource(false) (cpp:1454-1459).
@@ -198,6 +198,18 @@ def _probe_active_source(label):
     return result
 
 
+# The YAML fixtures cleanup() needs, named here so the restore path and the flow read the same
+# documents. Process_In_Active_Source.yaml is the BROADCAST <Inactive Source>; it is the pair used
+# by TCID17's restore path to clear a selection, and it is used for the same purpose below.
+INACTIVE_SOURCE_YAML = "Process_In_Active_Source.yaml"
+ACTIVE_SOURCE_YAML = "Process_Active_Source.yaml"
+
+# The active-source reading observed before this case arranged anything, handed to cleanup().
+# None means it was never captured - the probe failed, or run_test() never ran at all - so there
+# is nothing to put back and cleanup() says so instead of guessing.
+_captured_active_source = None
+
+
 def run_test():
     start_time = time.perf_counter()
 
@@ -212,6 +224,20 @@ def run_test():
     if before is None:
         log_error("TCID18_Set_Active_Source_Flow Failed ❌")
         return False
+
+    # CAPTURED BEFORE THE FIRST MUTATION, AND ONLY ONCE IT IS KNOWN TO BE A REAL READING.
+    #
+    # Everything below this line changes the sink's notion of the active source, so this is the
+    # last moment at which the state this case found can still be recorded. It is captured after
+    # the None check rather than before it, because a failed probe is not a state - restoring
+    # "whatever the probe could not read" would be a second uncontrolled change dressed up as a
+    # cleanup. Only the two members cleanup() can act on are kept; the physical address and port
+    # are derived from the logical address by the plugin and are not separately settable.
+    global _captured_active_source
+    _captured_active_source = {
+        "available": before.get("available"),
+        "logicalAddress": before.get("logicalAddress"),
+    }
 
     before_reading = _reading(before)
     log_info(
@@ -357,19 +383,130 @@ def run_test():
         f"{final_reading}"
     )
 
+    # THE VERDICT LINE GOES THROUGH THE SHARED TIMING HELPER. An earlier revision read
+    # os.environ["HDMICEC_TIMING_ENABLED"] here without importing os, so the documented -t mode -
+    # the only mode that takes this branch - raised NameError on the last line of a passing case
+    # and turned a green run red for a reason that had nothing to do with the device. utils.
+    # log_with_timing applies the same policy for every case in the suite and returns text, which
+    # is why log_success wraps it rather than being chosen by the caller.
     elapsed_time = time.perf_counter() - start_time
     log_success(log_with_timing("TCID18_Set_Active_Source_Flow Passed ✅", elapsed_time))
     return True
 
 
-# SHARED STATE THIS CASE LEAVES BEHIND, AND WHY IT IS NOT RESTORED
-# ---------------------------------------------------------------
-# On a passing run the residual is now KNOWN rather than incidental: the television itself holds
-# the active source, logical address 0 at 0.0.0.0 on port TV, because step 2 is the last write and
-# step 3 is asserted to change nothing. Stating the value is the point - a case that says only
-# "wherever the last frame put it" hands the next case an unknown.
+# SHARED STATE THIS CASE CHANGES, AND HOW IT IS PUT BACK
+# ------------------------------------------------------
+# This block used to be headed "AND WHY IT IS NOT RESTORED" and argued that leaving the television
+# holding the active source was acceptable because the next case in the declared order
+# re-establishes routing state for itself. Two things were wrong with that. The module's own
+# @details section promised a cleanup() hook that reproduces the states this suite can express -
+# so the file contradicted itself, and a reader had no way to tell which half was true. And the
+# argument only holds while the declared order holds: a case selected on its own, a re-ordered
+# registry, or a run that stops after this case all leave the device changed with nothing
+# following to absorb it.
 #
-# The residual is consumed, not leaked. TCID19_Active_Path_Routing_Change_Flow follows
-# immediately in the declared order and re-establishes routing state as its own first act, and
-# every case in this flow band opens with a before-probe that records rather than asserts the
-# starting state - so none of them inherits an expectation from this one.
+# The state is therefore captured before the first mutation and restored by cleanup() below, which
+# SuitManager runs unconditionally. On a passing run the state this case leaves at the end of
+# run_test() is still the television itself - logical address 0 at 0.0.0.0 on port TV, because
+# step 2 is the last write and step 3 is asserted to change nothing - and cleanup() is what turns
+# that from a residual into a transient.
+#
+# What cleanup() cannot reproduce is named rather than approximated: this suite's fixtures can
+# announce exactly one peer (logical address 4, via ACTIVE_SOURCE_YAML) and can clear the
+# selection, and setActiveSource can select the sink itself. An entry state naming any OTHER peer
+# is reported as a residual with both readings, because inventing a value would be a second
+# uncontrolled change presented as a restoration.
+
+
+def cleanup():
+    '''Put the sink's notion of the active source back where this case found it.
+
+    SuitManager runs this unconditionally - after a pass, a failure, an exception, and even for a
+    case it SKIPPED because a producer failed - so it assumes nothing about how far run_test() got
+    and is idempotent: the capture is consumed on read, so a second call finds nothing to do.
+
+    Three entry states can be reproduced, and each is confirmed by re-reading the observable
+    rather than trusted because a post or a call was accepted:
+      * no active source        -> broadcast <Inactive Source>, then confirm availability is gone;
+      * the sink itself         -> setActiveSource, then confirm the reading is the television's;
+      * the announced peer (LA 4) -> broadcast <Active Source>, then confirm the peer's reading.
+    Any other entry state is reported as a residual.
+
+    Returns:
+        True when there was nothing to restore, or the captured state was reproduced AND
+        confirmed. False when a required post or call was refused, when the restore could not be
+        confirmed within the fixture's pacing window, or when the captured state names a peer no
+        fixture in this suite can announce.
+    '''
+    global _captured_active_source
+    if _captured_active_source is None:
+        log_info("TCID18 cleanup: no active-source state was captured, nothing to restore")
+        return True
+
+    captured = _captured_active_source
+    _captured_active_source = None
+
+    current = _probe_active_source("cleanup entry")
+    if current is not None and (
+        current.get("available") == captured.get("available")
+        and current.get("logicalAddress") == captured.get("logicalAddress")
+    ):
+        log_info("TCID18 cleanup: the active source is already as it was found")
+        return True
+
+    if captured.get("available") is not True:
+        log_info("TCID18 cleanup: restoring 'no active source'")
+        if not _post_hdmicec(INACTIVE_SOURCE_YAML):
+            log_error("TCID18 cleanup: the required post was refused, active source left as it is")
+            return False
+        time.sleep(CEC_FRAME_PACING_SECONDS)
+        after = _probe_active_source("cleanup after clearing")
+        if after is None or after.get("available") is True:
+            log_error(
+                "TCID18 cleanup: the active source did not clear; last reading "
+                f"{None if after is None else _reading(after)}"
+            )
+            return False
+        log_success("✔ TCID18 cleanup: no active source, as found")
+        return True
+
+    if captured.get("logicalAddress") == TV_ACTIVE_SOURCE[0]:
+        log_info("TCID18 cleanup: re-selecting the television as active source")
+        response = send_curl_command(HdmiCecSinkApis.set_active_source)
+        if not response or response.startswith("< No response"):
+            log_error("TCID18 cleanup: setActiveSource was not answered, state left as it is")
+            return False
+        time.sleep(CEC_FRAME_PACING_SECONDS)
+        after = _probe_active_source("cleanup after re-selecting the television")
+        if after is None or _reading(after) != TV_ACTIVE_SOURCE:
+            log_error(
+                "TCID18 cleanup: the television did not become active source again; last reading "
+                f"{None if after is None else _reading(after)}"
+            )
+            return False
+        log_success("✔ TCID18 cleanup: the television holds the active source, as found")
+        return True
+
+    if captured.get("logicalAddress") == PEER_ACTIVE_SOURCE[0]:
+        log_info(f"TCID18 cleanup: re-announcing LA {PEER_ACTIVE_SOURCE[0]} as active source")
+        if not _post_hdmicec(ACTIVE_SOURCE_YAML):
+            log_error("TCID18 cleanup: the announcement was refused, state left as it is")
+            return False
+        time.sleep(CEC_FRAME_PACING_SECONDS)
+        after = _probe_active_source("cleanup after re-announcing the peer")
+        if after is None or _reading(after) != PEER_ACTIVE_SOURCE:
+            log_error(
+                "TCID18 cleanup: the peer did not become active source again; last reading "
+                f"{None if after is None else _reading(after)}"
+            )
+            return False
+        log_success("✔ TCID18 cleanup: the announced peer holds the active source, as found")
+        return True
+
+    log_warning(
+        "TCID18 cleanup: the active source found at entry was LA "
+        f"{captured.get('logicalAddress')}, which no fixture in this suite can announce, so it "
+        "cannot be reproduced. Residual reported rather than approximated: the active source is "
+        f"now {None if current is None else _reading(current)}"
+    )
+    return False

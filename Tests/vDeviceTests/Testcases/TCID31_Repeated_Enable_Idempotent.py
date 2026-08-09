@@ -90,10 +90,10 @@ def _result_object(response_text):
 
     A JSON-RPC error envelope carries "error" instead of "result", and a malformed body could carry
     a non-object "result" or not be an object at all. Every such case collapses to {} so the caller
-    reports a MISSING FIELD rather than raising AttributeError out of run_test(). Narrowing here is
-    what let the broad exception handler this module used to carry be removed entirely: the only
-    exception a caller can now see is json.JSONDecodeError, handled where it can occur rather than
-    swept up together with every programming defect in the file.
+    reports a MISSING FIELD rather than raising AttributeError out of run_test(). Narrowing here is what keeps the
+    module free of a broad exception handler: the only exception a caller can see is
+    json.JSONDecodeError, handled where it can occur rather than swept up together with every
+    programming defect in the file.
     """
     body = json.loads(response_text)
     if not isinstance(body, dict):
@@ -108,10 +108,9 @@ def _read_enabled_quietly():
     THE SILENT READER, and the reason there are two. This one is what the bounded polls and the
     repeated-reading confirmation call, so a wait that takes sixty samples produces sixty reads and
     no log lines; _read_enabled(label) below is the reporting form, called where a single reading
-    becomes part of a verdict and has to appear in the transcript. Both were previously spelled
-    _read_enabled, and because a module body runs top to bottom the later definition bound the name -
-    which left _wait_for_enabled and _confirm_held calling a one-argument function with no
-    arguments.
+    becomes part of a verdict and has to appear in the transcript. The two must keep DISTINCT names:
+    a module body runs top to bottom, so two definitions sharing one name would leave the later one
+    bound and every earlier caller invoking the wrong arity.
     """
     response = send_curl_command(HdmiCecSinkApis.get_enabled)
     # utils.send_curl_command reports a transport failure by RETURNING the TRUTHY sentinel
@@ -131,12 +130,12 @@ def _read_enabled_quietly():
 def _set_enabled(argv, label):
     """Dispatch one setEnabled request and REQUIRE its acknowledgement.
 
-    An earlier revision discarded every setter reply, which meant a request that was never
-    dispatched, answered with an error envelope or answered with success false was indistinguishable
-    from one that worked - and the case then drew its verdict from a single read that could have
-    been satisfied by pre-existing state. SetEnabled sets success unconditionally
-    (HdmiCecSinkImplementation.cpp:1839-1845), so requiring True proves the call REACHED the plugin
-    rather than proving the transition; the transition is proven by the read-back that follows.
+    Discarding a setter reply makes a request that was never dispatched, one answered with an error
+    envelope and one answered with success false indistinguishable from one that worked, which would
+    leave the verdict resting on a single read that pre-existing state could satisfy.
+    HdmiCecSinkImplementation::SetEnabled sets success unconditionally, so requiring True proves the
+    call REACHED the plugin rather than proving the transition; the transition is proven by the
+    read-back that follows.
     """
     response = send_curl_command(argv)
     if not response:

@@ -5,26 +5,25 @@
  *
  * @testcase TCID32_Invalid_ARC_Routing_Nochange
  * @details Validates that a malformed org.rdk.HdmiCecSink.setupARCRouting request perturbs nothing
- *          this transport can read, and CLASSIFIES the reply it produces. Four steps, in this
- *          order: read and require the three baseline observations - HDMI-CEC enabled, a
- *          well-formed active route, a boolean audio-connected flag; dispatch the malformed
- *          request; classify its envelope into one of exactly two admissible shapes; then re-read
- *          all three observations and require each to be unchanged, each on a bounded monotonic
- *          poll. The misspelled key lives in HdmiCECSink_Curl.setup_arc_routing_invalid -
+ *          this transport can read, and REQUIRES the reply it produces to be an acknowledgement.
+ *          Four steps, in this order: read and require the three baseline observations - HDMI-CEC
+ *          enabled, a well-formed active route, a boolean audio-connected flag; dispatch the
+ *          malformed request and require it to be acknowledged; then re-read all three
+ *          observations and require each to be unchanged, each on a bounded monotonic poll. The misspelled key lives in HdmiCECSink_Curl.setup_arc_routing_invalid -
  *          `{"ennabled": true}` instead of `{"enabled": true}` - and only there, so nothing about
  *          the malformed shape is restated in this module.
  *
- *          THE REPLY IS CLASSIFIED, NOT SHRUGGED AT. An earlier revision logged the reply and
- *          asserted nothing about it, reasoning that a plugin may refuse an unrecognised parameter
- *          with a JSON-RPC error or with a bare acknowledgement carrying a defaulted argument, and
- *          that pinning the choice would test the reply rather than the invariant. Classifying is
- *          not pinning. It admits BOTH legitimate shapes - an error envelope, or a result envelope
- *          reporting success True - and rejects the shapes that are neither: the transport
- *          sentinel, a non-object body, an unparsable string, or a result envelope reporting
- *          anything but True. That last one is a real finding rather than a formality, because
- *          SetupARCRouting sets success = true UNCONDITIONALLY
- *          (HdmiCecSinkImplementation.cpp:1600-1613), so a result envelope carrying success false
- *          contradicts the plugin's own contract.
+ *          THE MALFORMED REQUEST MUST BE ACKNOWLEDGED, AND THAT IS A DERIVED OUTCOME RATHER THAN A
+ *          PLUGIN CHOICE THIS CASE PINS ARBITRARILY. Thunder's generated registration calls
+ *          inbound.FromString(parameters) and discards the result
+ *          (Thunder/Source/core/JSONRPC.h, InternalRegister), so the misspelled "ennabled" leaves
+ *          the generated Enabled member at its default of false, and
+ *          HdmiCecSinkImplementation::SetupARCRouting is entered with enabled == false and sets
+ *          success = true unconditionally. The reply is therefore a result envelope reporting
+ *          success True, which is what utils.require_ack requires here - and requiring it is what
+ *          separates a plugin that absorbed the request from a request that never arrived. An
+ *          error envelope, the transport sentinel, a non-object body, an unparsable string and a
+ *          result reporting anything but True all fail.
  *
  *          WHICH BRANCH ACTUALLY OCCURS, AND WHY IT MATTERS TO THIS CASE. Thunder's JSON
  *          deserialiser silently ABSORBS an unknown member instead of failing: when Find(label)
@@ -35,8 +34,8 @@
  *          of assuming the comfortable one.
  *
  *          THE ARC-STATE INVARIANT, AND WHY IT IS DERIVED RATHER THAN OBSERVED. ARC routing state
- *          has NO GETTER on the interface: SetupARCRouting (HdmiCecSinkImplementation.cpp:1600)
- *          publishes only a success flag, and the state it moves - m_currentArcRoutingState - is
+ *          has NO GETTER on the interface: HdmiCecSinkImplementation::SetupARCRouting publishes
+ *          only a success flag, and the state it moves - m_currentArcRoutingState - is
  *          reported outward solely through the arcInitiationEvent / arcTerminationEvent
  *          notifications (ArcTerminationEvent, IHdmiCecSink.h:76), which reach registered
  *          COM-RPC/JSON-RPC subscribers rather than a one-shot curl request/response. So the
@@ -60,8 +59,8 @@
  *
  *          WHAT IS READ AND COMPARED. Three observations, each required to be well formed before
  *          it is compared and each re-read on a bounded monotonic poll: getEnabled, because a
- *          malformed ARC request must not disable HDMI-CEC and the earlier revision never checked
- *          it; getActiveRoute, because routing is what the case name is about; and
+ *          malformed ARC request must not disable HDMI-CEC; getActiveRoute, because routing is what
+ *          the case name is about; and
  *          getAudioDeviceConnectedStatus as a second, independent invariant.
  *
  *          THE COMPARISON IS GUARDED AGAINST PASSING ON NO EVIDENCE. Two absent members would
@@ -120,10 +119,9 @@
  *  - HDMI-CEC reads enabled on both sides of the malformed request.
  *  - The active route read after the malformed request equals the one read before it, and the
  *    audio-device connected status is likewise unchanged.
- *  - The setupARCRouting reply to the malformed request IS asserted, by require_ack: reading
- *    Thunder's registration template settles what the plugin does with an unrecognised member,
- *    so the acknowledgement is a determined outcome rather than a plugin choice this case
- *    would be wrong to pin. See @details, which sets out the derivation.
+ *  - The malformed setupARCRouting request is ACKNOWLEDGED - a result envelope reporting
+ *    success True - which utils.require_ack asserts. @details derives that outcome from Thunder's
+ *    registration template rather than assuming it.
  *  - No ARC routing state change is claimed, because none is observable from this transport.
  *
  * @pass_criteria
@@ -159,6 +157,7 @@ from utils import (
     log_error,
     log_warning,
     log_with_timing,
+    CEC_FRAME_PACING_SECONDS,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -174,10 +173,10 @@ def _result_object(response_text):
 
     A JSON-RPC error envelope carries "error" instead of "result", and a malformed body could carry
     a non-object "result" or not be an object at all. Every such case collapses to {} so the caller
-    reports a MISSING FIELD rather than raising AttributeError out of run_test(). Narrowing here is
-    what let the broad `except Exception` this module used to carry be removed entirely: the only
-    exception a caller can now see is json.JSONDecodeError, handled where it can occur rather than
-    swept up together with every programming defect in the file.
+    reports a MISSING FIELD rather than raising AttributeError out of run_test(). Narrowing here is what keeps the
+    module free of a broad `except Exception`: the only exception a caller can see is
+    json.JSONDecodeError, handled where it can occur rather than swept up together with every
+    programming defect in the file.
     Args:
         response_text: Raw response string as returned by utils.send_curl_command
     Returns:
@@ -193,12 +192,11 @@ def _result_object(response_text):
 def _envelope(response_text):
     """Classify a JSON-RPC reply as ("error", None), ("result", mapping) or (None, None).
 
-    The malformed request's reply is the one body this module must CLASSIFY rather than merely log.
-    An earlier revision logged it and asserted nothing at all, on the grounds that a plugin may
-    refuse an unrecognised parameter with an error or with a bare acknowledgement and that pinning
-    the choice would test the reply rather than the invariant. Classifying is not pinning: it
-    admits both legitimate shapes, rejects the shapes that are neither, and hands the caller the
-    branch it needs in order to check the two against each other.
+    Applied to the FOUR STATE READS this case compares - the two getActiveRoute replies and the two
+    getAudioDeviceConnectedStatus replies - each of which must be a result envelope before its
+    values are believed; a refusal or a non-envelope means there is nothing to compare rather than
+    an invariant that held. The malformed setupARCRouting reply does not come through here: it is
+    asserted by utils.require_ack, which requires the acknowledgement @details derives.
     Returns:
         ("error", None) for an error envelope, ("result", mapping) for a result object, and
         (None, None) when the body is the transport sentinel, is not JSON, or is not a JSON-RPC
@@ -319,18 +317,15 @@ def run_test():
     # The requests below are dispatched as named steps so a reader can see the shape of the
     # experiment: read, read, malformed write, read, read.
     #
-    # THE MALFORMED WRITE IS ASSERTED, WHICH IS WHAT MAKES THE COMPARISON EVIDENCE. Its reply
-    # used to be logged and nothing more, on the reasoning that a plugin's error-reporting choice
-    # should not become a pass criterion. That reasoning left a hole: an unchanged route proves
-    # nothing about a request that never arrived, so a transport failure produced two identical
-    # readings and a pass. What the plugin does is not in fact an open question, and reading the
-    # code settles it. Thunder's registration template calls inbound.FromString(parameters) and
-    # discards the result (Thunder/Source/core/JSONRPC.h, InternalRegister), so the misspelled
+    # THE MALFORMED WRITE IS ASSERTED, WHICH IS WHAT MAKES THE COMPARISON EVIDENCE. An unchanged
+    # route proves nothing about a request that never arrived, so without this assertion a
+    # transport failure would produce two identical readings and a pass. What the plugin does is
+    # not an open question: Thunder's registration template calls inbound.FromString(parameters)
+    # and discards the result (Thunder/Source/core/JSONRPC.h, InternalRegister), so the misspelled
     # "ennabled" leaves the generated Enabled member at its default of false and
-    # HdmiCecSinkImplementation::SetupARCRouting is called with enabled == false: it runs
-    # stopArc() and answers success (HdmiCecSinkImplementation.cpp:1600-1613). The malformed
-    # request is therefore ACKNOWLEDGED, and require_ack asserting that is what proves it was
-    # processed at all.
+    # HdmiCecSinkImplementation::SetupARCRouting is entered with enabled == false: it runs
+    # stopArc() and answers success. The malformed request is therefore ACKNOWLEDGED, and
+    # require_ack asserting that is what proves it was processed at all.
     #
     # WHAT THIS CASE DOES AND DOES NOT CLAIM, given that behaviour. It does NOT claim the request
     # is inert - absorbed as enabled == false, it takes the stopArc() path. It claims that the
@@ -364,7 +359,12 @@ def run_test():
         )
         log_error("TCID32_Invalid_ARC_Routing_Nochange Failed")
         return False
-    time.sleep(1)
+    # The suite's ONE documented CEC frame-pacing window, named rather than spelled as a bare 1.
+    # utils.CEC_FRAME_PACING_SECONDS is 1.0, so the value is unchanged; what changes is that it
+    # is now the same named constant the other 26 pacing waits in this suite use. A bare literal
+    # here made this module's wait look like an ad-hoc guess and meant a change to the suite's
+    # pacing model would silently miss it.
+    time.sleep(CEC_FRAME_PACING_SECONDS)
     final_route = send_curl_command(HdmiCecSinkApis.get_active_route)
     final_audio = send_curl_command(HdmiCecSinkApis.get_audio_device_connected_status)
 

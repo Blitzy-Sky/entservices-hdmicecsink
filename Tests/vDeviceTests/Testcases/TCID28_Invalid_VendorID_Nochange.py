@@ -127,9 +127,9 @@ def _result_object(response_text):
     A JSON-RPC error envelope carries "error" instead of "result", and a malformed body could
     carry a non-object "result" or not be an object at all. Every such case collapses to {} so the
     caller reports a MISSING FIELD rather than raising AttributeError out of run_test(). Narrowing
-    here is what let the broad `except Exception` this module used to carry be removed entirely:
-    the only exception any caller can now see is json.JSONDecodeError, which is handled where it
-    can occur rather than swept up with every programming defect in the file.
+    here is what keeps the module free of a broad `except Exception`: the only exception any caller
+    can see is json.JSONDecodeError, which is handled where it can occur rather than swept up with
+    every programming defect in the file.
     Args:
         response_text: Raw response string as returned by utils.send_curl_command
     Returns:
@@ -246,10 +246,8 @@ def _published_request(argv):
 def cleanup():
     """Restore the vendor identifier this module found before it wrote anything.
 
-    An earlier revision needed no restore clause because its only write re-established the value
-    the positive case had already left behind. This one deliberately writes a DISTINGUISHING value
-    so its negative step can be falsified, which creates a residual - and a residual a module
-    creates, it restores.
+    This module deliberately writes a DISTINGUISHING value so its negative step can be falsified,
+    which creates a residual - and a residual a module creates, it restores.
     SuitManager runs this unconditionally - after a pass, a failure, an exception, and even for a
     case it skipped because a producer failed - so it assumes nothing about how far run_test() got.
     Idempotent: the capture is consumed, so a second call has nothing to do.
@@ -347,15 +345,14 @@ def run_test():
     # string. HdmiCecSinkImplementation::SetVendorId then does stoi("") inside a try, and its
     # catch-all substitutes 0x0019FB (HdmiCecSinkImplementation.cpp:1586-1592).
     #
-    # SUPERSEDED READING, RECORDED RATHER THAN SILENTLY DROPPED. An earlier revision concluded from
-    # that analysis that the baseline had to REMAIN HdmiCECSink_Curl.set_vendor_id's own 0x0019FB,
-    # arguing that "a different baseline would make this case fail for a correct implementation".
-    # It would not: the fallback is one of the two outcomes this case ACCEPTS. Keeping the two
-    # values identical is what made the case unfalsifiable - the absorbed request's own default
-    # landed on the very value being compared against, so the invariant held whether the request
-    # was rejected, absorbed or never dispatched at all. The baseline is therefore a DISTINGUISHING
+    # WHY THE BASELINE MUST DIFFER FROM THE FALLBACK. If the baseline were
+    # HdmiCECSink_Curl.SET_VENDOR_ID_VALUE's own 0x0019FB - the same value the catch-all
+    # substitutes - the case would be unfalsifiable: the absorbed request's default would land on
+    # the very value being compared against, so the invariant would hold whether the request was
+    # rejected, absorbed or never dispatched at all. The baseline is therefore a DISTINGUISHING
     # value written through the published setter, and the two outcomes are told apart by which of
-    # the two renderings the identifier carries afterwards.
+    # the two renderings the identifier carries afterwards. Accepting the fallback is not a
+    # weakness: it is one of the two outcomes this case explicitly admits and reports.
     #
     # REQUIRED PRODUCTION CHANGE, REPORTED AND NOT MADE (AAP Directive 6). That a misspelt member
     # silently rewrites the advertised vendor identifier to a hard-coded literal is a robustness

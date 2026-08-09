@@ -11,8 +11,8 @@
  *          the one currently selected - then org.rdk.HdmiCecSink.requestActiveSource asks the bus
  *          who holds it, two BROADCAST CEC frames are injected through the vComponent so an
  *          already-configured emulated peer answers, and the sink must end up reporting EXACTLY
- *          the peer those frames announce. A run in which nothing moved therefore fails, which is
- *          what an earlier revision of this case could not distinguish from a successful one.
+ *          the peer those frames announce. A run in which nothing moved therefore fails, which a
+ *          shape-only check on the after-probe could not distinguish from a successful one.
  *
  *          The pair of injected frames is deliberate. <Request Active Source> (0x4F 0x85) drives
  *          process(RequestActiveSource) and <Active Source> (0x4F 0x82 0x30 0x00) drives
@@ -33,21 +33,20 @@
  *          holder an earlier case happened to leave behind - so neither predicate could tell this
  *          flow from no flow at all. The exact outcome is DERIVED rather than guessed, and it is
  *          deterministic because this case's own last state-changing step decides it:
- *            - process(ActiveSource) calls addDevice(4) then updateActiveSource(4, msg)
- *              (HdmiCecSinkImplementation.cpp:161-162);
+ *            - HdmiCecSinkProcessor::process(const ActiveSource &, const Header &) calls
+ *              addDevice(4) and then updateActiveSource(4, msg);
  *            - updateActiveSource proceeds whenever the announcing address differs from the
  *              television's own allocated address - 4 against 0 - and then unconditionally sets
  *              deviceList[4].m_isActiveSource, deviceList[4].update(3.0.0.0) and
- *              m_currentActiveSource = 4 (cpp:2150-2159);
+ *              m_currentActiveSource = 4;
  *            - GetActiveSource reports that entry back: available true, logicalAddress 4,
  *              physicalAddress from PhysicalAddress::toString() which is dotted - "3.0.0.0" - and
- *              port from the first nibble as "HDMI" followed by (nibble - 1), so "HDMI2"
- *              (cpp:1344-1370).
+ *              port from the first nibble as "HDMI" followed by (nibble - 1), so "HDMI2".
  *          The <Request Active Source> injected first cannot disturb that: it drives
  *          setActiveSource(true), which either returns early because the television is not the
- *          current active source (cpp:2060-2064) or claims the source for the television - and in
- *          either case the <Active Source> that follows overwrites the result. That ordering is
- *          why the assertion is sound here while a bare "some source is available" check was not.
+ *          current active source - its `isResponse` guard - or claims the source for the
+ *          television, and in either case the <Active Source> that follows overwrites the result.
+ *          That ordering is what makes the exact assertion sound rather than merely plausible.
  *
  *          The sink also publishes an active-source notification, which a device-level curl case
  *          cannot subscribe to, so no event assertion appears below and none is claimed - the
@@ -123,7 +122,7 @@ EXPECTED_ACTIVE_SOURCE_LA = 4
 EXPECTED_ACTIVE_SOURCE_PHYSICAL = "3.0.0.0"
 # GetActiveSource builds the port string from the first nibble of the physical address:
 # nibble 0 reports "TV", any other nibble n reports "HDMI" followed by n - 1
-# (HdmiCecSinkImplementation.cpp:1356-1363). Nibble 3 is therefore the television's third HDMI
+# (HdmiCecSinkImplementation::GetActiveSource). Nibble 3 is therefore the television's third HDMI
 # input, reported as HDMI2.
 EXPECTED_ACTIVE_SOURCE_PORT = "HDMI2"
 
@@ -142,21 +141,22 @@ def _post_hdmicec(yaml_file):
 
 
 # ── THE ANNOUNCED PEER, TAKEN FROM THE FIXTURES THEMSELVES ────────────────────────────────────
-# Process_Active_Source.yaml carries payload ["0x4F", "0x82", "0x10", "0x00"]: header 0x4F is
+# Process_Active_Source.yaml carries payload ["0x4F", "0x82", "0x30", "0x00"]: header 0x4F is
 # initiator 4 with destination 0xF (broadcast), opcode 0x82 is <Active Source>, and the two operand
-# bytes are the nibble-packed physical address 1.0.0.0. process(ActiveSource) accepts broadcast only
-# and then calls addDevice(4) and updateActiveSource(4, 1.0.0.0)
-# (HdmiCecSinkImplementation.cpp:335-343, :1861+), so the outcome is fully determined rather than
-# one plausible outcome among several: getActiveSource must afterwards report that address.
+# bytes are the nibble-packed physical address 3.0.0.0 - SONY's own address in this suite's
+# topology. HdmiCecSinkProcessor::process(const ActiveSource &, const Header &) accepts broadcast
+# only and then calls addDevice(4) and updateActiveSource(4, 3.0.0.0), so the outcome is fully
+# determined rather than one plausible outcome among several: getActiveSource must afterwards report
+# that address.
 #
-# PhysicalAddress::toString() renders {0x10, 0x00} as "1.0.0.0" and GetActiveSource derives the port
-# from getByteValue(0), which is 1, as "HDMI" + (1 - 1) (Operands.hpp; Implementation.cpp:1356-1362).
-# ONE SOURCE OF TRUTH, AND IT IS THE FIXTURE.  These three used to carry 1.0.0.0 and HDMI0 while
-# EXPECTED_ACTIVE_SOURCE_* above carried 3.0.0.0 and HDMI2 for the same reading, and the fixture on
-# disk carries ["0x4F","0x82","0x30","0x00"] - 3.0.0.0.  _is_announced_peer compares against these,
-# so the disagreement meant the Step 1 wait for the peer to take the bus could never be satisfied
-# and only ever expired.  They are now bound to the EXPECTED_ACTIVE_SOURCE_* values rather than
-# restated, so the two families cannot drift apart again.
+# PhysicalAddress::toString() renders {0x30, 0x00} as "3.0.0.0" and GetActiveSource derives the port
+# from getByteValue(0), which is 3, as "HDMI" + (3 - 1) - hence "HDMI2" (ccec/Operands.hpp;
+# HdmiCecSinkImplementation::GetActiveSource).
+#
+# ONE SOURCE OF TRUTH, AND IT IS THE FIXTURE. These three are BOUND to the EXPECTED_ACTIVE_SOURCE_*
+# values rather than restated, because _is_announced_peer compares Step 1's readings against them:
+# any disagreement between the two families would mean the wait for the peer to take the bus could
+# never be satisfied and would only ever expire.
 ANNOUNCED_LOGICAL_ADDRESS = EXPECTED_ACTIVE_SOURCE_LA
 ANNOUNCED_PHYSICAL_ADDRESS = EXPECTED_ACTIVE_SOURCE_PHYSICAL
 ANNOUNCED_PORT = EXPECTED_ACTIVE_SOURCE_PORT
@@ -483,13 +483,10 @@ def run_test():
         log_error("Invalid JSON response")
         log_error("TCID17_Request_Active_Source_Flow Failed ❌")
         return False
-    # NOTHING FOLLOWS THE except HANDLER ABOVE, AND A SECOND COPY OF STEPS 3 AND 4 USED TO.
-    # It was unreachable - it sat after the terminal `return False` of the try/except that closes
-    # this function, so Python never executed a line of it - and it was also WRONG: it asserted
-    # the active source became 1.0.0.0 on HDMI0, while the fixture it posted,
-    # vcomponent_configurations/commands/Process_Active_Source.yaml, carries
-    # ["0x4F","0x82","0x30","0x00"] - physical address 3.0.0.0, which GetActiveSource reports on
-    # HDMI2.  Its first statement also read an `acknowledgement` name that this module never binds.
-    # The reachable flow above asserts the same transition against the values the fixture actually
-    # produces (EXPECTED_ACTIVE_SOURCE_*), so the duplicate is removed rather than repaired: two
-    # copies of one assertion is how the two drift apart again.
+    # NOTHING MAY FOLLOW THE except HANDLER ABOVE.  The try/except that closes this function ends
+    # in a terminal `return False`, so any statement added after it is unreachable and Python will
+    # never execute a line of it.  Assert the active-source transition once, in the reachable flow
+    # above, against EXPECTED_ACTIVE_SOURCE_* - which are derived from the values
+    # vcomponent_configurations/commands/Process_Active_Source.yaml actually produces
+    # (["0x4F","0x82","0x30","0x00"] is physical address 3.0.0.0, which GetActiveSource reports on
+    # HDMI2).  A second copy of that assertion is how two copies drift apart.

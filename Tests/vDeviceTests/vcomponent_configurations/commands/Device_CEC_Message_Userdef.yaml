@@ -53,9 +53,14 @@
 #
 # Payload, byte by byte:
 #   0x5F  header = (initiator << 4) | destination
-#         = (AUDIO_SYSTEM 5 << 4) | BROADCAST 0xF. Initiator 5 is the peer
-#         pinned by ../hdmicec/hdmicec_vcomponent_configuration.yaml - the one
-#         logical address the vComponent offers an AudioSystem - and
+#         = (AUDIO_SYSTEM 5 << 4) | BROADCAST 0xF. Initiator 5 is the YAMAHA
+#         audio-system PEER, declared beneath the television in
+#         Device_Config_Add_Network.yaml; 5 is the one logical address
+#         vcDevice_AllocateLogicalAddress offers an AudioSystem, so the address
+#         follows from the declared role rather than being chosen here.
+#         (../hdmicec/hdmicec_vcomponent_configuration.yaml pins something
+#         different and must not be read as the source of this address: it
+#         declares the emulated DEVICE UNDER TEST, the television VTV.)
 #         LogicalAddress::BROADCAST is an alias of UNREGISTERED == 15.
 #   0x82  ACTIVE_SOURCE. Not 0x9D, which is INACTIVE_SOURCE and takes the
 #         opposite guard.
@@ -66,15 +71,19 @@
 #         forwards it to updateActiveSource, which writes it into
 #         deviceList[5].m_physicalAddr. An operand naming any other address
 #         therefore MOVES the audio system, and moving it off the ARC port's
-#         address disables process(InitiateArc) altogether (cpp:508-534). Keep
-#         this pair equal to the operand in
+#         address disables process(const InitiateArc &, const Header &)
+#         altogether. Keep this pair equal to the operand in
 #         DeviceListConfig/Payload_Report_Physical_Address_AudioSystem.yaml.
 #
-# The filename is part of the contract. utils.HDMICEC_CMD_BASE resolves to this
-# directory and a test case joins this exact basename onto it, while
-# utils.send_vcomponent_command() reports a missing document as code 0 rather
-# than raising - so a renamed file does not fail loudly, it quietly drops the
-# injection step from every case that posted it. Note the abbreviated
+# AVAILABLE FIXTURE, NO CURRENT CONSUMER. No test case in this suite posts this
+# document; the cases that need an ActiveSource announcement post
+# Process_Active_Source.yaml instead, which carries the same opcode and operand
+# from initiator 4. This document is available for a case that wants the frame
+# from initiator 5, and the filename is part of the contract for any case that
+# posts it: utils.HDMICEC_CMD_BASE resolves to this directory and the bare
+# basename is joined onto it, while utils.send_vcomponent_command() reports a
+# missing document as code 0 rather than raising - so a renamed file would not
+# fail loudly, it would quietly drop the injection step. Note the abbreviated
 # "Userdef", which distinguishes this raw-byte document from the symbolic
 # Device_CEC_Message form of the same injection.
 HdmiCec:

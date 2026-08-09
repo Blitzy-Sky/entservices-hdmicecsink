@@ -31,11 +31,16 @@
  *
  *          THE ORDER OF STEPS 2 AND 3 IS FUNCTIONAL, NOT COSMETIC, and must not be swapped: a
  *          reply injected before its request is an unsolicited report, not half of an exchange.
- *          The emulator cannot answer the solicitation by itself either - the
- *          <Request Short Audio Descriptor> -> <Report Short Audio Descriptor> pair is recorded
- *          as ABSENT from the auto-response table in
- *          vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml:82-83 -
- *          which is why the answer is injected as a raw user_defined payload.
+ *
+ *          WHY THE REPLY IS INJECTED EVEN THOUGH THE EMULATOR WOULD ANSWER. The auto-response
+ *          table in vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml DOES
+ *          carry the <Request Short Audio Descriptor> -> <Report Short Audio Descriptor> pair,
+ *          but it carries it with `payload: null`: the emulator answers with the opcode and no
+ *          operands. A Short Audio Descriptor IS its operands - three bytes per descriptor - and
+ *          Process_ShortAudioDescriptor_msg reads them, so an operand-less auto-reply exercises
+ *          the handler's entry and nothing it does. The user_defined payload injected here
+ *          carries a real one-descriptor body, which is what makes step 3 an exchange with
+ *          content rather than an empty acknowledgement.
  *
  * @precondition
  *  - A device under test - physical hardware or a QEMU target - is running WPEFramework with
@@ -103,6 +108,7 @@ import json
 from utils import (
     send_curl_command,
     send_vcomponent_command,
+    sanitise_for_log,
     HDMICEC_CMD_BASE,
     log_info,
     log_success,
@@ -116,7 +122,7 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 def _post_hdmicec(yaml_file):
     """Post a HdmiCec vComponent YAML command."""
     http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{yaml_file}")
-    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {body}")
+    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {sanitise_for_log(body)}")
     return http_code == 200
 
 
@@ -267,16 +273,15 @@ def run_test():
         log_error("TCID23_Short_Audio_Descriptor_Flow Failed ❌")
         return False
 
-    # VALUE ASSERTION ON `connected`, NOT A TYPE ASSERTION. An earlier revision checked only
-    # isinstance(connected, bool), reasoning from the sink's own L2 suite, which asserts
-    # EXPECT_FALSE(connected) (../../L2Tests/tests/HdmiCecSink_L2Test.cpp
-    # GetAudioDeviceConnectedStatus_COMRPC over COM-RPC, GetAudioDeviceConnectedStatus_JSONRPC
-    # over JSON-RPC). THAT CITATION DOES NOT TRANSFER: the L2 host discovers no audio system at
-    # all, which is why False is correct there, whereas this suite REQUIRES the VAUDIO peer at
-    # logical address 5 as a @precondition and addDevice() sets hdmiCecAudioDeviceConnected
-    # unconditionally for that address (:2457-2459), with nothing on any path this module drives
-    # clearing it. True is therefore the measured expectation for THIS environment, and a
-    # type-only check would have accepted the peer silently vanishing mid-exchange.
+    # VALUE ASSERTION ON `connected`, NOT A TYPE ASSERTION, and the distinction from the sink's L2
+    # suite is the reason. That suite asserts EXPECT_FALSE(connected) in
+    # GetAudioDeviceConnectedStatus_COMRPC and GetAudioDeviceConnectedStatus_JSONRPC
+    # (../../L2Tests/tests/HdmiCecSink_L2Test.cpp) because its in-process host discovers no audio
+    # system at all. THAT DOES NOT TRANSFER HERE: this suite REQUIRES the YAMAHA audio system at
+    # logical address 5 as a @precondition, addDevice() sets hdmiCecAudioDeviceConnected
+    # unconditionally for that address, and nothing on any path this module drives clears it. True
+    # is therefore the expectation for THIS environment, and a type-only check would accept the
+    # peer silently vanishing mid-exchange.
     connected_before = _read_flag(HdmiCecSinkApis.get_audio_device_connected_status, "connected")
     if connected_before is not True:
         log_error(

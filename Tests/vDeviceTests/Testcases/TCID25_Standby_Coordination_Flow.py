@@ -50,29 +50,33 @@
  *
  * @expected_result
  *  - sendStandbyMessage is accepted and acknowledged, all four command documents are accepted by
- *    the vComponent, and the device list is still well formed after the cycle with no peer lost
- *    from it.
- *  - THE PEERS' OWN POWER STATE IS NOT ASSERTED, because the sink publishes no getter that
- *    reports it: the only powerStatus on the interface belongs to the active-source record, and a
- *    standby flow may legitimately leave no active source at all. Nor is OnImageViewOnMsg
- *    asserted - it is a Thunder notification and is not observable over this suite's one-shot
- *    curl transport, which cannot subscribe to a notification channel. That is a limit of
- *    THIS level only: the event IS asserted by the sink's own suites - L1
- *    onImageViewOnMsg_DirectedFrame_NotifiesSubscribedClient and its unregistered-initiator,
- *    standby-wakeup and broadcast variants, and L2 InjectImageViewOnFrameAndVerifyEvent with
- *    its broadcast, unknown-playback-device and unregistered-address companions. The
- *    COVERAGE_GAPS.md entry listing it among the five uncovered notifications is that
- *    register's PRE-CHANGE BASELINE.
+ *    the vComponent, and after the cycle the device list reports the SAME set of logical
+ *    addresses it reported before it - not merely a count that did not fall.
+ *  - EACH PEER'S RECORDED POWER STATUS IS CONSTRAINED, not left unread. getDeviceList publishes
+ *    the field per peer, so this case captures it before the broadcast and admits exactly two
+ *    outcomes per address afterwards: unchanged, which is the emulator outcome because this
+ *    suite's response table absorbs <Standby> with `response: null`; or moved to "Standby",
+ *    which is what real hardware does once the sink's power-status poll interval has elapsed.
+ *    Any other movement, and any value outside PowerStatus::toString()'s vocabulary, fails.
+ *  - OnImageViewOnMsg IS NOT asserted: it is a Thunder notification, and this suite's one-shot
+ *    curl transport cannot subscribe to a notification channel. That is a limit of THIS level
+ *    only - the event is asserted by the sink's own L1 and L2 suites
+ *    (onImageViewOnMsg_DirectedFrame_NotifiesSubscribedClient and its variants;
+ *    InjectImageViewOnFrameAndVerifyEvent and its companions), and the COVERAGE_GAPS.md entry
+ *    listing it among the uncovered notifications describes that register's pre-change baseline.
  *
  * @pass_criteria
- *  - All four required YAML posts return HTTP 200, sendStandbyMessage acknowledges
- *    'success': true, the after-probe reports 'success': true with an int 'numberofdevices' that
- *    has not decreased since the before-probe, and run_test() returns True.
+ *  - All four required YAML posts return HTTP 200; sendStandbyMessage acknowledges
+ *    'success': true; the after-probe reports 'success': true and the same set of logical
+ *    addresses as the before-probe; every peer's power status is either unchanged or has moved to
+ *    "Standby"; and run_test() returns True.
  *
  * @failure_criteria
  *  - An empty reply, the "< No response from WPEFramework >" transport sentinel, a rejected
- *    vComponent post, an unacknowledged standby request, a device count that fell across the
- *    cycle, a JSON parse error, or run_test() returning False.
+ *    vComponent post, an unacknowledged standby request, a changed set of discovered logical
+ *    addresses, a peer power status that moved to anything other than "Standby" or that is outside
+ *    the PowerStatus vocabulary, a device list that became unreadable, a JSON parse error, or
+ *    run_test() returning False.
  */
 """
 
@@ -92,16 +96,6 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-# The eight utils names above are this case's pinned import contract: the six that every TCID
-# module in this suite shares, plus send_vcomponent_command and HDMICEC_CMD_BASE. Those last two
-# are exactly what separates a flow case from a single-API case - they are the reason this module
-# can inject frames at all, and therefore the reason it is able to repay the residual TCID15
-# declares and cannot repair. log_with_timing belongs to the shared set and is imported with it
-# although this case gates its own message inline: the inline form keeps the choice of log level
-# at the call that prints, whereas log_with_timing returns a string and would move that choice
-# away from the call site. Nothing beyond the set is imported - in particular no HTTP, YAML or
-# RAFT package, because this suite authors device-level requests and never serves them.
-#
 # The source suite's equivalent flow wakes its peer through a one-touch-play action. IHdmiCecSink
 # publishes no such method, so that idiom is deliberately NOT carried across and no constant for
 # it is imported; the sink's wake levers are the view-on frames injected below.
@@ -158,9 +152,9 @@ def _ensure_peers_woken():
 
 
 # EVERY STRING THE PLUGIN CAN PUBLISH AS A PEER'S powerStatus, AND NOTHING ELSE. getDeviceList
-# renders the field through PowerStatus::toString() (HdmiCecSinkImplementation.cpp:1403), so the
-# admissible set is that function's own output and is written out here rather than guessed at:
-# Operands.hpp:595-614 names "On", "Standby", "In transition Standby to On" and
+# renders the field through PowerStatus::toString(), so the admissible set is that function's own
+# output and is written out here rather than guessed at: PowerStatus in ccec/Operands.hpp names
+# "On", "Standby", "In transition Standby to On" and
 # "In transition On to Standby" for the four bytes validate() accepts, and returns "Unknown" for
 # anything else. "Unknown" is admitted deliberately - PowerStatus' frame constructor takes whatever
 # byte arrives on the wire, so a peer reporting POWER_STATUS_NOT_KNOWN (0x04) or
@@ -455,12 +449,11 @@ def _run_standby_coordination_flow():
         log_success(f"✔ delivered {description}")
 
     # ── AFTER-PROBE: THE POWER OBSERVATION AND THE TOPOLOGY INVARIANT ────────────────────────────
-    # THE ADDRESS SET MUST BE IDENTICAL, NOT MERELY NOT SMALLER. An earlier revision asserted only
-    # after_count >= before_count, which passed a run where a peer vanished and a different one
-    # appeared, and passed a spurious peer arriving from nowhere. Every frame this case injects
-    # initiates from an address the suite already seeded (5 and 4) and addDevice() is idempotent for
-    # a device already present, so the set can only be identical - equality is the correct claim and
-    # is strictly stronger.
+    # THE ADDRESS SET MUST BE IDENTICAL, NOT MERELY NOT SMALLER. A count comparison would pass a
+    # run where one peer vanished and a different one appeared, and would pass a spurious peer
+    # arriving from nowhere. Every frame this case injects initiates from an address the suite
+    # already seeded (5 and 4) and addDevice() is idempotent for a device already present, so the
+    # set can only be identical - equality is the correct claim and is strictly stronger.
     deadline = time.monotonic() + OBSERVE_TIMEOUT_S
     while True:
         reading = _recorded_power_status()
@@ -483,13 +476,13 @@ def _run_standby_coordination_flow():
     # THE POWER OBSERVATION, AND WHY IT ADMITS EXACTLY TWO OUTCOMES PER PEER. Both are correct, in
     # different environments, and the case reports which one it saw:
     #   * UNCHANGED. On the emulator this is the expected outcome, because this suite's own response
-    #     table declares <Standby> as absorbed with `response: null`
-    #     (vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml:46-47), so the
-    #     peer's declared power_status does not move and a later refresh re-reads the same value.
+    #     table declares <Standby> as absorbed with `response: null` (the Standby request entry in
+    #     vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml), so the peer's
+    #     declared power_status does not move and a later refresh re-reads the same value.
     #   * MOVED TO "Standby". On real hardware a peer genuinely powers down, and the sink's poll
     #     thread re-reads power status once HDMICECSINK_UPDATE_POWER_STATUS_INTERVA_MS - sixty
-    #     seconds (:53, cleared at :2914) - has elapsed since the last update, so the recorded value
-    #     legitimately becomes Standby. Failing that would be failing correct behaviour.
+    #     seconds - has elapsed since the last update, so the recorded value legitimately becomes
+    #     Standby. Failing that would be failing correct behaviour.
     # ANY OTHER MOVEMENT IS WRONG IN BOTH ENVIRONMENTS and fails: a peer captured as Standby reading
     # anything else means something woke it, and a value outside the PowerStatus vocabulary means
     # the record is malformed. Whichever outcome occurred, run_test()'s finally block re-issues the

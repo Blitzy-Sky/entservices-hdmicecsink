@@ -79,20 +79,19 @@
 #     PLAYBACKDEVICE1 and PANASONIC takes PLAYBACKDEVICE2 rather than the two competing for it.
 #
 # WHY THE AUDIO SYSTEM IS ON PORT 2, AND WHY THAT IS NOT INTERCHANGEABLE.
-# process(InitiateArc) (HdmiCecSinkImplementation.cpp:508-534) derives the ARC port's physical
+# process(const InitiateArc &, const Header &) derives the ARC port's physical
 # address from HdmiArcPortID - 0 gives 1.0.0.0, 1 gives 2.0.0.0, 2 gives 3.0.0.0, anything else
 # leaves it at the invalid sentinel 15.15.15.15 - and proceeds to Process_InitiateArc() only when
 # deviceList[0x5].m_physicalAddr matches that address or is itself the sentinel. This suite seeds
 # the audio system's physical address explicitly, so the sentinel escape does not apply: an audio
 # system at the wrong address makes the sink's ARC initiation path structurally unreachable and
 # every ARC fixture in this tree a silent no-op. Port 2 is not a guess - the suite states its own
-# platform three times over, in test_HdmiCecSink.cpp:853 and in HdmiCecSink_L2Test.cpp:961 and
-# :1224, each stubbing device::HdmiInput::getHDMIARCPortId to 1 and reporting only port 1
-# connected. HDMI input 1 is physical address 2.0.0.0, because the sink matches a peer to an input
+# platform in both of its GoogleTest suites, the sink L1 and the sink L2, each stubbing
+# device::HdmiInput::getHDMIARCPortId to 1 and reporting only port 1 connected. HDMI input 1 is physical address 2.0.0.0, because the sink matches a peer to an input
 # by comparing the address's first nibble against m_portID + 1.
 #
 # WHY THREE PEERS ARE NESTED UNDER THE AUDIO SYSTEM RATHER THAN GIVEN THEIR OWN TV PORTS.
-# updateDeviceChain (cpp:1933-1956) and getActiveRoute (cpp:1958-1987) both admit a peer into the
+# updateDeviceChain and getActiveRoute both admit a peer into the
 # sink's HdmiPortMap only when the first nibble of its physical address equals some
 # hdmiInputs[i].m_portID + 1 for i < m_numofHdmiInput. A peer at 4.0.0.0 or 5.0.0.0 is discoverable
 # through getDeviceList but never enters the port map on a three-input television, so its route can
@@ -110,7 +109,8 @@
 # A peer renamed, re-typed or re-ported here without the same change there leaves two documents
 # describing different devices at the same address. The trap is not theoretical: an <Active Source>
 # or <Report Physical Address> operand is written straight into deviceList[la].m_physicalAddr
-# (cpp:366 and updateActiveSource), so a stale operand does not merely read wrong - it MOVES the
+# (process(const ReportPhysicalAddress &, const Header &) and updateActiveSource), so a stale
+# operand does not merely read wrong - it MOVES the
 # peer, and moving the audio system disables ARC.
 #
 # THE AUDIO SYSTEM IS LOAD-BEARING IN A SECOND WAY. The vComponent offers an audio system exactly
@@ -180,8 +180,8 @@ HdmiCec:
                 # all. Declaring this peer a Tuner instead would allocate it from the tuner pool
                 # (3, 6, 7, 10), leaving 3 to SAMSUNG and 6 to this device, so address 5 would be
                 # unoccupied and Init_Devicelist_Populate's bootstrap - which declares discovery
-                # ready on address 5 - could never complete. There is no separate VAUDIO device in
-                # this topology; the audio system IS this peer.
+                # ready on address 5 - could never complete. This peer IS the topology's audio
+                # system; there is no second audio-system device anywhere in it.
                 device_type: "AudioSystem"
                 power_status: "on"
                 fault: no

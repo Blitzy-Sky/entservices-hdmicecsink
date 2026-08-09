@@ -17,6 +17,7 @@
 * limitations under the License.
 **/
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -25,13 +26,17 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "HdmiCecSink.h"
@@ -107,56 +112,15 @@ static bool isOwnedRegularFile(const char* path, bool& exists)
     return S_ISREG(pathStat.st_mode) && (pathStat.st_uid == geteuid());
 }
 
-static bool readWholeFile(const char* path, std::string& contents)
-{
-    contents.clear();
-
-    const int fileDescriptor = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fileDescriptor < 0) {
-        return false;
-    }
-
-    char buffer[4096];
-    bool readSucceeded = true;
-    for (;;) {
-        const ssize_t chunk = read(fileDescriptor, buffer, sizeof(buffer));
-        if (chunk == 0) {
-            break;
-        }
-        if (chunk < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            readSucceeded = false;
-            break;
-        }
-        contents.append(buffer, static_cast<size_t>(chunk));
-    }
-    return (close(fileDescriptor) == 0) && readSucceeded;
-}
-
-static bool writeWholeFile(const char* path, const std::string& contents)
-{
-    const int fileDescriptor = open(path,
-        O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR);
-    if (fileDescriptor < 0) {
-        return false;
-    }
-
-    bool writeSucceeded = true;
-    size_t offset = 0;
-    while (writeSucceeded && (offset < contents.size())) {
-        const ssize_t chunk = write(fileDescriptor, contents.data() + offset, contents.size() - offset);
-        if (chunk <= 0) {
-            writeSucceeded = (errno == EINTR);
-            continue;
-        }
-        offset += static_cast<size_t>(chunk);
-    }
-
-    writeSucceeded = writeSucceeded && (offset == contents.size());
-    return (close(fileDescriptor) == 0) && writeSucceeded;
-}
+// readWholeFile() and writeWholeFile() USED TO LIVE HERE and are gone, superseded by
+// snapshotOwnedRegularFile() and publishFileAtomically() below.  They are removed rather than
+// left unused because each carried the defect its replacement exists to fix - readWholeFile read
+// to EOF with no size bound and returned no metadata; writeWholeFile truncated the target in
+// place, so a reader could observe it empty or half-written, and created it 0600 regardless of
+// what the original mode had been.  Their only caller was ScopedCecSettingsFile.  Keeping them as
+// dead code would leave the weaker pair as the obvious thing to reach for next time a
+// process-global path needs bracketing, and an unused static function is also a -Wunused-function
+// warning in a build that treats warnings as errors.
 
 // std::remove, not unlink: this suite links with -Wl,-wrap,unlink and routes that symbol
 // into the Wraps mock, which is torn down before this guard is destroyed. std::remove
@@ -168,6 +132,266 @@ static void removeOwnedRegularFile(const char* path)
     if (isOwnedRegularFile(path, exists) && exists) {
         (void)std::remove(path);
     }
+}
+
+// Largest snapshot this suite will take of a process-global file.  A cap is needed because the
+// snapshot is held in memory and the path is not one this suite owns: /opt/persistent/ds is a
+// real persistence directory on a shared host, and whatever is sitting at that path when the
+// suite starts is not bounded by anything the suite controls.  Reading until EOF into a
+// std::string makes the test's memory footprint a function of a foreign file.  Exceeding the cap
+// is reported and the guard then refuses to touch the file at all, rather than capturing a
+// prefix - restoring a truncated prefix would destroy the rest of it.
+static const size_t kMaxSnapshotBytes = 1024u * 1024u;
+
+/**
+ * Exclusive custody of one process-global path for the lifetime of this object.
+ *
+ * The paths this suite brackets are host-global and this host runs many checkouts of this
+ * repository at once, so "capture, clear, restore" is only correct while nothing else is doing
+ * the same thing to the same path: two overlapping guards can each capture the other's cleared
+ * state and then restore it, and the original contents are gone.  An advisory whole-file flock
+ * on a sibling lock file is what serialises them - advisory because the file under test is
+ * opened by production code that knows nothing about the lock, so the lock has to live beside
+ * the path rather than on it.
+ *
+ * Custody is NOT fail-open.  When it cannot be taken within the bound, Held() stays false and
+ * every caller refuses to mutate anything; a guard that proceeded without custody would be
+ * indistinguishable from one that had it, right up to the point where it overwrote another
+ * run's file.
+ *
+ * Reference-counted per path within the process so nested acquisitions - a fixture's guard and
+ * a helper that also wants custody of the same path - share one descriptor instead of
+ * deadlocking against themselves, which flock(LOCK_EX) on a second descriptor in the same
+ * process would do.
+ */
+class PathCustodyLock {
+public:
+    explicit PathCustodyLock(const char* fileName)
+        : m_path(std::string(fileName) + ".l1test.lock")
+        , m_held(false)
+    {
+        std::lock_guard<std::mutex> guard(Mutex());
+        Registry_t& registry = Registry();
+        Registry_t::iterator existing = registry.find(m_path);
+        if (existing != registry.end()) {
+            existing->second.second++;
+            m_held = true;
+            return;
+        }
+
+        const int fd = ::open(m_path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            return;
+        }
+        for (int waitedMs = 0; waitedMs <= kLockWaitMs; waitedMs += 50) {
+            if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+                registry[m_path] = std::make_pair(fd, 1);
+                m_held = true;
+                return;
+            }
+            if (errno != EWOULDBLOCK) {
+                break;
+            }
+            ::usleep(50 * 1000);
+        }
+        ::close(fd);
+    }
+
+    PathCustodyLock(const PathCustodyLock&) = delete;
+    PathCustodyLock& operator=(const PathCustodyLock&) = delete;
+
+    ~PathCustodyLock()
+    {
+        if (!m_held) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(Mutex());
+        Registry_t& registry = Registry();
+        Registry_t::iterator existing = registry.find(m_path);
+        if (existing == registry.end()) {
+            return;
+        }
+        if (--existing->second.second <= 0) {
+            (void)::flock(existing->second.first, LOCK_UN);
+            ::close(existing->second.first);
+            registry.erase(existing);
+        }
+    }
+
+    bool Held() const { return m_held; }
+
+private:
+    typedef std::map<std::string, std::pair<int, int> > Registry_t;
+
+    static const int kLockWaitMs = 5000;
+
+    static Registry_t& Registry()
+    {
+        static Registry_t registry;
+        return registry;
+    }
+
+    static std::mutex& Mutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    std::string m_path;
+    bool m_held;
+};
+
+/**
+ * Snapshot of a process-global file, taken through a descriptor and complete with its metadata.
+ *
+ * Everything here is checked on the DESCRIPTOR rather than on the path: O_NOFOLLOW refuses a
+ * symlink outright, and the fstat that follows describes the object actually opened, so the
+ * regular-file and ownership tests cannot be defeated by replacing the path between the check
+ * and the open.  Mode, uid and gid are part of the snapshot because they are part of the state:
+ * handing the file back with the right bytes and the wrong permissions is not handing it back.
+ *
+ * @param present  set when a file was there at all - absence is a valid state to restore to.
+ * @return false when the file exists but could not be captured faithfully; the caller must then
+ *         leave it alone, because a partial capture cannot be restored.
+ */
+static bool snapshotOwnedRegularFile(const char* path, std::string& contents,
+    mode_t& fileMode, uid_t& fileUid, gid_t& fileGid, bool& present)
+{
+    contents.clear();
+    fileMode = 0600;
+    fileUid = static_cast<uid_t>(-1);
+    fileGid = static_cast<gid_t>(-1);
+    present = false;
+
+    const int fd = ::open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        // ENOENT is "nothing to capture", which is a state, not a failure.  ELOOP is
+        // O_NOFOLLOW refusing a symlink, and that IS a failure: something is at the path that
+        // this suite must not write through.
+        return (errno == ENOENT);
+    }
+
+    struct stat fileStat;
+    if (::fstat(fd, &fileStat) != 0) {
+        ::close(fd);
+        return false;
+    }
+    if (!S_ISREG(fileStat.st_mode) || (fileStat.st_uid != ::geteuid())) {
+        ::close(fd);
+        return false;
+    }
+    if (static_cast<size_t>(fileStat.st_size) > kMaxSnapshotBytes) {
+        ::close(fd);
+        return false;
+    }
+
+    char buffer[4096];
+    bool readSucceeded = true;
+    for (;;) {
+        const ssize_t chunk = ::read(fd, buffer, sizeof(buffer));
+        if (chunk == 0) {
+            break;
+        }
+        if (chunk < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            readSucceeded = false;
+            break;
+        }
+        if ((contents.size() + static_cast<size_t>(chunk)) > kMaxSnapshotBytes) {
+            // It grew past the cap while being read.  Reported by returning false; a prefix is
+            // not a snapshot.
+            readSucceeded = false;
+            break;
+        }
+        contents.append(buffer, static_cast<size_t>(chunk));
+    }
+
+    const bool closed = (::close(fd) == 0);
+    if (!readSucceeded || !closed) {
+        contents.clear();
+        return false;
+    }
+
+    fileMode = static_cast<mode_t>(fileStat.st_mode & 07777);
+    fileUid = fileStat.st_uid;
+    fileGid = fileStat.st_gid;
+    present = true;
+    return true;
+}
+
+/**
+ * Put @p contents back at @p path ATOMICALLY, with the captured metadata.
+ *
+ * Truncate-then-write is the alternative, and it has a window in which the file exists with the
+ * right name and the wrong contents - zero bytes, then a prefix.  The plugin under test reads
+ * this exact path during Initialize(), and a sibling run of this suite reads it too, so that
+ * window is observable: loadSettings() parsing an empty or half-written cecData_2.json is
+ * precisely the state this guard exists to prevent.  Writing a sibling temporary and rename(2)ing
+ * it over the target replaces the file in one step - a reader sees either the old file or the new
+ * one - and rename also preserves the target's directory entry rather than recreating it.
+ *
+ * The temporary is created O_EXCL so an existing file at that name is never adopted, gets the
+ * captured mode and owner before it is published rather than after, and is fsync'ed so the
+ * rename cannot be ordered ahead of the data.  Any failure removes the temporary and returns
+ * false, leaving the original file exactly as it was.
+ */
+static bool publishFileAtomically(const char* path, const std::string& contents,
+    const mode_t fileMode, const uid_t fileUid, const gid_t fileGid)
+{
+    const std::string staged = std::string(path) + ".l1test.staged";
+
+    (void)std::remove(staged.c_str());
+    const int fd = ::open(staged.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        return false;
+    }
+
+    bool ok = true;
+    size_t offset = 0;
+    while (ok && (offset < contents.size())) {
+        const ssize_t chunk = ::write(fd, contents.data() + offset, contents.size() - offset);
+        if (chunk > 0) {
+            offset += static_cast<size_t>(chunk);
+            continue;
+        }
+        if ((chunk < 0) && (errno == EINTR)) {
+            continue;
+        }
+        ok = false;
+    }
+    ok = ok && (offset == contents.size());
+
+    // Permissions first, ownership second, and ownership only when it would actually change:
+    // fchown to the current owner is a no-op that still fails for an unprivileged process, and
+    // failing a restore over a no-op would be wrong.
+    if (ok && (::fchmod(fd, fileMode) != 0)) {
+        ok = false;
+    }
+    if (ok && (fileUid != static_cast<uid_t>(-1))) {
+        struct stat stagedStat;
+        if (::fstat(fd, &stagedStat) != 0) {
+            ok = false;
+        } else if ((stagedStat.st_uid != fileUid) || (stagedStat.st_gid != fileGid)) {
+            ok = (::fchown(fd, fileUid, fileGid) == 0);
+        }
+    }
+    if (ok && (::fsync(fd) != 0)) {
+        ok = false;
+    }
+    if (::close(fd) != 0) {
+        ok = false;
+    }
+
+    if (ok) {
+        ok = (::rename(staged.c_str(), path) == 0);
+    }
+    if (!ok) {
+        (void)std::remove(staged.c_str());
+    }
+    return ok;
 }
 
 /**
@@ -187,31 +411,91 @@ static void removeOwnedRegularFile(const char* path)
  * it snapshots the file (and whether its directory existed at all) before the plugin is
  * initialised, clears it so the plugin loads its documented defaults, and puts the exact
  * original state back afterwards - including removing a directory the run created, so the
- * next fixture sees the same filesystem the first one did. It is declared as the first
- * fixture member so it is constructed before every mock and destroyed after all of them.
+ * next fixture sees the same filesystem the first one did.
+ *
+ * THIS IS THE ONLY GUARD ON THIS PATH, and it is declared as the first member of the BASE
+ * fixture, so its lifetime encloses every mock, every derived-fixture member and both the
+ * Initialize() and Deinitialize() calls in the fixture bodies.  There used to be two: a
+ * plain-iostream snapshot on the base fixture and this one on a derived fixture, both
+ * bracketing the same path.  Two guards on one path is not redundancy, it is a bug - the
+ * derived one was constructed AFTER the base one had already cleared the file, so its
+ * "snapshot" was always "absent", and its destructor consequently REMOVED the file (and
+ * could rmdir the directory) on the way out.  What actually protected the host's contents
+ * was the weaker guard.  Collapsing them leaves one snapshot, taken at the earliest point
+ * in the fixture's life, doing the whole job.
+ *
+ * HOW IT HOLDS UP AGAINST A HOSTILE OR MERELY BUSY PATH.  /opt/persistent/ds is a real
+ * persistence directory, the name is predictable, and this host runs many checkouts of
+ * this repository concurrently:
+ *   - CUSTODY FIRST.  A PathCustodyLock over the path is the first member, so it is taken
+ *     before the snapshot and released after the restore, and two overlapping runs cannot
+ *     each capture the other's cleared state.  It is not fail-open: without custody the
+ *     guard reports the fact and touches NOTHING, leaving the file to its owner.
+ *   - NO SYMLINK IS FOLLOWED, EVER.  Both the snapshot and the restore act on a descriptor
+ *     opened O_NOFOLLOW and re-check regular-file-ness and ownership through fstat on that
+ *     descriptor, so the path cannot be swapped between the check and the use.
+ *   - THE READ IS BOUNDED.  A foreign file at that path is not size-limited by anything
+ *     this suite controls, so the capture caps at kMaxSnapshotBytes and refuses rather than
+ *     keeping a prefix - restoring a prefix would destroy the remainder.
+ *   - METADATA IS PART OF THE STATE.  Mode, uid and gid are captured and re-applied; right
+ *     bytes with wrong permissions is not a restored file.
+ *   - THE RESTORE IS ATOMIC.  It writes a sibling temporary and rename(2)s it over the
+ *     target, so no reader - the plugin's own loadSettings(), or a sibling run - can ever
+ *     observe the empty or half-written file that truncate-then-write leaves visible.
+ * Every failure is reported through ADD_FAILURE_AT rather than swallowed, because a guard
+ * that silently did not restore is worse than one that did not run.
  */
 class ScopedCecSettingsFile {
 public:
     ScopedCecSettingsFile()
+        : m_custody(kCecSettingsFile)
     {
+        if (!m_custody.Held()) {
+            ADD_FAILURE_AT(__FILE__, __LINE__)
+                << "could not take custody of " << kCecSettingsFile
+                << " within the bound, so this fixture will NOT touch it: capturing and "
+                   "restoring it while another run holds it would destroy that run's copy. "
+                   "The plugin will load whatever is there, which may make this test fail for "
+                   "a reason that is not its own.";
+            return;
+        }
+
         struct stat directoryStat;
         m_directoryExisted = (lstat(kCecSettingsDirectory, &directoryStat) == 0)
             && S_ISDIR(directoryStat.st_mode);
 
-        bool exists = false;
-        if (isOwnedRegularFile(kCecSettingsFile, exists) && exists) {
-            m_captured = readWholeFile(kCecSettingsFile, m_contents);
+        bool present = false;
+        if (!snapshotOwnedRegularFile(kCecSettingsFile, m_contents,
+                m_mode, m_uid, m_gid, present)) {
+            ADD_FAILURE_AT(__FILE__, __LINE__)
+                << "could not capture " << kCecSettingsFile
+                << " faithfully (symlink, not a regular file, foreign-owned, larger than "
+                << kMaxSnapshotBytes << " bytes, or a read error), so it is left untouched: a "
+                   "partial capture cannot be restored.";
+            return;
         }
+        m_captured = present;
+        m_bracketed = true;
 
         // Start every fixture from the same state: no persisted settings, so
         // loadSettings() takes its documented "create with default settings" path.
-        removeOwnedRegularFile(kCecSettingsFile);
+        Clear();
     }
 
     ~ScopedCecSettingsFile()
     {
+        if (!m_bracketed) {
+            // Nothing was captured, so there is nothing this guard is entitled to change.
+            return;
+        }
+
         if (m_captured) {
-            (void)writeWholeFile(kCecSettingsFile, m_contents);
+            if (!publishFileAtomically(kCecSettingsFile, m_contents, m_mode, m_uid, m_gid)) {
+                ADD_FAILURE_AT(__FILE__, __LINE__)
+                    << "failed to restore " << kCecSettingsFile
+                    << "; the host is left with whatever this fixture last wrote there, and a "
+                       "later fixture or a sibling run will inherit it.";
+            }
             return;
         }
 
@@ -226,9 +510,25 @@ public:
     ScopedCecSettingsFile(const ScopedCecSettingsFile&) = delete;
     ScopedCecSettingsFile& operator=(const ScopedCecSettingsFile&) = delete;
 
+    // Take the file out of the way so the code under test starts from its documented default.
+    // Only ever acts once the snapshot succeeded, so a fixture that could not take custody
+    // cannot delete a file it did not capture.
+    void Clear() const
+    {
+        if (m_bracketed) {
+            removeOwnedRegularFile(kCecSettingsFile);
+        }
+    }
+
 private:
+    // FIRST member: custody is acquired before the snapshot and released after the restore.
+    PathCustodyLock m_custody;
     std::string m_contents;
-    bool m_captured = false;
+    mode_t m_mode = 0600;
+    uid_t m_uid = static_cast<uid_t>(-1);
+    gid_t m_gid = static_cast<gid_t>(-1);
+    bool m_captured = false;      // a file was there and was captured
+    bool m_bracketed = false;     // custody held and snapshot taken: this guard may act
     bool m_directoryExisted = false;
 };
 /*
@@ -403,58 +703,17 @@ private:
     mode_t m_mode;
     bool m_captured;
 };
-// Snapshot of one process-global file, so a fixture can hand the filesystem back exactly as it
-// found it.  Deliberately capture-and-restore rather than unconditional deletion: the suite runs
-// on a shared host and must not decide, on the strength of one test, that a file the rest of the
-// system owns should cease to exist.
-class ScopedGlobalFile {
-public:
-    explicit ScopedGlobalFile(const char* fileName)
-        : m_fileName(fileName)
-        , m_wasPresent(false)
-        , m_contents()
-    {
-        std::ifstream input(m_fileName.c_str(), std::ios::in | std::ios::binary);
-        if (input.is_open()) {
-            m_wasPresent = true;
-            m_contents.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-            input.close();
-        }
-    }
-
-    ScopedGlobalFile(const ScopedGlobalFile&) = delete;
-    ScopedGlobalFile& operator=(const ScopedGlobalFile&) = delete;
-
-    ~ScopedGlobalFile()
-    {
-        Restore();
-    }
-
-    // Take the file out of the way so the code under test starts from its documented default.
-    void Clear() const
-    {
-        std::remove(m_fileName.c_str());
-    }
-
-    void Restore() const
-    {
-        if (m_wasPresent) {
-            std::ofstream output(m_fileName.c_str(), std::ios::out | std::ios::trunc | std::ios::binary);
-            if (output.is_open()) {
-                output.write(m_contents.data(), static_cast<std::streamsize>(m_contents.size()));
-                output.close();
-            }
-        } else {
-            std::remove(m_fileName.c_str());
-        }
-    }
-
-private:
-    std::string m_fileName;
-    bool m_wasPresent;
-    std::string m_contents;
-};
-
+// ScopedGlobalFile - a plain-iostream snapshot of one process-global file - USED TO LIVE HERE and
+// has been removed as a class, not merely stopped being used.  Its single instantiation bracketed
+// /opt/persistent/ds/cecData_2.json from the base fixture while ScopedCecSettingsFile bracketed the
+// SAME path from a derived one, and it was the weaker of the two that the host's contents actually
+// depended on: it followed a symlink at the path, read to EOF without a bound, restored by
+// truncating in place - so a reader could see the file empty or half-written - discarded the file's
+// mode, owner and group, and held no lock against the sibling runs of this suite that share the
+// host.  Leaving it in place as dead code would invite its reuse for the next global path.
+// ScopedCecSettingsFile above is now the one guard on that path, hardened for exactly those five
+// points, and it is declared as the first member of the base fixture so it is the earliest thing
+// constructed and the last thing destroyed.
 // The plugin brings itself up asynchronously: Initialize() returns as soon as the polling thread
 // has been started, and it is that thread which reaches POLL_THREAD_STATE_POLL, calls
 // allocateLAforTV() and records m_logicalAddressAllocated
@@ -505,7 +764,11 @@ static bool waitForTvLogicalAddress(const unsigned int timeoutMs)
 // No test body is modified by this: it is fixture state management only.
 class HdmiCecSinkInitializeTest : public ::testing::Test {
 protected:
-    ScopedGlobalFile persistedCecSettings;
+    // FIRST member of the BASE fixture, so the bracket opens before any mock, any derived-fixture
+    // member and any Initialize() in a constructor body, and closes after every one of them.  This
+    // is the only guard on this path; see ScopedCecSettingsFile for why there used to be two and
+    // why the earlier of the two was the one that mattered.
+    ScopedCecSettingsFile persistedCecSettings;
     Core::ProxyType<Plugin::HdmiCecSink> plugin;
     Core::JSONRPC::Handler& handler;
     DECL_CORE_JSONRPC_CONX connection;
@@ -521,9 +784,11 @@ protected:
 
     HdmiCecSinkInitializeTest()
         // Captured before the plugin exists, so the snapshot is of the state this test inherited.
-        // The literal is CEC_SETTING_ENABLED_FILE from HdmiCecSinkImplementation.cpp, which is a
-        // private production macro and therefore not visible to a test translation unit.
-        : persistedCecSettings("/opt/persistent/ds/cecData_2.json")
+        // The path is kCecSettingsFile, which repeats the value of CEC_SETTING_ENABLED_FILE from
+        // HdmiCecSinkImplementation.cpp - a private production macro, and therefore not visible to
+        // a test translation unit.  The guard takes that constant itself rather than a path
+        // argument, so there is exactly one place in this file that names it.
+        : persistedCecSettings()
         , plugin(Core::ProxyType<Plugin::HdmiCecSink>::Create())
         , handler(*(plugin))
         , INIT_CONX(1, 0)
@@ -545,11 +810,17 @@ protected:
 
 class HdmiCecSinkDsTest : public HdmiCecSinkInitializeTest {
 protected:
-    // FIRST member on purpose: constructed before every mock and before the constructor
-    // body calls plugin->Initialize(), destroyed after the destructor body has called
-    // plugin->Deinitialize() and after every mock has been torn down. See
-    // ScopedCecSettingsFile for why the persisted settings file has to be isolated.
-    ScopedCecSettingsFile cecSettingsFileGuard;
+    // NO SETTINGS-FILE GUARD HERE, DELIBERATELY.  This fixture used to declare its own
+    // ScopedCecSettingsFile over the same path the base fixture already bracketed, and the
+    // duplication was actively harmful rather than merely redundant: a base subobject is
+    // constructed in full before any derived member, so by the time this one ran the base guard
+    // had already cleared the file - its snapshot was therefore always "absent", and its
+    // destructor consequently REMOVED the file and could rmdir /opt/persistent/ds on the way out,
+    // one step before the base guard put the real contents back.  The bracket the host's contents
+    // actually depended on was the base one.  There is now exactly one guard, it is the base
+    // fixture's first member, and its lifetime already encloses everything this fixture does -
+    // every mock, plugin->Initialize() in the constructor body and plugin->Deinitialize() in the
+    // destructor body.  See ScopedCecSettingsFile for how it is hardened.
 
     // Minimal RPC::IRemoteConnection double, used to drive the plugin's private
     // remote-connection notification sink. Stack-allocated by the tests, so Release() only
@@ -1330,11 +1601,15 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, powerModeChange)
 // Configure() really consults RFC, and then proves the behavioural consequence on the bus: a 2.0
 // sink answers <Give Features> with a broadcast <Report Features> and a 1.4 sink stays silent.
 //
-// The sink vDevice suite keeps a matching negative constant,
-// Tests/vDeviceTests/HdmiCECSink_Curl.py's get_cec_version_unregistered, whose name states that
-// the method is unregistered so that no test asset presents this internal helper as a published
-// endpoint. The CEC version is observable instead through the <Give CEC Version> exchange in that
-// suite's vComponent response configuration.
+// The sink vDevice suite reaches the same conclusion from the device side, and it deliberately
+// publishes NO shared command constant for the name: Tests/vDeviceTests/HdmiCECSink_Curl.py
+// records at the point where such a constant would sit that none exists, together with the four
+// confirmations that the method is unregistered. Its TCID05_Get_CEC_Version instead builds the
+// request in the case itself and asserts that the dispatcher refuses it, so the tripwire survives
+// without a shared asset presenting an internal helper as though it were a published endpoint.
+// Where the version IS observable device-side is the <Give CEC Version> exchange in that suite's
+// vComponent response configuration, whose reply reaches a peer's device-list entry as its
+// "cecVersion" field and is read back by TCID02_Get_Devicelist.
 TEST_F(HdmiCecSinkInitializedEventDsTest, DISABLED_getCecVersion)
 {
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getCecVersion"), _T("{}"), response));
@@ -4314,13 +4589,20 @@ TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_EachAbortReason_IsNotified)
     // The notification each call produces is what this test is about, so the JSON-RPC event is
     // captured and asserted per reason. Asserting only that the call did not throw, or that an
     // operand still reads back its own value, would pass even if the fan-out never happened.
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -4329,7 +4611,7 @@ TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_EachAbortReason_IsNotified)
     // The five reasons defined by CEC: unrecognised opcode, not in correct mode, cannot provide
     // source, invalid operand and refused.
     for (int reason = 0; reason <= 4; reason++) {
-        notified.clear();
+        notified->clear();
 
         // The shared CEC mock's AbortReason(int) constructor is the only one in that header
         // which leaves its public `impl` delegate uninitialised, and AbortReason::toInt()
@@ -4341,12 +4623,12 @@ TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_EachAbortReason_IsNotified)
             LogicalAddress(4), OpCode(GET_CEC_VERSION), abortReason))
             << "abort reason " << reason << " was not reported cleanly";
 
-        EXPECT_THAT(notified, ::testing::HasSubstr("reportFeatureAbortEvent"))
+        EXPECT_THAT(*notified, ::testing::HasSubstr("reportFeatureAbortEvent"))
             << "abort reason " << reason << " produced no client notification";
-        EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":4"))
+        EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":4"))
             << "abort reason " << reason;
-        EXPECT_THAT(notified, ::testing::HasSubstr("\"opcode\":" + std::to_string(static_cast<int>(GET_CEC_VERSION)))) << "abort reason " << reason;
-        EXPECT_THAT(notified, ::testing::HasSubstr("\"FeatureAbortReason\":" + std::to_string(reason))) << "abort reason " << reason;
+        EXPECT_THAT(*notified, ::testing::HasSubstr("\"opcode\":" + std::to_string(static_cast<int>(GET_CEC_VERSION)))) << "abort reason " << reason;
+        EXPECT_THAT(*notified, ::testing::HasSubstr("\"FeatureAbortReason\":" + std::to_string(reason))) << "abort reason " << reason;
     }
 
     EVENT_UNSUBSCRIBE(0, _T("reportFeatureAbortEvent"), _T("client.events.reportFeatureAbortEvent"), message);
@@ -4361,13 +4643,20 @@ TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_BoundaryOperands_AreNotified)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -4388,7 +4677,7 @@ TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_BoundaryOperands_AreNotified)
     };
 
     for (const Boundary& boundary : boundaries) {
-        notified.clear();
+        notified->clear();
 
         AbortReason abortReason(boundary.reason);
         abortReason.impl = nullptr;
@@ -4396,10 +4685,10 @@ TEST_F(HdmiCecSinkDsTest, reportFeatureAbortEvent_BoundaryOperands_AreNotified)
             LogicalAddress(boundary.logicalAddress), OpCode(boundary.opcode), abortReason))
             << boundary.description;
 
-        EXPECT_THAT(notified, ::testing::HasSubstr("reportFeatureAbortEvent")) << boundary.description;
-        EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":" + std::to_string(boundary.logicalAddress))) << boundary.description;
-        EXPECT_THAT(notified, ::testing::HasSubstr("\"opcode\":" + std::to_string(boundary.opcode))) << boundary.description;
-        EXPECT_THAT(notified, ::testing::HasSubstr("\"FeatureAbortReason\":" + std::to_string(boundary.reason))) << boundary.description;
+        EXPECT_THAT(*notified, ::testing::HasSubstr("reportFeatureAbortEvent")) << boundary.description;
+        EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":" + std::to_string(boundary.logicalAddress))) << boundary.description;
+        EXPECT_THAT(*notified, ::testing::HasSubstr("\"opcode\":" + std::to_string(boundary.opcode))) << boundary.description;
+        EXPECT_THAT(*notified, ::testing::HasSubstr("\"FeatureAbortReason\":" + std::to_string(boundary.reason))) << boundary.description;
     }
 
     EVENT_UNSUBSCRIBE(0, _T("reportFeatureAbortEvent"), _T("client.events.reportFeatureAbortEvent"), message);
@@ -5093,13 +5382,20 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_SubscribedClient_Recei
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5107,22 +5403,29 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_SubscribedClient_Recei
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->SendKeyPressMsgEvent(4, 65));
     EVENT_UNSUBSCRIBE(0, _T("onKeyPressEvent"), _T("client.events.onKeyPressEvent"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("onKeyPressEvent"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":4"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"keyCode\":65"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("onKeyPressEvent"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":4"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"keyCode\":65"));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_BoundaryOperands_AreForwardedVerbatim)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5137,43 +5440,57 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_BoundaryOperands_AreFo
 
     EVENT_UNSUBSCRIBE(0, _T("onKeyPressEvent"), _T("client.events.onKeyPressEvent"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":0"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"keyCode\":0"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":15"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"keyCode\":255"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"keyCode\":256"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":0"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"keyCode\":0"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":15"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"keyCode\":255"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"keyCode\":256"));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyPressEvent_NoSubscriber_ProducesNoClientNotification)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->SendKeyPressMsgEvent(4, 65));
 
-    EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onKeyPressEvent")));
+    EXPECT_THAT(*notified, ::testing::Not(::testing::HasSubstr("onKeyPressEvent")));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyReleaseEvent_SubscribedClient_ReceivesLogicalAddress)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5184,12 +5501,12 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onKeyReleaseEvent_SubscribedClient_Rec
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->SendKeyReleaseMsgEvent(LogicalAddress::UNREGISTERED));
     EVENT_UNSUBSCRIBE(0, _T("onKeyReleaseEvent"), _T("client.events.onKeyReleaseEvent"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("onKeyReleaseEvent"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":4"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":0"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":15"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("onKeyReleaseEvent"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":4"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":0"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":15"));
     // The release event carries no key code at all.
-    EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("keyCode")));
+    EXPECT_THAT(*notified, ::testing::Not(::testing::HasSubstr("keyCode")));
 }
 
 // Deliberately makes no claim about the wake-from-standby companion event: the TV's own power
@@ -5240,13 +5557,20 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_UnregisteredInitiator
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5263,7 +5587,7 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_UnregisteredInitiator
 
     EVENT_UNSUBSCRIBE(0, _T("onImageViewOnMsg"), _T("client.events.onImageViewOnMsg"), message);
 
-    EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onImageViewOnMsg")));
+    EXPECT_THAT(*notified, ::testing::Not(::testing::HasSubstr("onImageViewOnMsg")));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_DirectedFrameWhileInStandby_AlsoNotifiesWakeup)
@@ -5323,13 +5647,20 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_BroadcastFrame_Produc
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5346,7 +5677,7 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onImageViewOnMsg_BroadcastFrame_Produc
 
     EVENT_UNSUBSCRIBE(0, _T("onImageViewOnMsg"), _T("client.events.onImageViewOnMsg"), message);
 
-    EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onImageViewOnMsg")));
+    EXPECT_THAT(*notified, ::testing::Not(::testing::HasSubstr("onImageViewOnMsg")));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, onTextViewOnMsg_DirectedFrame_NotifiesSubscribedClient)
@@ -5393,13 +5724,20 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, reportFeatureAbortEvent_SubscribedClie
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5416,10 +5754,10 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, reportFeatureAbortEvent_SubscribedClie
 
     EVENT_UNSUBSCRIBE(0, _T("reportFeatureAbortEvent"), _T("client.events.reportFeatureAbortEvent"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("reportFeatureAbortEvent"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":4"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"opcode\":" + std::to_string(static_cast<int>(GET_CEC_VERSION))));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"FeatureAbortReason\":" + std::to_string(static_cast<int>(AbortReason::UNRECOGNIZED_OPCODE))));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("reportFeatureAbortEvent"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":4"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"opcode\":" + std::to_string(static_cast<int>(GET_CEC_VERSION))));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"FeatureAbortReason\":" + std::to_string(static_cast<int>(AbortReason::UNRECOGNIZED_OPCODE))));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, onDeviceRemoved_SubscribedClient_ReceivesLogicalAddress)
@@ -5470,13 +5808,20 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onDeviceRemoved_AbsentDevice_ProducesN
 
     Plugin::HdmiCecSinkImplementation::_instance->deviceList[LogicalAddress::UNREGISTERED].clear();
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5485,7 +5830,7 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onDeviceRemoved_AbsentDevice_ProducesN
     EXPECT_NO_THROW(Plugin::HdmiCecSinkImplementation::_instance->removeDevice(LogicalAddress::UNREGISTERED));
     EVENT_UNSUBSCRIBE(0, _T("onDeviceRemoved"), _T("client.events.onDeviceRemoved"), message);
 
-    EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("onDeviceRemoved")));
+    EXPECT_THAT(*notified, ::testing::Not(::testing::HasSubstr("onDeviceRemoved")));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcFromAudioSystemWhilePoweredOn_NotifiesSuccess)
@@ -5637,13 +5982,20 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcWithWron
         WPEFramework::Exchange::IPowerManager::POWER_STATE_STANDBY,
         WPEFramework::Exchange::IPowerManager::POWER_STATE_ON);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5665,20 +6017,27 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcInitiationEvent_InitiateArcWithWron
 
     EVENT_UNSUBSCRIBE(0, _T("arcInitiationEvent"), _T("client.events.arcInitiationEvent"), message);
 
-    EXPECT_THAT(notified, ::testing::Not(::testing::HasSubstr("arcInitiationEvent")));
+    EXPECT_THAT(*notified, ::testing::Not(::testing::HasSubstr("arcInitiationEvent")));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, arcTerminationEvent_TerminateArcFromAudioSystem_NotifiesSuccess)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5695,21 +6054,28 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, arcTerminationEvent_TerminateArcFromAu
 
     EVENT_UNSUBSCRIBE(0, _T("arcTerminationEvent"), _T("client.events.arcTerminationEvent"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("arcTerminationEvent"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"success\""));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("arcTerminationEvent"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"success\""));
 }
 
 TEST_F(HdmiCecSinkInitializedEventDsTest, standbyMessageReceived_InboundStandby_NotifiesSubscribedClient)
 {
     ASSERT_NE(nullptr, Plugin::HdmiCecSinkImplementation::_instance);
 
-    string notified;
+    // HEAP-OWNED AND CAPTURED BY VALUE.  The action below is installed on `service`, a FIXTURE
+    // member that outlives this body, and gmock keeps the action until the fixture is destroyed -
+    // so the object it writes to must not be a local of this frame.  Delivery is also not
+    // necessarily synchronous: Submit() is the JSON-RPC fan-out path and, with CEC up, the polling
+    // thread reaches it too, so a notification can arrive after the body has returned.  A
+    // shared_ptr taken by value makes the action a co-owner, and the string dies with whichever of
+    // {this body, the action} goes last.
+    auto notified = std::make_shared<string>();
     ON_CALL(service, Submit(::testing::_, ::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
+            [notified](const uint32_t, const Core::ProxyType<Core::JSON::IElement>& json) {
                 string text;
                 json->ToString(text);
-                notified += text;
+                *notified += text;
                 return Core::ERROR_NONE;
             }));
 
@@ -5726,8 +6092,8 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, standbyMessageReceived_InboundStandby_
 
     EVENT_UNSUBSCRIBE(0, _T("standbyMessageReceived"), _T("client.events.standbyMessageReceived"), message);
 
-    EXPECT_THAT(notified, ::testing::HasSubstr("standbyMessageReceived"));
-    EXPECT_THAT(notified, ::testing::HasSubstr("\"logicalAddress\":4"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("standbyMessageReceived"));
+    EXPECT_THAT(*notified, ::testing::HasSubstr("\"logicalAddress\":4"));
 }
 
 //=============================================================================
@@ -5906,27 +6272,48 @@ TEST_F(HdmiCecSinkDsTest, PluginNotificationSink_DeactivationHook_ActsOnlyOnItsO
     RemoteConnectionDouble ownConnection(0);
     RemoteConnectionDouble foreignConnection(4321);
 
-    // Signalled from the worker thread that runs the submitted job, so the wait below can be woken
-    // by the event itself rather than by a clock.  The counter is written on that thread and read on
-    // this one, and the event is what orders the two.
-    Core::Event deactivationDispatched(false, true);
-    uint32_t deactivationsRequested = 0;
+    // HEAP-OWNED STATE, SHARED WITH THE ACTIONS BY VALUE.
+    //
+    // The event, the counter and the captured-sink flag are written by the fixture's WORKER POOL
+    // thread (Deactivated() submits a job rather than calling the shell inline) and read by this
+    // thread.  Capturing them by reference from this stack frame is only safe while the frame is
+    // alive, and the wait below is BOUNDED: `deactivationDispatched.Lock(5000)` is checked with a
+    // non-fatal EXPECT, so on timeout the test body continues, returns, and unwinds this frame -
+    // while the job it was waiting for is still queued.  When that job finally runs it increments
+    // the counter and signals the event through references into a frame that no longer exists.
+    // The actions themselves also outlive the body: they are installed on `service` and
+    // `comLinkMock`, both fixture members, and gmock keeps them until the fixture is destroyed.
+    //
+    // A shared_ptr taken BY VALUE makes each action a co-owner, so the state dies with the last of
+    // {this body, the actions} rather than with the body - in either order, and with no ordering
+    // requirement for the test to get right.  The Core::Event lives inside that block too, because
+    // signalling a destroyed event is the same defect as incrementing a destroyed counter.
+    struct DeactivationProbe {
+        Core::Event dispatched { false, true };
+        std::atomic<uint32_t> requested { 0 };
+        std::atomic<bool> sinkCaptured { false };
+    };
+    auto probe = std::make_shared<DeactivationProbe>();
+
     ON_CALL(service, Deactivate(::testing::_))
         .WillByDefault(::testing::Invoke(
-            [&](const PluginHost::IShell::reason) {
-                ++deactivationsRequested;
-                deactivationDispatched.SetEvent();
+            [probe](const PluginHost::IShell::reason) {
+                ++(probe->requested);
+                probe->dispatched.SetEvent();
                 return Core::ERROR_NONE;
             }));
 
-    bool sinkWasCaptured = false;
+    // ownConnection and foreignConnection are deliberately NOT captured by the shared_ptr: they are
+    // driven synchronously from inside the Unregister action, which runs on THIS thread during
+    // plugin->Deinitialize() below, so they cannot outlive the frame that owns them.  The window is
+    // closed by the ASSERT immediately after Deinitialize returns.
     ON_CALL(comLinkMock, Unregister(::testing::Matcher<const RPC::IRemoteConnection::INotification*>(::testing::_)))
         .WillByDefault(::testing::Invoke(
-            [&](const RPC::IRemoteConnection::INotification* captured) {
+            [probe, &foreignConnection, &ownConnection](const RPC::IRemoteConnection::INotification* captured) {
                 if (captured == nullptr) {
                     return;
                 }
-                sinkWasCaptured = true;
+                probe->sinkCaptured = true;
                 RPC::IRemoteConnection::INotification* sink
                     = const_cast<RPC::IRemoteConnection::INotification*>(captured);
 
@@ -5938,16 +6325,17 @@ TEST_F(HdmiCecSinkDsTest, PluginNotificationSink_DeactivationHook_ActsOnlyOnItsO
             }));
 
     plugin->Deinitialize(&service);
-    ASSERT_TRUE(sinkWasCaptured) << "the plugin never handed its notification sink to the COM link";
+    ASSERT_TRUE(probe->sinkCaptured.load())
+        << "the plugin never handed its notification sink to the COM link";
 
     // Deactivated() submits a job rather than calling the shell inline, so the request arrives on
     // the fixture's worker pool. Waiting on the event returns the instant the job runs and reports
     // ERROR_TIMEDOUT if it never does - bounded, never unbounded, and with no wall-clock interval
     // to guess at.  Matches the idiom the sibling deactivation case below uses.
-    EXPECT_EQ(Core::ERROR_NONE, deactivationDispatched.Lock(5000))
+    EXPECT_EQ(Core::ERROR_NONE, probe->dispatched.Lock(5000))
         << "the deactivation job never reached the shell";
 
-    EXPECT_EQ(1u, deactivationsRequested)
+    EXPECT_EQ(1u, probe->requested.load())
         << "exactly the plugin's own connection should have triggered a shell deactivation";
 }
 
@@ -5975,21 +6363,32 @@ TEST_F(HdmiCecSinkDsTest, Deactivated_MatchingConnectionId_RequestsPluginDeactiv
     RemoteConnectionDouble matchingConnection;
     matchingConnection.SetId(0);
 
-    Core::Event deactivationDispatched(false, true);
-    bool sinkObserved = false;
+    // Heap-owned for the same reason as the sibling hook case above: the event is signalled from
+    // the worker-pool thread that runs the submitted deactivation job, the wait on it is a
+    // NON-FATAL EXPECT, and an action installed on the fixture-member `service` mock outlives this
+    // body.  On timeout the body returns and unwinds while the job is still queued, so a
+    // by-reference capture would signal a destroyed Core::Event.  Captured by value, the state is
+    // co-owned by the action and dies with whichever goes last.
+    struct DeactivationProbe {
+        Core::Event dispatched { false, true };
+        std::atomic<bool> sinkObserved { false };
+    };
+    auto probe = std::make_shared<DeactivationProbe>();
 
     EXPECT_CALL(service, Deactivate(PluginHost::IShell::FAILURE))
         .WillOnce(::testing::Invoke(
-            [&deactivationDispatched](const PluginHost::IShell::reason) -> Core::hresult {
-                deactivationDispatched.SetEvent();
+            [probe](const PluginHost::IShell::reason) -> Core::hresult {
+                probe->dispatched.SetEvent();
                 return Core::ERROR_NONE;
             }));
 
+    // matchingConnection is driven synchronously from inside this action, which runs on THIS thread
+    // during plugin->Deinitialize() below, so a reference to it cannot outlive its frame.
     ON_CALL(comLinkMock, Unregister(::testing::Matcher<const RPC::IRemoteConnection::INotification*>(::testing::_)))
         .WillByDefault(::testing::Invoke(
-            [&](const RPC::IRemoteConnection::INotification* capturedSink) {
+            [probe, &matchingConnection](const RPC::IRemoteConnection::INotification* capturedSink) {
                 if (capturedSink != nullptr) {
-                    sinkObserved = true;
+                    probe->sinkObserved = true;
                     const_cast<RPC::IRemoteConnection::INotification*>(capturedSink)
                         ->Deactivated(&matchingConnection);
                 }
@@ -5998,10 +6397,10 @@ TEST_F(HdmiCecSinkDsTest, Deactivated_MatchingConnectionId_RequestsPluginDeactiv
     // Deinitialize is idempotent, so the fixture destructor's own call becomes a no-op.
     plugin->Deinitialize(&service);
 
-    ASSERT_TRUE(sinkObserved);
+    ASSERT_TRUE(probe->sinkObserved.load());
     // The plugin submits the deactivation to the worker pool the fixture is already running, so
     // this is a bounded wait on delivery rather than a wall-clock delay.
-    EXPECT_EQ(Core::ERROR_NONE, deactivationDispatched.Lock(5000));
+    EXPECT_EQ(Core::ERROR_NONE, probe->dispatched.Lock(5000));
     EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(&service));
 }
 
@@ -6017,26 +6416,37 @@ TEST_F(HdmiCecSinkDsTest, Deactivated_MismatchedConnectionId_IsIgnored)
 
     // _connectionId is 0 by the time Deinitialize hands the sink over, so any non-zero identifier
     // is a foreign connection.
-    RemoteConnectionDouble foreignConnection;
-    foreignConnection.SetId(0xC0FFEEu);
-
-    bool sinkObserved = false;
+    //
+    // HEAP-OWNED, for the same reason as the two sibling deactivation cases even though this one
+    // has no asynchronous leg: `.Times(0)` on Deactivate means no worker job is ever submitted, so
+    // the action below only ever runs synchronously inside plugin->Deinitialize().  What still
+    // outlives this body is the ACTION - it is installed on `comLinkMock`, a fixture member, and
+    // gmock keeps it until the fixture is destroyed, which happens after the fixture destructor has
+    // itself called plugin->Deinitialize(&service).  That second call is a no-op only because
+    // _service is already null; nothing in this test enforces it.  Owning the state and the
+    // connection double through the action removes the question rather than reasoning about it, and
+    // keeps all three deactivation cases in this file to one pattern.
+    struct MismatchProbe {
+        RemoteConnectionDouble foreignConnection { 0xC0FFEEu };
+        std::atomic<bool> sinkObserved { false };
+    };
+    auto probe = std::make_shared<MismatchProbe>();
 
     EXPECT_CALL(service, Deactivate(::testing::_)).Times(0);
 
     ON_CALL(comLinkMock, Unregister(::testing::Matcher<const RPC::IRemoteConnection::INotification*>(::testing::_)))
         .WillByDefault(::testing::Invoke(
-            [&](const RPC::IRemoteConnection::INotification* capturedSink) {
+            [probe](const RPC::IRemoteConnection::INotification* capturedSink) {
                 if (capturedSink != nullptr) {
-                    sinkObserved = true;
+                    probe->sinkObserved = true;
                     EXPECT_NO_THROW(const_cast<RPC::IRemoteConnection::INotification*>(capturedSink)
-                            ->Deactivated(&foreignConnection));
+                            ->Deactivated(&probe->foreignConnection));
                 }
             }));
 
     plugin->Deinitialize(&service);
 
-    ASSERT_TRUE(sinkObserved);
+    ASSERT_TRUE(probe->sinkObserved.load());
     EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(&service));
 }
 
@@ -6209,8 +6619,9 @@ TEST_F(HdmiCecSinkDsTest, UserSettingsNotificationWrapper_ForwardsLanguageChange
     // restart that skipped this would come back up with CEC disabled: measured, the second
     // Initialize then logged "getEnabled :0" and "setCurrentLanguage: Logical Address NOT
     // Allocated", and no logical address was ever allocated. Clear() restores the production
-    // default that loadSettings() applies when the file is absent, and the fixture's
-    // ScopedGlobalFile still puts the host's original contents back at teardown.
+    // default that loadSettings() applies when the file is absent, and the base fixture's
+    // ScopedCecSettingsFile still puts the host's original contents, mode and owner back at
+    // teardown.
     plugin->Deinitialize(&service);
     persistedCecSettings.Clear();
     ASSERT_EQ(string(""), plugin->Initialize(&service));
@@ -6237,7 +6648,21 @@ TEST_F(HdmiCecSinkDsTest, UserSettingsNotificationWrapper_ForwardsLanguageChange
     EXPECT_GT(broadcasts, 0);
 
     // The interface map publishes the UserSettings notification and refuses anything else.
-    EXPECT_NE(nullptr, capturedSink->QueryInterface(Exchange::IUserSettings::INotification::ID));
+    //
+    // A SUCCESSFUL QueryInterface RETURNS A COUNTED REFERENCE - Thunder's INTERFACE_ENTRY calls
+    // AddRef() on the entry it matches (Services.h) - so it is held in a named pointer and released
+    // exactly once rather than being discarded inside the assertion.  Asserting on the returned
+    // value and dropping it adds a reference that nobody ever removes: this sink is a Core::Sink<>,
+    // whose destructor reports outstanding references, and the leak also keeps the implementation
+    // alive past the restart below, which is what makes the sequence at the end of this test
+    // meaningful.  The refused identifier returns nullptr and holds nothing, so it needs no release.
+    // This matches the idiom the sibling interface-map case already uses.
+    void* userSettingsNotification
+        = capturedSink->QueryInterface(Exchange::IUserSettings::INotification::ID);
+    EXPECT_NE(nullptr, userSettingsNotification);
+    if (userSettingsNotification != nullptr) {
+        static_cast<Exchange::IUserSettings::INotification*>(userSettingsNotification)->Release();
+    }
     EXPECT_EQ(nullptr, capturedSink->QueryInterface(Exchange::IHdmiCecSink::ID));
 
     EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(p_connectionImplMock));
@@ -6255,4 +6680,87 @@ TEST_F(HdmiCecSinkDsTest, UserSettingsNotificationWrapper_ForwardsLanguageChange
     persistedCecSettings.Clear();
     ASSERT_EQ(string(""), plugin->Initialize(&service));
     EXPECT_TRUE(waitForTvLogicalAddress(5000));
+}
+
+
+// DISABLED, and it stays disabled: the JSON-RPC method it invokes does not exist.
+//
+// "getCecVersion" is not a published method of this plugin, so no arrangement of mocks can make
+// this test pass:
+//   * IHdmiCecSink.h declares no getCecVersion in its @text method set, and
+//     Exchange::JHdmiCecSink::Register (HdmiCecSink.cpp) is the plugin's ONLY registration path,
+//     so the dispatcher has no such method to invoke - handler.Invoke below can only fail;
+//   * the RegisteredMethods case in this same file enumerates the 24 published names and
+//     getCecVersion is not among them;
+//   * HdmiCecSinkImplementation::getCecVersion() does exist, but it is an internal RFC helper
+//     that returns void and is called only from Configure(); it was never a JSON-RPC endpoint.
+//
+// BLOCKED - REQUIRED PRODUCTION CHANGE, REPORTED NOT MADE: enabling this test needs (1) a
+// getCecVersion method declared on Exchange::IHdmiCecSink in entservices-apis, so ThunderTools
+// generates its JSON-RPC binding, and (2) an implementation of it in the plugin, so
+// Exchange::JHdmiCecSink::Register (HdmiCecSink.cpp:86) publishes it. Both are production source
+// changes, which are out of scope for this suite, so the gap is reported with the change it would
+// require rather than made. The test stays exactly where it is.
+//
+// COMPENSATING COVERAGE, delivered and passing: HdmiCecSinkDsTest
+// .cecVersionFromRfc_ReportedTwoPointZero_ChangesTheGiveFeaturesResponse covers the behaviour
+// this test was reaching for, and covers it more strictly than a JSON-RPC read-back could. It
+// asserts the RFC caller id and the exact TR181 parameter name, proves via a counter that
+// Configure() really consults RFC, and then proves the behavioural consequence on the bus: a 2.0
+// sink answers <Give Features> with a broadcast <Report Features> and a 1.4 sink stays silent.
+//
+// The sink vDevice suite keeps a matching negative constant,
+// Tests/vDeviceTests/HdmiCECSink_Curl.py's get_cec_version_unregistered, whose name states that
+// the method is unregistered so that no test asset presents this internal helper as a published
+// endpoint. The CEC version is observable instead through the <Give CEC Version> exchange in that
+// suite's vComponent response configuration.
+/*
+ * The SUPPORTED contract around the CEC version, asserted executably.
+ *
+ * This is the enabled counterpart to the DISABLED_getCecVersion case below.  That case cannot be
+ * enabled - "getCecVersion" is not a published JSON-RPC method of this plugin and making it one
+ * would require production changes in entservices-apis and the plugin, which are out of scope (see
+ * the block comment on it, and the blocked entry in the traceability report).  What CAN be asserted
+ * without a production change is the contract as it actually stands, and that is what this does:
+ *
+ *   1. "getCecVersion" is NOT published.  Stated as an assertion rather than left as a comment, so
+ *      that if someone later adds the method the disabled case and its documentation are forced
+ *      back into review by a failing test instead of quietly becoming stale.
+ *   2. The published route by which a caller CAN observe a CEC version still answers: getDeviceList
+ *      reports a cecVersion per registered device.  This fixture registers no devices, so the
+ *      response is asserted for a well-formed empty list rather than for a cecVersion field that
+ *      only exists once a device has been discovered - measured: {"numberofdevices":0,
+ *      "success":true}.  The populated form, with the per-device cecVersion, is exercised by the
+ *      frame-processing tests that first register a device.
+ *
+ * The behavioural consequence of the configured version is asserted separately and more strictly by
+ * HdmiCecSinkDsTest.cecVersionFromRfc_ReportedTwoPointZero_ChangesTheGiveFeaturesResponse, which
+ * drives both the 2.0 and 1.4 arms of the <Give Features> handler.  This case deliberately does not
+ * duplicate that.
+ */
+TEST_F(HdmiCecSinkDsTest, cecVersionIsNotAPublishedMethodButIsObservableThroughTheDeviceList)
+{
+    // 1 - the negative contract.  Every published name in this plugin answers Exists() with
+    // ERROR_NONE (see RegisteredMethods); an unpublished one must not.
+    EXPECT_NE(Core::ERROR_NONE, handler.Exists(_T("getCecVersion")))
+        << "getCecVersion is now published by the dispatcher.  That contradicts the analysis "
+           "recorded on DISABLED_getCecVersion and the blocked entry in the traceability report: "
+           "if the method has genuinely been added, enable that case and remove the blocked status "
+           "rather than leaving both stale.";
+
+    // A control in the same breath, so a broken Exists() cannot make the assertion above pass
+    // vacuously: a name that IS published still answers ERROR_NONE.
+    EXPECT_EQ(Core::ERROR_NONE, handler.Exists(_T("getDeviceList")))
+        << "getDeviceList is published, so Exists() must find it; if this fails the negative "
+           "assertion above proves nothing";
+
+    // 2 - the published observation route still answers.  getDeviceList is the method that carries
+    // a per-device cecVersion, so its continued availability is what keeps the CEC version
+    // reachable by a caller at all; without it the gap recorded on the disabled case would widen
+    // from "no dedicated getter" to "no published observation point".
+    EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("getDeviceList"), _T("{}"), response));
+    EXPECT_THAT(response, ::testing::ContainsRegex("\"success\":true"));
+    EXPECT_THAT(response, ::testing::ContainsRegex("\"numberofdevices\":[0-9]+"))
+        << "getDeviceList did not report a device count, so the published route that carries each "
+           "device's cecVersion is not answering; response was: " << response;
 }

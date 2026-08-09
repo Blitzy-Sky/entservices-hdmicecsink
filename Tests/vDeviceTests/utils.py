@@ -13,12 +13,12 @@
  *          vDevice suite: a sibling module composes its request targets from the
  *          WPEFRAMEWORK_JSONRPC_URL and VCOMPONENT_API_URL values published here instead
  *          of embedding host or port literals of its own, so a single environment
- *          variable retargets the whole suite. HdmiCECSink_Curl.py is the consumer that
- *          exists today, alongside the vcomponent_configurations/ YAML fixtures this
- *          module posts. The remaining modules of the suite - SuitManager.py,
- *          Init_Devicelist_Populate.py and the Testcases/TCID*.py cases - are planned and
- *          are not present in this directory yet; they are written against the same
- *          contract when they land.
+ *          variable retargets the whole suite. Its consumers are HdmiCECSink_Curl.py, which
+ *          publishes the structured requests, Init_Devicelist_Populate.py, which seeds the
+ *          device list, SuitManager.py, which runs the suite, and the 33 Testcases/TCID*.py
+ *          cases - all of which are present in this directory and written against the
+ *          contract below - alongside the vcomponent_configurations/ YAML fixtures this
+ *          module posts.
  *
  *          Every request this module issues is executed as an argument LIST with no shell
  *          involved, through the single hardened helper _run_curl(). A request is therefore
@@ -759,12 +759,93 @@ def _close_quietly(stream):
         pass
 
 
+# ------------------------------------------------------------------------------------
+# WHAT CURL IS ALLOWED TO BE TOLD BY ITS SURROUNDINGS.
+#
+# curl reads a great deal of its behaviour from places that are not this argv.  Every one of
+# them is somebody else's decision about a request this suite makes and then reports on:
+#
+#   * ~/.curlrc (or $CURL_HOME/.curlrc).  Read before any argument is processed, and it may
+#     contain ANY option - including --url, --proxy, --header, --data and --output.  A single
+#     line there silently retargets every request in this suite, and the run still reports
+#     whatever came back as the device's answer.
+#   * the proxy variables http_proxy / https_proxy / HTTPS_PROXY / ALL_PROXY / all_proxy.
+#     curl honours them for a plain http:// URL, so an exported proxy sends a request aimed at
+#     a loopback JSON-RPC port to a third party instead - which both leaks the request and
+#     lets the proxy's own document (its 502 page, say) arrive in place of a response.
+#     no_proxy is not a defence: it only carves exceptions out of a proxy that is in effect,
+#     and a hostile or merely stale value can be narrowed as easily as it can be widened.
+#   * CURL_CA_BUNDLE / SSL_CERT_FILE / SSL_CERT_DIR, which decide what a TLS endpoint has to
+#     prove; and NETRC / .netrc, which can attach credentials to a request.
+#
+# Two independent measures, because neither alone is sufficient:
+#
+#   1. "-q" as the FIRST parameter.  curl documents that --disable must come first to take
+#      effect, and it makes curl skip its configuration file entirely.  Applied in _run_curl
+#      rather than in each builder, so it cannot be forgotten by a new call site.
+#   2. an explicit environment.  -q does not touch environment variables, so the child is given
+#      a small allow-list instead of this process's environment: PATH so the binary resolves,
+#      HOME and LANG/LC_ALL for well-defined behaviour, and nothing else.  Absence is the
+#      mechanism -- no filtering of names is involved, so a variable curl gains meaning for in
+#      a future version is excluded by default rather than by enumeration.
+#
+# "--noproxy '*'" is added as well.  It is redundant against the empty environment and
+# deliberately kept: it states the intent in the argv itself, where a reader of a failing run's
+# command line can see it, and it holds even if a caller ever hands _run_curl a pre-built
+# environment.
+# ------------------------------------------------------------------------------------
+_CURL_PASSTHROUGH_ENV = ("PATH", "HOME", "LANG", "LC_ALL")
+_CURL_FALLBACK_PATH = "/usr/bin:/bin"
+
+
+def _curl_child_env():
+    '''Return the minimal environment curl is run with (allow-list, not deny-list).'''
+    env = {}
+    for name in _CURL_PASSTHROUGH_ENV:
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    # PATH is the one entry the child cannot do without: without it execve still succeeds for
+    # the absolute path Popen resolved, but any curl behaviour that shells out (it has none in
+    # this suite's usage) and every diagnostic that names a tool would misreport.
+    env.setdefault("PATH", _CURL_FALLBACK_PATH)
+    return env
+
+
+def _hardened_curl_argv(argv):
+    '''Return argv with "-q" first and "--noproxy '*'" present, without duplicating either.
+
+    Both are inserted immediately after the binary, so they land before any "--" option
+    terminator and can never be read as the URL or as its argument.
+    '''
+    argv = [str(token) for token in argv]
+    if not argv:
+        raise ValueError("empty curl command")
+
+    prefix = []
+    # "-q" only disables the configuration file when it is the first parameter, so it is placed
+    # there.  An argv that already carries it anywhere is left alone rather than given a second
+    # copy in a position where the first one may already have done the work.
+    if not any(token in ("-q", "--disable") for token in argv[1:]):
+        prefix.append("-q")
+    # A caller that has already made its own proxy decision keeps it; this only fills the gap.
+    if not any(token == "--noproxy" or token.startswith("--noproxy=") for token in argv[1:]):
+        prefix.extend(("--noproxy", "*"))
+    if not prefix:
+        return argv
+    return [argv[0]] + prefix + argv[1:]
+
+
 def _run_curl(argv, timeout, input_bytes=None):
     '''Run curl as an argument list with no shell, bounded in time AND in bytes.
 
     This is the ONLY place in the suite that starts a process. shell=False means the argument
     list is passed to execve untouched, so no element of it - endpoint, payload or parameter
     value - can be interpreted as a command, a redirection or a second argument.
+
+    It is also the single place where curl's own configuration surface is closed off: every
+    invocation gets "-q" as its first parameter, "--noproxy '*'", and a minimal explicit
+    environment.  See the block above this function for what each of those excludes and why.
 
     The response is read through _pump_child, which stops at _MAX_RESPONSE_BYTES and kills the
     child rather than accumulating whatever an endpoint chooses to send.  An overflow is
@@ -782,12 +863,17 @@ def _run_curl(argv, timeout, input_bytes=None):
     '''
     deadline = time.monotonic() + timeout + _SUBPROCESS_TIMEOUT_MARGIN_SECONDS
     try:
+        argv = _hardened_curl_argv(argv)
+    except ValueError as exc:
+        return False, None, "", f"curl could not be executed: {exc}"
+    try:
         proc = subprocess.Popen(
             argv,
             shell=False,
             stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=_curl_child_env(),
         )
     except (OSError, ValueError) as exc:
         return False, None, "", f"curl could not be executed: {exc}"
@@ -907,10 +993,14 @@ def _dispatch_jsonrpc(method, params, request_id, timeout):
         _jsonrpc_argv(payload, timeout), timeout
     )
     if not ok:
+        # Bounded and escaped HERE rather than at the log call.  This diagnostic is returned to
+        # callers that interpolate it into a log line, and its content is curl's stderr or the
+        # endpoint's own output - so the value crosses a function boundary before it is printed,
+        # and whichever caller prints it must not have to remember that.
         detail = stderr.strip() or stdout.strip()
         diagnostic = f"curl exited {returncode}"
         if detail:
-            diagnostic = f"{diagnostic}: {detail}"
+            diagnostic = f"{diagnostic}: {sanitise_for_log(detail)}"
         return False, "", diagnostic
 
     body_text, status = _split_http_status(stdout)
@@ -921,11 +1011,12 @@ def _dispatch_jsonrpc(method, params, request_id, timeout):
         )
     if not 200 <= status < 300:
         detail = body_text.strip()
-        if len(detail) > 200:
-            detail = detail[:200] + "..."
         diagnostic = f"the endpoint answered HTTP {status}, which is not a success status"
         if detail:
-            diagnostic = f"{diagnostic}; body: {detail!r}"
+            # sanitise_for_log both bounds the length and escapes control bytes; the manual
+            # 200-character slice it replaces did the first and not the second, so an error page
+            # containing an ESC still reached the terminal.
+            diagnostic = f"{diagnostic}; body: {sanitise_for_log(detail, 200)}"
         return False, "", diagnostic
 
     body = body_text.strip()
@@ -935,22 +1026,59 @@ def _dispatch_jsonrpc(method, params, request_id, timeout):
     return True, body, ""
 
 
-def _parse_jsonrpc_envelope(body):
-    '''Return the decoded JSON-RPC 2.0 envelope, or None when the body is not one.
+def _no_duplicate_keys(pairs):
+    '''json object_pairs_hook that refuses an object with a repeated key.
 
-    A complete envelope is a JSON object carrying "jsonrpc": "2.0" together with either a
-    result or an error member. An error envelope IS a valid response - the device answered -
-    so it is returned to the caller rather than suppressed.
+    json.loads keeps the LAST value for a duplicated key and says nothing, so
+    {"result": {"success": false}, "result": {"success": true}} decodes to a success and a
+    reader of the raw body sees a refusal.  This suite hands the RAW TEXT back to its callers
+    and they parse it again, so a body whose meaning depends on which parser is asked cannot be
+    treated as an answer at all.  Raising here makes the whole decode fail, which is what the
+    callers already handle as "not an envelope".
+    '''
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r} in a JSON object")
+        seen[key] = value
+    return seen
+
+
+def _parse_jsonrpc_envelope(body):
+    '''Return the decoded JSON-RPC 2.0 envelope, or None when the body is not exactly one.
+
+    A complete envelope is a JSON object carrying "jsonrpc": "2.0" together with EXACTLY ONE of
+    a result member or an error member. An error envelope IS a valid response - the device
+    answered - so it is returned to the caller rather than suppressed.
+
+    Five ways of not being an envelope are refused, and each was reachable before:
+
+      * not JSON at all, or JSON followed by anything else.  json.loads refuses trailing data,
+        so this also rejects a body that is one envelope plus a second document, a log line or
+        an HTML error page appended to it.
+      * not a JSON object: an array is refused, which is what makes a JSON-RPC BATCH response
+        inadmissible here.  A batch answers several requests; this suite issues one request per
+        exchange, so a batch cannot be attributed to it, and taking element zero would be a
+        guess.
+      * "jsonrpc" that is not exactly the string "2.0".
+      * BOTH result and error present, or NEITHER.  The specification says a response carries
+        one or the other, never both; an envelope with both is self-contradictory, and the
+        previous test ("neither present") accepted it - after which envelope_result() would
+        report a result for a response that also announced a failure.
+      * a repeated key anywhere in the document (see _no_duplicate_keys).
     '''
     try:
-        decoded = json.loads(body)
+        decoded = json.loads(body, object_pairs_hook=_no_duplicate_keys)
     except (TypeError, ValueError):
         return None
     if not isinstance(decoded, dict):
         return None
     if decoded.get("jsonrpc") != "2.0":
         return None
-    if "result" not in decoded and "error" not in decoded:
+    has_result = "result" in decoded
+    has_error = "error" in decoded
+    if has_result == has_error:
+        # Both, or neither.
         return None
     return decoded
 
@@ -1258,18 +1386,26 @@ def send_curl_command(curl_command, timeout=None):
       * a server that sends success-looking JSON and then stalls until curl gives up at exit 28
         was reported as a successful response, because the JSON had already been printed.
 
+    A third, from the same family, is closed by the environment and configuration handling in
+    _run_curl: a request aimed at a loopback JSON-RPC port being sent to whatever an exported
+    proxy variable or a ~/.curlrc line names instead, so that a third party's document arrives
+    in place of the device's answer.
+
     All four conditions below must therefore hold, and each is checked because the others
     cannot see its failure:
 
       1. curl exited 0 - so the exchange completed rather than timing out or being refused;
       2. the HTTP status is 2xx - so the request was actually served;
-      3. exactly ONE line of the body is a complete JSON-RPC 2.0 envelope - so a document with
-         several JSON fragments, or none, is not silently reduced to whichever line came first;
+      3. the WHOLE body is exactly one complete JSON-RPC 2.0 envelope and nothing else - so a
+         document with several JSON fragments, with an HTML error page around one of them, or
+         with none at all, is not silently reduced to whichever line came first;
       4. the envelope's id matches the id the command sent, when the command carried one - so a
          stale or fabricated response cannot be attributed to this request.
 
     The response is returned as a raw string, not a parsed object: callers run their own
-    json.loads on it so that they can distinguish a malformed payload from a missing one.
+    json.loads on it so that they can distinguish a malformed payload from a missing one.  The
+    string returned is the exact text this function parsed, so a caller's second parse cannot
+    reach a different conclusion from this one's.
     Any failure - a command that cannot be tokenised, a curl binary that is absent, a
     transport error, a non-success status, an unparsable body, an id mismatch, a response over
     the byte ceiling, or no body at all - yields the "< No response from WPEFramework >"
@@ -1281,7 +1417,8 @@ def send_curl_command(curl_command, timeout=None):
                  to anything that is not a positive integer, falls back to
                  CURL_TIMEOUT_SECONDS.
     Returns:
-        The single JSON-RPC envelope line, otherwise the sentinel string.
+        The single JSON-RPC envelope, as the exact stripped body text, otherwise the sentinel
+        string.
     '''
     try:
         if isinstance(curl_command, (list, tuple)):
@@ -1329,73 +1466,78 @@ def send_curl_command(curl_command, timeout=None):
 
         if not ok:
             detail = stderr.strip() or stdout.strip()
-            print(
+            log_warning(
                 "Inside Utils.py : send_curl_command got no usable response - curl exited "
-                f"{returncode}" + (f": {detail}" if detail else "")
+                f"{returncode}"
+                + (f": {sanitise_for_log(detail)}" if detail else "")
             )
             return NO_RESPONSE_SENTINEL
 
         body, status = _split_http_status(stdout)
         if status is None:
-            print(
+            log_warning(
                 "Inside Utils.py : send_curl_command got no HTTP status back, so no "
                 "request/response exchange completed"
             )
             return NO_RESPONSE_SENTINEL
         if not 200 <= status < 300:
             snippet = body.strip()
-            if len(snippet) > 200:
-                snippet = snippet[:200] + "..."
-            print(
+            log_warning(
                 f"Inside Utils.py : the endpoint answered HTTP {status}, which is not a success "
-                f"status" + (f"; body: {snippet!r}" if snippet else "")
+                f"status"
+                + (f"; body: {sanitise_for_log(snippet, 200)}" if snippet else "")
             )
             return NO_RESPONSE_SENTINEL
 
-        # EXACTLY ONE envelope.  Collecting every match rather than breaking at the first one is
-        # the point: a body carrying two envelopes is not a response this suite can attribute,
-        # and quietly taking the first would hide that.
-        envelope_lines = []
-        for line in body.splitlines(keepends=True):
-            if _parse_jsonrpc_envelope(line) is not None:
-                envelope_lines.append(line)
-
-        if not envelope_lines:
-            snippet = body.strip()
-            if len(snippet) > 200:
-                snippet = snippet[:200] + "..."
-            print(
-                "Inside Utils.py : the response carried no JSON-RPC 2.0 envelope"
-                + (f"; body: {snippet!r}" if snippet else "")
+        # ONE DOCUMENT, PARSED ONCE, IN FULL.
+        #
+        # This used to walk the body LINE BY LINE and collect the lines that parsed as an
+        # envelope.  Everything that was not on such a line was therefore ignored: a body
+        # consisting of an HTML error page, a stack trace or a second JSON document with one
+        # envelope line somewhere inside it was accepted, and the envelope line alone was
+        # returned as "the response".  That is a parser reading past content it does not
+        # understand, and the content it skipped is exactly where a discrepancy would show.
+        #
+        # The whole stripped body is now parsed as a single JSON-RPC envelope.  json.loads
+        # refuses trailing data, so "exactly one envelope AND NOTHING ELSE" is enforced by the
+        # decode itself rather than by counting matches - and a two-envelope body, which the
+        # count was there to catch, fails the same way for the same reason.  The text handed
+        # back is the exact text that was parsed, so a caller re-parsing it cannot reach a
+        # different conclusion from this function's.
+        response_text = body.strip()
+        envelope = _parse_jsonrpc_envelope(response_text)
+        if envelope is None:
+            log_warning(
+                "Inside Utils.py : the response body is not exactly one JSON-RPC 2.0 envelope "
+                "(it must be a single JSON object with \"jsonrpc\": \"2.0\", exactly one of "
+                "result/error, no repeated keys and nothing before or after it)"
+                + (f"; body: {sanitise_for_log(response_text, 200)}" if response_text else "")
             )
             return NO_RESPONSE_SENTINEL
-        if len(envelope_lines) > 1:
-            print(
-                f"Inside Utils.py : the response carried {len(envelope_lines)} JSON-RPC "
-                "envelopes; exactly one is expected, so none of them is attributable to this "
-                "request"
-            )
-            return NO_RESPONSE_SENTINEL
 
-        response_line = envelope_lines[0]
-        envelope = _parse_jsonrpc_envelope(response_line)
         if expected_id is not None:
             if "id" not in envelope or str(envelope.get("id")) != str(expected_id):
-                print(
-                    f"Inside Utils.py : the response carried id {envelope.get('id')!r} but the "
-                    f"request sent id {expected_id!r}; it does not answer this request"
+                log_warning(
+                    "Inside Utils.py : the response carried id "
+                    f"{sanitise_for_log(repr(envelope.get('id')), 120)} but the request sent id "
+                    f"{expected_id!r}; it does not answer this request"
                 )
                 return NO_RESPONSE_SENTINEL
 
-        return response_line
+        return response_text
     except ValueError as exc:
         # An untokenisable command, or an endpoint this module refuses.  The sentinel is
         # returned rather than an empty string, because a caller testing
         # response.startswith("< No response") must see a failure as exactly that.
-        print(f"Inside Utils.py : Exception in send_curl_command function: {exc}")
+        log_warning(
+            "Inside Utils.py : Exception in send_curl_command function: "
+            f"{sanitise_for_log(str(exc))}"
+        )
         return NO_RESPONSE_SENTINEL
     except OSError as exc:
-        print(f"Inside Utils.py : send_curl_command could not run curl: {exc}")
+        log_warning(
+            f"Inside Utils.py : send_curl_command could not run curl: {sanitise_for_log(str(exc))}"
+        )
         return NO_RESPONSE_SENTINEL
 
 
@@ -1609,7 +1751,7 @@ def send_vcomponent_command(yaml_file_path, timeout=10):
             # wants to proceed on that specific case can test for `curl exited 52` in the body
             # and then verify the effect through the middleware APIs.
             detail = stderr.strip() or stdout.strip() or "no diagnostic"
-            return 0, f"curl exited {returncode}: {detail}"
+            return 0, f"curl exited {returncode}: {sanitise_for_log(detail)}"
 
         # curl output format is: <body>\n<http_code> from "-w \n%{http_code}"
         # Keep split robust even when body is empty (e.g. "\n200").
@@ -1653,7 +1795,15 @@ def send_vcomponent_command(yaml_file_path, timeout=10):
         return _post_payload(payload)
     except ValueError as exc:
         # A rejected endpoint is a configuration defect, reported rather than dispatched.
-        print(f"Inside Utils.py : Exception in send_vcomponent_command: {exc}")
+        # Routed through log_error rather than print, because the message interpolates the
+        # exception text and an endpoint value can reach that text: a bare print would put
+        # whatever control bytes it carries straight onto the terminal that IS this run's only
+        # evidence.  log_* applies _guard_log_line, and sanitise_for_log bounds and escapes the
+        # remote-derived part on top of it.
+        log_error(
+            "Inside Utils.py : Exception in send_vcomponent_command: "
+            f"{sanitise_for_log(str(exc))}"
+        )
         return 0, str(exc)
 
 
@@ -1678,14 +1828,21 @@ def await_plugin_ready(callsign, timeout=30.0, recheck_interval=0.5):
         True once the controller reports the plugin activated; False on expiry, or when the
         controller could not be reached or answered without a usable state.
     '''
-    deadline = time.time() + max(0.0, float(timeout))
+    # time.monotonic, not time.time.  This is a DURATION being measured, and time.time is the
+    # wall clock: NTP stepping it, or a container's clock being corrected after start-up, moves it
+    # backwards or forwards under a loop that is comparing against a stored value.  Backwards
+    # turns a 30-second deadline into an arbitrarily long one; forwards expires it immediately and
+    # reports a healthy plugin as never activated.  time.monotonic cannot be stepped, so the only
+    # thing the deadline can be affected by is time actually passing.  The same substitution is
+    # made in every other deadline loop in this suite for the same reason.
+    deadline = time.monotonic() + max(0.0, float(timeout))
     interval = max(0.05, float(recheck_interval))
     while True:
         response = send_jsonrpc_command(f"Controller.1.status@{callsign}")
         if response and "error" not in response:
             if _reports_activated(response.get("result")):
                 return True
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             return False
         time.sleep(interval)
 
@@ -1709,3 +1866,82 @@ def _reports_activated(result):
         if isinstance(state, str) and state.strip().lower() == "activated":
             return True
     return False
+
+
+def is_plain_int(value):
+    '''True for an integer that is not a boolean.
+
+    THE REASON THIS EXISTS RATHER THAN isinstance(value, int) AT EACH SITE. In Python bool is a
+    SUBCLASS of int, so isinstance(True, int) is True and True >= 1 is True. A field validated with
+    a bare isinstance(..., int) therefore accepts a JSON boolean wherever it means to require a
+    number - so a plugin answering {"numberofdevices": true} or a device entry carrying
+    {"logicalAddress": false} passes a count check and a logical-address check that were written to
+    reject exactly that. The suite validates numeric fields in several cases, so the rejection is
+    defined once here and used at every one of them rather than restated and eventually forgotten.
+
+    Args:
+        value: Any parsed JSON value.
+    Returns:
+        True only for an int that is not a bool. Floats are refused too: the fields this guards -
+        device counts and logical addresses - are integers in the published contract, and accepting
+        3.0 where 3 is required would let an off-contract reply read as conforming.
+    '''
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def device_inventory(get_device_list_command):
+    '''Read the CEC device population as a comparable snapshot.
+
+    THE ONE INVENTORY HELPER FOR THE WHOLE SUITE, and it is here rather than in each case that
+    needs it because several cases assert the SAME invariant - "the API under test did not disturb
+    the device population" - and two copies of an inventory reader would be two definitions of what
+    the population IS. Four cases used to call a `_device_inventory()` that existed in none of them,
+    so the invariant they documented was never actually evaluated; this is that helper, defined once.
+
+    The snapshot is (count, addresses) rather than the raw list on purpose. The plugin's device
+    records carry fields that legitimately change while the POPULATION does not - osdName and
+    vendorID arrive on later frames, powerStatus follows a peer's own state - so comparing whole
+    records would report those as inventory churn. The reported count and the sorted set of logical
+    addresses are the two properties that describe the population itself, and a frozenset makes the
+    comparison order-insensitive, which matters because the plugin does not promise an order.
+
+    Args:
+        get_device_list_command: The getDeviceList request, as the suite's command module exports
+                                 it. Passed in rather than composed here so this module stays free
+                                 of any particular plugin's method names, exactly as
+                                 activate_plugin() takes its callsign.
+    Returns:
+        (readable, count, addresses):
+          * readable is False for every unusable reply - a request that was not dispatched, the
+            no-response sentinel, a body that does not parse, a non-object envelope, a result that
+            is not an object, a success member that is not True, or a deviceList that is not a
+            list. A caller must treat False as "no invariant can be asserted", never as an empty
+            population;
+          * count is the reported numberofdevices, unchanged, or None when unreadable;
+          * addresses is a frozenset of the integer logicalAddress values, or an empty frozenset
+            when unreadable. Entries that are not objects, and objects whose logicalAddress is not
+            an int, are skipped - the set is only ever keyed by something a caller can look up.
+    '''
+    response = send_curl_command(get_device_list_command)
+    # NO_RESPONSE_SENTINEL is truthy, so the falsy check alone lets a transport failure through as
+    # if it were a reply. startswith("< No response") is the suite-wide detection idiom for it.
+    if not response or response.startswith("< No response"):
+        return False, None, frozenset()
+    try:
+        envelope = json.loads(response)
+    except json.JSONDecodeError:
+        return False, None, frozenset()
+    if not isinstance(envelope, dict):
+        return False, None, frozenset()
+    result = envelope.get("result")
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return False, None, frozenset()
+    device_list = result.get("deviceList")
+    if not isinstance(device_list, list):
+        return False, None, frozenset()
+    addresses = frozenset(
+        device["logicalAddress"]
+        for device in device_list
+        if isinstance(device, dict) and is_plain_int(device.get("logicalAddress"))
+    )
+    return True, result.get("numberofdevices"), addresses

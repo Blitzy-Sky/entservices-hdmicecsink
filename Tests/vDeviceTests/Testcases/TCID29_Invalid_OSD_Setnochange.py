@@ -106,10 +106,10 @@ def _result_object(response_text):
 
     A JSON-RPC error envelope carries "error" instead of "result", and a malformed body could carry
     a non-object "result" or not be an object at all. Every such case collapses to {} so the caller
-    reports a MISSING FIELD rather than raising AttributeError out of run_test(). Narrowing here is
-    what let the broad `except Exception` this module used to carry be removed entirely: the only
-    exception any caller can now see is json.JSONDecodeError, handled where it can occur rather than
-    swept up together with every programming defect in the file.
+    reports a MISSING FIELD rather than raising AttributeError out of run_test(). Narrowing here is what keeps the
+    module free of a broad `except Exception`: the only exception any caller can see is
+    json.JSONDecodeError, handled where it can occur rather than swept up together with every
+    programming defect in the file.
     Args:
         response_text: Raw response string as returned by utils.send_curl_command
     Returns:
@@ -187,9 +187,9 @@ def _read_osd_name_quietly():
     THE SILENT READER, and the reason there are two. This one is what the bounded polls call, so a
     wait that takes twenty samples produces twenty reads and no log lines; _read_osd_name(label)
     below is the reporting form, called where a single reading becomes part of a verdict and has to
-    appear in the transcript. Both were previously spelled _read_osd_name, and because a module body
-    runs top to bottom the later definition bound the name - which left cleanup() and
-    _wait_for_osd_name calling a one-argument function with no arguments.
+    appear in the transcript. The two must keep DISTINCT names: a module body runs top to bottom, so
+    two definitions sharing one name would leave the later one bound and every earlier caller
+    invoking the wrong arity.
     """
     response = send_curl_command(HdmiCecSinkApis.get_osd_name)
     # utils.send_curl_command reports a transport failure by RETURNING the TRUTHY sentinel
@@ -249,9 +249,9 @@ def _write_osd_name(value, label):
 def cleanup():
     """Restore the OSD name this module found before it wrote anything.
 
-    An earlier revision claimed its baseline write doubled as the restoration, because the literal it
-    wrote matched the one TCID10_Set_OSD_Name leaves behind. That coupling holds only while both
-    modules agree on the literal. This hook instead puts back the name this module actually observed.
+    The baseline write cannot double as the restoration: that would hold only while this module and
+    TCID10_Set_OSD_Name agreed on one literal. This hook puts back the name this module actually
+    observed instead.
     SuitManager runs it unconditionally - after a pass, a failure, an exception, and even for a case
     it skipped because a producer failed - so it assumes nothing about how far run_test() got.
     Idempotent: the capture is consumed, so a second call has nothing to do.

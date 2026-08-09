@@ -141,7 +141,7 @@ def _post_hdmicec(yaml_file):
 
 # ── WHAT THE IMPLEMENTATION ACTUALLY MOVES, AND WHAT IT ONLY BROADCASTS ───────────────────────
 # Every expectation below is taken from the implementation rather than assumed, because the two
-# halves of this flow behave differently and an earlier revision could assert neither:
+# halves of this flow behave differently and a single blanket assertion would fit neither:
 #
 #   * setRoutingChange resolves both port identifiers and, when the NEW port names "TV", sets
 #     m_currentActiveSource to the sink's own allocated address (HdmiCecSinkImplementation.cpp:
@@ -252,11 +252,10 @@ def _published_request(argv):
     return decoded
 
 
-# _acknowledged() is defined once, below run_test()'s helpers, and every caller in this module -
-# cleanup() included - resolves it at call time. A second definition used to sit here as well;
-# because a module body executes top to bottom, the later definition bound the name and this one
-# never ran, so the two could drift apart unnoticed. The surviving definition is the one that was
-# already in force at runtime, so removing the shadowed copy changes no behaviour.
+# _acknowledged() is defined exactly ONCE, below run_test()'s helpers, and every caller in this
+# module - cleanup() included - resolves it at call time. Keep it that way: a module body executes
+# top to bottom, so a second definition of the name would silently shadow the first and the two
+# could drift apart unnoticed.
 
 
 # The route block observed before this case arranged anything, handed to cleanup().

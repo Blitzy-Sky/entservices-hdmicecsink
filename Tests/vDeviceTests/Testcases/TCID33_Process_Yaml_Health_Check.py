@@ -119,6 +119,10 @@ from utils import (
     CEC_FRAME_PACING_SECONDS,
     CEC_PIPELINE_PACING_SECONDS,
     CEC_SHORT_PACING_SECONDS,
+    # The longest of the four documented pacing windows, used by cleanup() only: re-declaring the
+    # topology is a topology change, which travels the whole pipeline before a device-list read can
+    # reflect it - the same window Act 1 and Act 4 of TCID27 use for the same reason.
+    CEC_TOPOLOGY_PACING_SECONDS,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -138,15 +142,14 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 # fixture's name is refused rather than posted.
 #
 # THE INVENTORY IS DECLARED EXACTLY ONCE, as APPROVED_PROCESS_FIXTURES below, and
-# EXPECTED_PROCESS_FIXTURES is derived from it. It used to be written out three times over - twice
-# as a frozenset and once as the tuple - which is three copies of twenty-four filenames that a
-# rename could put out of step with each other while every one of them still looked authoritative.
+# EXPECTED_PROCESS_FIXTURES is derived from it. Keep it that way: a second hand-written copy of the
+# filenames is a copy a rename can put out of step while both still look authoritative.
 
 # ── WHAT EACH FIXTURE IS EXPECTED TO DO, ONE ENTRY PER FIXTURE ───────────────────────────────────
-# Three expectation kinds, and every fixture carries at least one EXPLICITLY. An earlier revision
-# named two small sets and let everything else fall into an unstated default, so "no expectation was
-# written for this fixture" and "this fixture genuinely has no observable consequence" looked
-# identical. They are different statements and they are now written differently.
+# Three expectation kinds, and every fixture carries at least one EXPLICITLY. An unstated default
+# would make "no expectation was written for this fixture" and "this fixture genuinely has no
+# observable consequence" look identical; they are different statements, so they are written
+# differently.
 #
 #   "registers"      the handler calls addDevice(header.from), so the frame's own initiator must
 #                    appear in getDeviceList afterwards. Derived from the payload's header nibble.
@@ -248,8 +251,9 @@ FIXTURE_EXPECTATIONS = {
     ),
 }
 
-# The emulated topology document, re-posted at the start to establish a known baseline and again by
-# cleanup() so the suite ends in that same known topology.
+# The emulated topology document, re-posted at the start of this case to establish a known baseline
+# before the sweep. It is NOT re-posted afterwards: see the note on the residual at the foot of this
+# module, which is why this case is registered last.
 NETWORK_CONFIG_YAML = "Device_Config_Add_Network.yaml"
 
 # Bounded budgets. Poll ceilings, never durations anything waits out. The device-list budget is the
@@ -259,9 +263,6 @@ NETWORK_CONFIG_YAML = "Device_Config_Add_Network.yaml"
 HEALTH_TIMEOUT_S = 10.0
 REGISTER_TIMEOUT_S = 15.0
 POLL_INTERVAL_S = 0.25
-
-# True once the sweep has run, so cleanup() knows the topology may need re-declaring.
-_topology_disturbed = False
 
 _PAYLOAD_PATTERN = re.compile(r'payload:\s*\[(.*?)\]', re.S)
 
@@ -273,13 +274,13 @@ _PAYLOAD_PATTERN = re.compile(r'payload:\s*\[(.*?)\]', re.S)
 # document makes the emulator inject a CEC frame into the device under test, so "whatever matches
 # Process_*.yaml on disk" is not an acceptable definition of the work.
 #
-# An earlier revision discovered the set with rglob("Process_*.yaml") and swept whatever it found.
-# Three things follow from that, and all three are defects rather than flexibility. A document
-# DELETED from the tree shrank the sweep silently, so coverage could be lost while the case went
-# on reporting a pass. A document ADDED - by a careless merge or by anything able to write into
-# the fixture tree - was posted unreviewed, which is to say arbitrary CEC frames were injected on
-# the strength of a filename. And a symlink or a directory bearing a matching name was swept in
-# and posted as though it were one of these documents.
+# WHY THE SET IS NOT DISCOVERED WITH A GLOB. Sweeping whatever matches Process_*.yaml would carry
+# three defects rather than any flexibility. A document DELETED from the tree would shrink the sweep
+# silently, so coverage could be lost while the case went on reporting a pass. A document ADDED - by
+# a careless merge or by anything able to write into the fixture tree - would be posted unreviewed,
+# which is to say arbitrary CEC frames would be injected on the strength of a filename. And a
+# symlink or a directory bearing a matching name would be swept in and posted as though it were one
+# of these documents.
 #
 # So the inventory is fixed here, the tree is required to match it EXACTLY in both directions, and
 # every entry is required to be a regular file rather than a link or a directory. Adding a fixture
@@ -481,11 +482,10 @@ FIXTURES_THAT_MOVE_ACTIVE_SOURCE = tuple(sorted(
 # fixture is not harmless - it is indistinguishable from a fixture whose consumer was deleted or
 # renamed, so real lost coverage looks exactly like a document that was never meant to be posted.
 #
-# They are NOT removed. Every one of them is a reviewed emulator command that a future case may
-# legitimately reach for, and this pass does not delete test assets. What they get instead is an
-# explicit status, checked against the tree by _verify_device_fixture_inventory below: either a named
-# consuming module, verified to actually reference the filename, or a recorded reason for being
-# retained without one.
+# They are RETAINED. Every one of them is a reviewed emulator command that a future case may
+# legitimately reach for. What they carry instead is an explicit status, checked against the tree by
+# _verify_device_fixture_inventory below: either a named consuming module, verified to actually
+# reference the filename, or a recorded reason for being retained without one.
 #
 # DEVICE_FIXTURE_CONSUMERS - posted by the module named. The check reads that module and requires the
 # filename to appear in it, so a rename on either side is a named failure rather than a silent orphan.
@@ -542,8 +542,8 @@ DEVICE_FIXTURES_RETAINED = {
     "Device_CEC_Version.yaml":
         "alternative framing: Process_CEC_Version.yaml is the one on the sweep",
     "Device_Config.yaml":
-        "emulator control, and superseded: Device_Config_Add_Network.yaml is the topology this "
-        "suite configures, declaring the six peers rather than an empty map",
+        "emulator control, and not the topology this suite configures: Device_Config_Add_Network.yaml "
+        "is, declaring the six peers rather than an empty map",
     "Device_Device_Vendor_ID.yaml":
         "alternative framing: Process_Device_Vendor_ID.yaml is the one on the sweep",
     "Device_Feature_Abort.yaml":
@@ -756,11 +756,11 @@ def _fixture_initiator(yaml_name):
 def _get_device_snapshot():
     """Capture the device list as {"number": int, "logicals": set}, or None when it is not usable.
 
-    THE INTEGER IS NOW REQUIRED, WHICH IS THE POINT OF THIS REVISION. An earlier version returned
-    "number": None whenever the count was absent or not an integer, and run_test() then substituted
-    -1 for it - so a plugin that stopped reporting a count produced -1 on BOTH sides of the sweep and
-    the direction check compared -1 against -1 and passed. A snapshot that cannot be trusted is now
-    reported as no snapshot at all.
+    THE INTEGER IS REQUIRED, AND MUST STAY REQUIRED. Returning "number": None when the count is
+    absent or not an integer would let run_test() substitute -1 for it, so a plugin that stopped
+    reporting a count would produce -1 on BOTH sides of the sweep and the direction check would
+    compare -1 against -1 and pass. A snapshot that cannot be trusted is reported as no snapshot at
+    all instead.
 
     The two key names are the sink's own and are deliberately inconsistent with each other:
     getDeviceList answers with "numberofdevices" all in lower case beside "deviceList" in camel case.
@@ -796,7 +796,7 @@ def _get_device_snapshot():
         # snapshot comparable to another one. A reply that reports success false, or that omits
         # numberofdevices, is an answer the sweep cannot measure anything against, so it is
         # reported as NO SNAPSHOT here rather than handed upwards as a snapshot with a hole in
-        # it - which is what let an earlier revision compare -1 against -1 and call that a
+        # it. A substitute count would let an omission on both sides compare equal and be read as a
         # steady device count.
         if result.get("success") is not True:
             return None
@@ -964,16 +964,23 @@ def run_test():
     # independent of how many flow cases ran before it. Posted directly rather than through
     # _post_yaml because the failure below names THIS step: a rejected topology is not the same
     # finding as a rejected handler fixture.
-    http_code, _ = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/Device_Config_Add_Network.yaml")
+    http_code, _ = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{NETWORK_CONFIG_YAML}")
     if http_code != 200:
         log_error("TCID33_Process_Yaml_Health_Check Failed: configure command rejected")
         return False
+    # MARKED AS SOON AS THE FIRST MUTATING POST IS ACCEPTED, not after the sweep completes.
+    #
+    # _topology_disturbed carried the comment "True once the sweep has run, so cleanup() knows the
+    # topology may need re-declaring" and was never assigned True anywhere - a dead flag beside a
+    # cleanup() that did not exist. It is set here because this post is the first change this case
+    # makes, and every line after it is a place the case can return or raise; a flag set at the END
+    # of the sweep would be False on exactly the paths restoration is for.
+    global _topology_disturbed
+    _topology_disturbed = True
     time.sleep(CEC_FRAME_PACING_SECONDS)
 
-    # WAITED FOR, NOT SLEPT THROUGH. An earlier revision paused a fixed second here and defended
-    # every fixed pause in this file as the reference suite's idiom. A bounded poll is strictly
-    # better on both counts: it returns as soon as the plugin answers, and it still reports when the
-    # plugin never does.
+    # WAITED FOR, NOT SLEPT THROUGH. A bounded poll returns as soon as the plugin answers and still
+    # reports when the plugin never does, which a fixed pause can do neither of.
     ready, pre_snapshot = _wait_for_snapshot(lambda snap: True, HEALTH_TIMEOUT_S)
     if not ready:
         log_error(
@@ -1050,8 +1057,8 @@ def run_test():
 
     # Both counts are integers by _get_device_snapshot's contract - a reply without an integer
     # numberofdevices is no snapshot at all and was reported as such above - so no substitute value
-    # is needed or wanted here. An earlier revision defaulted each side to -1, which made an
-    # omission on both sides compare equal and pass the direction check below.
+    # is needed or wanted here. Defaulting each side to a sentinel such as -1 would make an omission
+    # on both sides compare equal and pass the direction check below.
     pre_num = pre_snapshot["number"]
     post_num = post_snapshot["number"]
     log_info(f"Device count pre={pre_num} post={post_num}")
@@ -1106,13 +1113,77 @@ def run_test():
 # window for the rest are the reference suite's documented idiom for that pipeline, inherited
 # here for parity. No further sleep is added anywhere in this file.
 #
-# NO RESTORE STEP, AND ITS ABSENCE IS DELIBERATE. The sweep leaves the plugin wherever the last
-# accepted fixture put it. Every document posted here is an inbound frame or the topology
-# configuration - not one is a setter with an inverse to call - so a restore could only be
-# manufactured by hand-building a CEC payload, which this suite does not do: every frame it
-# injects comes from a reviewed document under vcomponent_configurations/commands/. It would
-# manufacture a claim too, making it look as though the device had been returned to a known
-# state when one more untracked change had in fact been issued. The residual is safe because of
-# where this case sits: SuitManager.py registers it 33rd and LAST, so no sibling inherits the
-# state, and the two health checks plus the count-direction check are what establish that the
-# plugin is still answering when the suite prints its summary.
+# WHAT IS RESTORED, WHAT IS NOT, AND WHY THE DIFFERENCE IS STATED RATHER THAN GLOSSED.
+#
+# This block used to read "NO RESTORE STEP, AND ITS ABSENCE IS DELIBERATE", which contradicted the
+# NETWORK_CONFIG_YAML comment forty lines earlier - "re-posted at the start to establish a known
+# baseline and again by cleanup()" - and contradicted the dead _topology_disturbed flag whose own
+# comment named a cleanup() that did not exist. Three statements, no two of them agreeing, and no
+# hook anywhere.
+#
+# The half that WAS restorable is now restored. Device_Config_Add_Network.yaml declares the
+# emulated topology and re-posting it is idempotent - Init_Devicelist_Populate posts the same
+# document at bootstrap - so cleanup() re-declares it and then CONFIRMS the plugin still answers
+# with a usable device-list snapshot. That is the state a later run or a later suite actually
+# depends on.
+#
+# The half that is NOT restorable is named instead of approximated: the inbound frames this sweep
+# injects move active-source, routing and per-peer status, and not one of them is a setter with an
+# inverse to call. A restore could only be manufactured by hand-building a CEC payload, which this
+# suite does not do - every frame it injects comes from a reviewed document under
+# vcomponent_configurations/commands/ - and doing so would issue one more untracked change while
+# presenting it as a return to a known state. So cleanup() re-declares the topology and says
+# plainly that the frame-driven state is left where the last accepted fixture put it.
+#
+# That residual is bounded by where this case sits: SuitManager.py registers it 33rd and LAST, so
+# no sibling inherits it, and the two health checks plus the count-direction check are what
+# establish that the plugin is still answering when the suite prints its summary.
+
+
+def cleanup():
+    """Re-declare the emulated topology and confirm the plugin still answers.
+
+    SuitManager runs this unconditionally - after a pass, a failure, an exception, and for a case it
+    SKIPPED - so it assumes nothing about how far the sweep got. Idempotent: the flag is consumed
+    on read, and re-posting the topology document is itself idempotent.
+
+    Restores exactly one thing, and confirms it: the topology declaration. The frame-driven state
+    the sweep leaves behind is reported as a residual rather than manufactured back, for the reason
+    given in the block above.
+
+    Returns:
+        True when there was nothing to restore, or the topology was re-declared AND the plugin
+        answered a device-list read afterwards. False when the post was refused or no usable
+        snapshot arrived inside the health budget - in which case the message says what is left.
+    """
+    global _topology_disturbed
+    if not _topology_disturbed:
+        log_info("TCID33 cleanup: nothing was posted, so the topology needs no re-declaring")
+        return True
+    _topology_disturbed = False
+
+    log_info(f"TCID33 cleanup: re-declaring the emulated topology from {NETWORK_CONFIG_YAML}")
+    http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{NETWORK_CONFIG_YAML}")
+    if http_code != 200:
+        log_error(
+            f"TCID33 cleanup: the topology re-declaration was refused (HTTP {http_code}: "
+            f"{sanitise_for_log(body, 200)}), so the emulated topology is left as the sweep "
+            "found it"
+        )
+        return False
+    time.sleep(CEC_TOPOLOGY_PACING_SECONDS)
+
+    if not _health_check():
+        log_error(
+            "TCID33 cleanup: the topology was re-declared but the plugin did not answer a "
+            f"device-list read within {HEALTH_TIMEOUT_S:.0f}s, so the restoration is unconfirmed"
+        )
+        return False
+
+    log_success("✔ TCID33 cleanup: the topology is re-declared and the plugin is answering")
+    log_info(
+        "  Residual reported, not manufactured: the active-source, routing and per-peer status "
+        "the swept frames moved is left where the last accepted fixture put it - no fixture in "
+        "this suite inverts an inbound frame, and this case runs last"
+    )
+    return True

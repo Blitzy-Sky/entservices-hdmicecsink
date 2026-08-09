@@ -25,9 +25,8 @@
 # peer that is not in the map - which the vComponent does not reject, it simply has no
 # effect. "GameConsole" is NOT declared in Device_Config_Add_Network.yaml: that document
 # declares exactly six peers, SAMSUNG, YAMAHA, DENON, PANASONIC, LG and SONY beneath VTV,
-# and leaves port 4 of the audio system free for this triple. An earlier note here claimed a
-# collision with a PlaybackDevice beneath a "CECAdapter" in that document; neither device
-# exists in it, and the claim was carried across from the source plugin's tree where they do.
+# and leaves port 4 of the audio system free for this triple. Neither a "CECAdapter" nor a
+# "GameConsole" appears in that document, so the name cannot collide with a declared peer.
 #
 # The filename is part of the contract rather than a label: utils.HDMICEC_CMD_BASE
 # resolves to this directory and a consumer posts the literal "Device_Remove.yaml" joined
@@ -48,11 +47,13 @@
 # What this drives on the sink side: HdmiCecSinkImplementation::removeDevice() clears the
 # deviceList entry, decrements the device count, and fans OnDeviceRemoved out to every
 # registered notification, which HdmiCecSink.h forwards as the plugin's onDeviceRemoved
-# event. Both are listed as zero-hit in the coverage gap register, and so is the third
-# path this reaches: because the peer is nested one level below an HDMI port rather than
-# sitting directly on one, removeDevice() also calls HdmiPortMap::removeChild for
-# whichever input matches the departing peer's physical address - and that inner arm
-# needs a non-zero second address byte, which only a nested peer has. The audio-system
+# event. COVERAGE_GAPS.md lists both as zero-hit in its PRE-CHANGE BASELINE - that is the
+# state the register recorded, not the state of the delivered suite, where the sink L1 and L2
+# suites both exercise removeDevice and the onDeviceRemoved event. A third path is reached
+# from here for the same reason: because the peer is nested one level below an HDMI port
+# rather than sitting directly on one, removeDevice() also calls HdmiPortMap::removeChild for
+# whichever input matches the departing peer's physical address - and that inner arm needs a
+# non-zero second address byte, which only a nested peer has. The audio-system
 # branch is not this document's; removeDevice() special-cases logical address 5, which
 # belongs to the root audio system.
 #

@@ -124,38 +124,31 @@ get_vendor_id = [
 
 # THERE IS NO getCecVersion CONSTANT HERE, AND THAT IS THE POINT.
 #
-# `org.rdk.HdmiCecSink.getCecVersion` is not a registered JSON-RPC method. A constant for it
-# used to sit at this point, named get_cec_version_unregistered, and TCID05 called it and
-# treated the dispatcher's method-not-found reply as a PASS. That asserted a property of the
-# DISPATCHER rather than of the plugin's CEC-version surface: the same reply, and the same pass,
-# would come back from a build with no CEC support at all. Keeping a command constant for an
-# unpublished method also invites the next reader to use it as though it were a capability,
-# which is what the "_unregistered" suffix was trying and failing to prevent.
-#
-# Four independent confirmations that the method is unregistered, retained because they are the
-# evidence for the removal:
-#   1. absent from the generated registration list in the built
-#      interfaces/json/JHdmiCecSink.h (grep for it returns 0 hits);
-#   2. absent from the 24 `handler.Exists` assertions in the L1 RegisteredMethods test;
-#   3. HdmiCecSinkImplementation::getCecVersion() is a private void internal helper
-#      (HdmiCecSinkImplementation.h:743, inside the private block at 589-745), called only
-#      from Configure() at HdmiCecSinkImplementation.cpp:824 -- it neither returns a value to
-#      a caller nor is wired to the JSON-RPC surface;
-#   4. a workspace-wide grep for _T("getCecVersion") finds exactly one site, inside the L1
-#      test that remains disabled for precisely this reason.
+# `org.rdk.HdmiCecSink.getCecVersion` is not a registered JSON-RPC method, so a command constant
+# for it would be a capability this suite does not have. Four independent confirmations, kept
+# because they are what the absence rests on:
+#   1. it is absent from the generated registration list in the built
+#      interfaces/json/JHdmiCecSink.h (a grep for it returns no hits);
+#   2. it is absent from the `handler.Exists` assertions in the sink L1 RegisteredMethods test;
+#   3. HdmiCecSinkImplementation::getCecVersion() is a private void internal helper called only
+#      from Configure() -- it neither returns a value to a caller nor is wired to the JSON-RPC
+#      surface;
+#   4. a workspace-wide grep for _T("getCecVersion") finds exactly one site, inside the sink L1
+#      test that stays disabled for precisely this reason.
 # The mechanism behind all four: the method is absent from IHdmiCecSink.h's published set and
 # therefore from Exchange::JHdmiCecSink::Register, which is the plugin's only JSON-RPC
 # registration path. Publishing it is a production change - a declaration on
 # Exchange::IHdmiCecSink so ThunderTools generates the binding, plus a plugin implementation -
 # which AAP Directive 6 requires be reported rather than made.
 #
-# Where the CEC version IS observable, and what TCID05_Get_CEC_Version now exercises: a
-# directed <Get CEC Version> drives the sink's own responder
-# (HdmiCecSinkProcessor::process(GetCECVersion)), a directed <CEC Version> from a peer is
-# recorded by process(CECVersion) into that peer's device-list entry, and `get_device_list`
-# above reads it back as the entry's "cecVersion". If the plugin ever publishes the method, add
-# a `get_cec_version` constant here alongside the others and re-enable
-# DISABLED_getCecVersion in ../L1Tests/tests/test_HdmiCecSink.cpp.
+# Where the CEC version IS observable, and what TCID05_Get_CEC_Version exercises instead: a
+# DIRECTED <Get CEC Version> (Device_Get_CEC_Version.yaml) drives the sink's own responder in
+# HdmiCecSinkProcessor::process(const GetCECVersion &, const Header &), a DIRECTED <CEC Version>
+# from a peer (Device_CEC_Version.yaml) is recorded by process(const CECVersion &, const Header &)
+# into that peer's device-list entry, and `get_device_list` above reads it back as the entry's
+# "cecVersion". If the plugin ever publishes the method, add a `get_cec_version` constant here
+# alongside the others and re-enable DISABLED_getCecVersion in
+# ../L1Tests/tests/test_HdmiCecSink.cpp.
 
 
 print_device_list = [
@@ -445,8 +438,12 @@ setup_arc_routing_false = [
 
 
 # THE WRITTEN VALUE IS EXPORTED, AND THE COMMAND IS BUILT FROM IT - same contract as
-# SET_OSD_NAME_VALUE above, and for the same reason: TCID12_Verify_Vendor_ID_Readback imports
-# this constant and requires the readback to equal it, so the value lives in exactly one place.
+# SET_OSD_NAME_VALUE above, and for the same reason: TCID12_Verify_Vendor_ID_Readback imports this
+# constant and requires the readback to denote it, and TCID28_Invalid_VendorID_Nochange dispatches
+# the set_vendor_id command below to re-establish it as its own baseline. The value therefore lives
+# in exactly one place. (TCID28's second, DISTINGUISHING write - 0x00AABB - is its own constant and
+# is deliberately not this one: it has to differ from both this value and the plugin's fallback,
+# which are the same 0x0019FB.)
 #
 # Unlike the OSD name, this one CANNOT be compared verbatim, and the reason is in the
 # middleware. getVendorId returns appVendorId.toString(), and CECBytes::toString() in

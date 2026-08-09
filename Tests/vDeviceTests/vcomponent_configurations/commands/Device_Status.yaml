@@ -45,13 +45,16 @@
 # against the reported one and calls sendDeviceUpdateInfo() only when the two
 # differ, so a status the peer already holds would fan out nothing at all.
 #
-# fault is spelled as the bare word yes because that is this template's boolean
-# spelling for the key - Device_Add.yaml writes no the same way - whereas
-# active_source elsewhere in the tree is written false/true. Neither may be
-# normalised into the other's form. The power change and the fault are also
-# deliberately a single post: nothing here clears the fault, because the fixture
-# that clears one is Device_Setapi_Open_Pass.yaml and it targets VTV, the
-# emulated device under test rather than a peer.
+# fault is spelled as the bare word yes to match this template - Device_Add.yaml
+# writes no the same way - while active_source elsewhere in the tree is written
+# false/true. The two spellings are EQUIVALENT to a YAML 1.1 parser: yes/no and
+# true/false both load as booleans, so this is a house-style choice rather than a
+# semantic one, and the reason to leave each document as it is written is
+# consistency with the emulator's own templates rather than any parsing risk. The
+# power change and the fault are deliberately a single post: nothing here clears
+# the fault, because the fixture that clears one is
+# Device_Setapi_Open_Pass.yaml and it targets VTV, the emulated device under test
+# rather than a peer.
 #
 # The filename is part of the contract too. utils.HDMICEC_CMD_BASE resolves to
 # this directory and a consumer posts the literal "Device_Status.yaml" joined
@@ -61,17 +64,15 @@
 # document, no anchors, aliases or includes - because send_vcomponent_command()
 # posts these bytes verbatim and the vComponent parses them on their own.
 # THE PEER NAMED BELOW IS THE TEST-ONLY PEER Device_Add.yaml CREATES, and its name has to be the
-# one that document and Device_Remove.yaml use: "GameConsole". A previous revision named
-# "L3TestPeer" here alone, on the reasoning that "GameConsole" collided with a PlaybackDevice
-# declared beneath a "CECAdapter" in Device_Config_Add_Network.yaml. There is no CECAdapter and no
-# GameConsole in that document - the sink topology declares exactly six peers, SAMSUNG, YAMAHA,
-# DENON, PANASONIC, LG and SONY beneath VTV, and that reasoning was carried across from the source
-# plugin's tree where such a device does exist. The rename therefore did not avoid a collision; it
-# created one, because this document then addressed a peer that was never in the map, and the
-# vComponent does not reject an update for an unknown device - it simply has no effect, so the
-# power-status change this document exists to make silently stopped happening.
-# Init_Devicelist_Populate.verify_topology_consistency() is what now makes a claim about the
-# topology checkable rather than a comment.
+# one that document and Device_Remove.yaml use: "GameConsole". Renaming it in this document alone
+# would leave it addressing a peer that is not in the map, and the vComponent does not reject an
+# update for an unknown device - it simply has no effect, so the power-status change this document
+# exists to make would silently stop happening. There is no CECAdapter and no GameConsole in
+# Device_Config_Add_Network.yaml, which declares exactly six peers - SAMSUNG, YAMAHA, DENON,
+# PANASONIC, LG and SONY beneath VTV - so the name cannot collide with a declared peer.
+# Init_Devicelist_Populate.verify_topology_consistency() checks those SIX declared peers against
+# the seed table and their payload documents; it says nothing about this test-only peer, which
+# exists only between the add and the remove.
 HdmiCec:
   command: update_device_status
   description: Updates the status of an HDMI CEC device

@@ -10,6 +10,16 @@
  *          the coverage register records as covered by the sink's own L2 suite with no
  *          end-to-end verification behind it.
  *
+ *          CLASSIFICATION: THE ACKNOWLEDGEMENT PROVES QUEUE ACCEPTANCE, NOT TRANSMISSION, AND THE
+ *          CLAIM MADE HERE IS LIMITED TO EXACTLY THAT. SendKeyPressEvent
+ *          (HdmiCecSinkImplementation.cpp:1643-1656) fills a SendKeyInfo, pushes it onto
+ *          m_SendKeyQueue under m_sendKeyEventMutex, notifies m_sendKeyCV and returns
+ *          successResult.success = true. A separate worker thread drains that queue and performs
+ *          the actual sendTo afterwards, so the reply is produced BEFORE any frame is emitted and
+ *          cannot testify that one was. Every assertion below is therefore worded as acceptance:
+ *          the request was well formed enough for the plugin to enqueue it, and enqueueing it
+ *          disturbed nothing observable. Transmission and the peer's reaction are not claimed.
+ *
  *          The OnKeyPressEvent notification the resulting frame provokes is NOT observed
  *          here and nothing is asserted about it: this level reaches the plugin over plain
  *          one-shot curl, which cannot subscribe to a Thunder notification channel, so an
@@ -50,13 +60,17 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - The plugin acknowledges the request with {"success": true} and the CEC device inventory is
- *    identical before and after the call. The notification the key press produces is not observable
- *    at this level and is therefore not asserted.
+ *  - The plugin ACCEPTS the request onto its send-key queue and acknowledges it with
+ *    {"success": true}, and the CEC device inventory is identical before and after the call.
+ *  - Transmission of the resulting <User Control Pressed> frame is NOT asserted: the reply is
+ *    produced before the worker thread sends, and this suite cannot read outbound frames.
+ *  - The notification the key press produces is not observable at this level either and is
+ *    therefore not asserted.
  *
  * @pass_criteria
- *  - The reply equals {"jsonrpc":"2.0","id":42,"result":{"success":true}}, the device inventory
- *    reads identically before and after, and run_test() returns True.
+ *  - The reply equals {"jsonrpc":"2.0","id":42,"result":{"success":true}} - read as queue
+ *    acceptance - the device inventory reads identically before and after, and run_test() returns
+ *    True.
  *
  * @failure_criteria
  *  - A response mismatch, a JSON parsing failure, an unreachable endpoint, an unreadable device
@@ -72,6 +86,7 @@ import time
 import json
 from utils import (
     send_curl_command,
+    device_inventory,
     log_info,
     log_success,
     log_error,
@@ -81,53 +96,10 @@ from utils import (
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
 
-def _result_object(response_text):
-    """Return the JSON-RPC result mapping from a response body, or an empty mapping.
-
-    A JSON-RPC error envelope carries "error" instead of "result", and a malformed body could
-    carry a non-object "result" or not be an object at all. Every such case collapses to {} so
-    the caller reports a MISSING FIELD rather than raising AttributeError out of run_test(). A
-    body that is not JSON at all still raises json.JSONDecodeError, which run_test() handles as
-    the documented failure. Three call sites share this, which is why it is factored out.
-    Args:
-        response_text: Raw response string as returned by utils.send_curl_command
-    Returns:
-        The "result" mapping when the body is a JSON object carrying one, otherwise {}.
-    """
-    body = json.loads(response_text)
-    if not isinstance(body, dict):
-        return {}
-    result = body.get("result")
-    return result if isinstance(result, dict) else {}
-
-
-def _device_inventory():
-    '''Return (readable, count, sorted_logical_addresses) from the published getDeviceList method.
-
-    readable is False when the reply could not be read as a JSON-RPC result reporting success,
-    which is deliberately distinct from an empty inventory.
-    '''
-    response = send_curl_command(HdmiCecSinkApis.get_device_list)
-    if not response or response.startswith("< No response"):
-        return False, None, None
-    try:
-        result = _result_object(response)
-    except json.JSONDecodeError:
-        return False, None, None
-    if result.get("success") is not True:
-        return False, None, None
-    device_list = result.get("deviceList")
-    if not isinstance(device_list, list):
-        return False, None, None
-    addresses = sorted(
-        device["logicalAddress"]
-        for device in device_list
-        if isinstance(device, dict) and isinstance(device.get("logicalAddress"), int)
-    )
-    return True, result.get("numberofdevices"), addresses
-
 def run_test():
-    '''Dispatch one sendKeyPressEvent call and verify the success acknowledgement.
+    '''Dispatch one sendKeyPressEvent call and verify it was ACCEPTED onto the send-key queue.
+    The verdict is deliberately not "the frame was sent": the plugin answers success as soon as the
+    key is queued, before its worker thread transmits.
     Returns:
         True when the plugin answers with the expected success envelope AND the CEC device inventory
         is identical across the call; False on a transport failure, a response mismatch, an
@@ -144,7 +116,19 @@ def run_test():
     }
 
     # Inventory snapshot BEFORE the call, so the invariant below compares two real observations.
-    inventory_readable, before_count, before_addresses = _device_inventory()
+    # utils.device_inventory is the suite's one reader of the CEC population and refuses every
+    # unusable reply, so `readable` False means "no invariant can be asserted", never "empty".
+    #
+    # The baseline is a PRECONDITION, refused before the call rather than after it: a case that
+    # acts first and only then finds it cannot compare has already touched the device it was about
+    # to make a claim about, while still reading as though the invariant had been evaluated.
+    inventory_readable, before_count, before_addresses = device_inventory(
+        HdmiCecSinkApis.get_device_list
+    )
+    if not inventory_readable:
+        log_error("✖ the device inventory could not be read, so no invariant can be asserted")
+        log_error("TCID16_Send_Key_Press_Event Failed ❌")
+        return False
     log_info(f"Device inventory before: {before_count} devices at {before_addresses}")
 
     log_info("Executing the curl command send key press event")
@@ -172,7 +156,7 @@ def run_test():
 
     # A key press is transient and leaves no persistent plugin state behind - SendKeyPressEvent
     # pushes the key onto m_SendKeyQueue and notifies the worker thread
-    # (HdmiCecSinkImplementation.cpp:3243-3257) - so this case needs none of the restore clauses the
+    # (HdmiCecSinkImplementation.cpp:1643-1656) - so this case needs none of the restore clauses the
     # suite's stateful write-side cases carry, and publishes no cleanup() hook.
     try:
         if json.loads(curl_response) != expected_output_response:
@@ -185,12 +169,9 @@ def run_test():
         # implementation that touched the device list from the send path would fail it while still
         # answering success - and it is the strongest consequence reachable here, since the frame
         # itself is outbound and this suite cannot read outbound frames.
-        if not inventory_readable:
-            log_error("✖ the device inventory could not be read, so no invariant can be asserted")
-            log_error("TCID16_Send_Key_Press_Event Failed ❌")
-            return False
-
-        after_readable, after_count, after_addresses = _device_inventory()
+        after_readable, after_count, after_addresses = device_inventory(
+            HdmiCecSinkApis.get_device_list
+        )
         if not after_readable:
             log_error("✖ the device inventory became unreadable after the key press")
             log_error("TCID16_Send_Key_Press_Event Failed ❌")

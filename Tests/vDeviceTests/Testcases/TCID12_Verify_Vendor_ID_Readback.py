@@ -31,19 +31,25 @@
  *          "setVendorId took effect", which is the device-level evidence a single call cannot
  *          produce.
  *
- *          NO EXPECTED IDENTIFIER IS PINNED HERE, and that is a correctness decision rather
- *          than a weaker assertion. The written value lives in exactly one place - the sibling
- *          write constant in HdmiCECSink_Curl.py, which this module deliberately does not
- *          reference - so restating it here would couple two files that must be able to change
- *          independently. A literal would further assume the device echoes the written text byte
- *          for byte, which the interface does not promise: the identifier is rendered from a
- *          three-byte VendorID, so prefix, case and zero-padding are the plugin's business. The
- *          shape is therefore asserted and the observed value LOGGED, so a mismatch is diagnosed
- *          from evidence rather than hidden behind a brittle equality check.
+ *          THE EXACT IDENTIFIER IS ASSERTED, and it is imported rather than restated. The value
+ *          lives in exactly one place - HdmiCECSink_Curl.SET_VENDOR_ID_VALUE, the same constant
+ *          TCID11's request is built from - so the two halves of the pair cannot drift apart, and
+ *          a shape-only check is not enough: a non-empty identifier comes back from a device that
+ *          ignored the write entirely, which is precisely the outcome the pair exists to exclude.
  *
- *          Sound in isolation as well as in sequence: an identifier is reported whether or not
- *          TCID11 has run, so under a name filter this case still asserts something real - a
- *          reachable plugin reporting a usable identifier - rather than passing vacuously.
+ *          THE COMPARISON IS ON THE 24-BIT VALUE, NOT ON THE TEXT, because the interface does not
+ *          promise a byte-for-byte echo and does not need to. getVendorId returns
+ *          appVendorId.toString(), and CECBytes::toString() (hdmicec/ccec/include/ccec/Operands.hpp)
+ *          formats each byte with std::hex, no zero padding and no "0x" prefix - so the three
+ *          bytes 0x00, 0x19, 0xFB are published as "019fb". Text equality would fail a correct
+ *          device for its formatting; int(value, 16) equality is what the two renderings actually
+ *          agree on. A value that cannot be parsed as hexadecimal at all is a failure and names
+ *          what came back.
+ *
+ *          Sound in isolation as well as in sequence: run under a name filter without TCID11, the
+ *          identifier will not match and this case FAILS rather than passing vacuously - which is
+ *          the correct outcome, because the pair's evidence is exactly what is missing then. The
+ *          diagnostic says so instead of leaving the next reader to work it out.
  *
  * @precondition
  *  - Required plugin is active and reachable via JSON-RPC endpoint: a device under test -
@@ -59,21 +65,26 @@
  *    nothing described here has been observed against a live device or emulator.
  *
  * @dependencies
- *  - utils.py
- *  - HdmiCECSink_Curl.py
- *  - SuitManager.py
- *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
+ *  - utils.py - endpoint resolution and the shell-free curl dispatcher
+ *  - HdmiCECSink_Curl.py - the get_vendor_id definition and SET_VENDOR_ID_VALUE, the identifier
+ *    TCID11 wrote and this case requires back
+ *  - SuitManager.py - registers this case at position 12, immediately after its producer
  *
  * @expected_result
- *  - getVendorId answers with result.success True and a non-empty result.vendorid string,
- *    confirming that the identifier established by TCID11_Set_Vendor_ID is being advertised.
+ *  - getVendorId answers with result.success True and a result.vendorid string that denotes the
+ *    same 24-bit identifier as HdmiCECSink_Curl.SET_VENDOR_ID_VALUE, confirming that the write
+ *    TCID11_Set_Vendor_ID performed took effect rather than merely being acknowledged.
  *
  * @pass_criteria
- *  - result.success is True, result.vendorid is a non-empty string, and run_test() returns True.
+ *  - result.success is True, result.vendorid is a non-empty string parseable as hexadecimal, its
+ *    integer value equals int(HdmiCECSink_Curl.SET_VENDOR_ID_VALUE, 16), and run_test() returns
+ *    True.
  *
  * @failure_criteria
  *  - An empty or sentinel response, a JSON parsing error, a missing, non-string or blank
- *    vendorid, a success value other than True, or run_test() returning False.
+ *    vendorid, a vendorid that is not parseable as hexadecimal, a value that denotes a different
+ *    identifier from the one written, a success value other than True, or run_test() returning
+ *    False.
  */
 """
 
@@ -92,23 +103,40 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 
 # The block above is the six-symbol contract every case in this suite is written against, kept
 # intact rather than pruned per case so that every module here presents an identical import block
-# and an added or dropped helper shows up in a diff. log_with_timing has no call site because the
-# pass path applies the HDMICEC_TIMING_ENABLED gate inline - the same gate that helper implements -
-# keeping the decoration visible where the message is emitted. That unused symbol is this module's
-# only static-analysis finding, and this comment is the record of it rather than a suppression
-# pragma.
+# and an added or dropped helper shows up in a diff.
+
+
+def _as_vendor_value(text):
+    '''Return the 24-bit identifier a published vendorid string denotes, or None.
+
+    The plugin and this suite spell the same identifier differently - "019fb" against "0x0019FB" -
+    because CECBytes::toString() emits unpadded hex with no prefix. Both are parsed here as
+    hexadecimal so the comparison is made on the value the two spellings share; anything that is
+    not hexadecimal at all answers None and is reported as such rather than silently mismatching.
+    Args:
+        text: A vendorid string, with or without a leading "0x".
+    Returns:
+        The integer value, or None when the string does not denote one.
+    '''
+    if not isinstance(text, str) or text.strip() == "":
+        return None
+    try:
+        return int(text.strip(), 16)
+    except ValueError:
+        return None
 
 
 def run_test():
-    '''Read the vendor identifier back and validate the shape of the response.
+    '''Read the vendor identifier back and require it to be the one TCID11 wrote.
 
-    The read half of the ordered pair whose write half is TCID11_Set_Vendor_ID. Shape-only by
-    design: the identifier's text is owned by the sibling write constant in HdmiCECSink_Curl.py,
-    so this case asserts that a usable identifier is reported and logs what it was.
+    The read half of the ordered pair whose write half is TCID11_Set_Vendor_ID. The expected value
+    is imported from the single constant both halves resolve, and the comparison is made on the
+    24-bit value rather than on its text, because the two spellings of one identifier differ only
+    in padding and prefix.
     Returns:
-        True when result.success is True and result.vendorid is a non-empty string; False on a
-        transport failure, a JSON parsing failure, or a shape mismatch. A bool is returned on
-        every path, which is the contract SuitManager.py binds.
+        True when result.success is True and result.vendorid denotes the written identifier; False
+        on a transport failure, a JSON parsing failure, a shape mismatch or a different
+        identifier. A bool is returned on every path, which is the contract SuitManager.py binds.
     '''
     start_time = time.perf_counter()
 
@@ -150,28 +178,34 @@ def run_test():
             result = {}
 
         vendor_id = result.get("vendorid")
-
-        # Logged, not compared. The exact identifier is owned by the sibling write constant in
-        # HdmiCECSink_Curl.py that TCID11_Set_Vendor_ID dispatches, so printing it is how the
-        # pair's outcome becomes visible in the run record without this module restating a value
-        # it does not own.
         log_info(f"Read-back vendorid: {vendor_id!r}")
 
         # `is True` rather than a truthy test, so a JSON 1 or "true" cannot pass for a boolean
-        # success. Non-empty AFTER strip() is the strongest honest assertion available: the
-        # identifier is rendered from a three-byte VendorID, so a blank or whitespace-only string
-        # is always a defect, while any particular value is the write constant's business and not
-        # this module's.
+        # success. The identifier itself is compared on its 24-bit value against the one constant
+        # both halves of the pair resolve, which is what turns "setVendorId was acknowledged" into
+        # "setVendorId took effect": a non-empty string alone comes back from a device that
+        # ignored the write.
+        expected_value = _as_vendor_value(HdmiCecSinkApis.SET_VENDOR_ID_VALUE)
+        observed_value = _as_vendor_value(vendor_id)
+
         if (
             result.get("success") is True
-            and isinstance(vendor_id, str)
-            and vendor_id.strip() != ""
+            and expected_value is not None
+            and observed_value == expected_value
         ):
+            log_success(
+                f"✔ the advertised identifier denotes 0x{observed_value:06X}, the value "
+                "TCID11_Set_Vendor_ID wrote"
+            )
             elapsed_time = time.perf_counter() - start_time
             log_success(log_with_timing("TCID12_Verify_Vendor_ID_Readback Passed ✅", elapsed_time))
             return True
 
-        log_warning("Expected: result.success True and a non-empty string result.vendorid")
+        log_warning(
+            "Expected: result.success True and result.vendorid denoting "
+            f"{HdmiCecSinkApis.SET_VENDOR_ID_VALUE} - the identifier TCID11_Set_Vendor_ID writes. "
+            "Run without that producer, this case is expected to report a different identifier."
+        )
         log_warning(f"Actual  : {json.dumps(parsed, indent=2, sort_keys=True)}")
         log_error("TCID12_Verify_Vendor_ID_Readback Failed ❌")
         return False

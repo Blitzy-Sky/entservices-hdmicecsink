@@ -86,10 +86,19 @@
  *    REQUIRED PRODUCTION CHANGE TO CLOSE THAT GAP, reported and not made: an event channel
  *    reachable without an HTTP listener, so a device-level test could subscribe to
  *    onDeviceAdded / onDeviceRemoved. It does not exist, and this suite may not add one.
- *  - THE BASELINE TOPOLOGY IS INTACT WHEN THE CASE ENDS, on every path. cleanup is not needed as
- *    a separate hook here because the finally clause inside run_test() re-posts the removal and
- *    CONFIRMS the reference sample is back; a failure to confirm is reported plainly rather than
- *    left for a later case to trip over.
+ *  - THE BASELINE TOPOLOGY IS INTACT WHEN THE CASE ENDS, on every path, and that is now
+ *    delivered by a module-level cleanup() hook rather than claimed. This entry previously read
+ *    "cleanup is not needed as a separate hook here because the finally clause inside run_test()
+ *    re-posts the removal" - there was no finally clause in run_test() and no hook either, so
+ *    every early return between the add in Act 1 and the confirmed removal in Act 4 left
+ *    "GameConsole" attached to the emulated topology. This case's own precondition check is what
+ *    then failed on the NEXT run, reporting "a previous run that did not reach its removal step
+ *    leaves the peer behind" - the symptom of exactly this gap.
+ *    The hook re-posts Device_Remove.yaml and CONFIRMS the peer is gone by re-reading the
+ *    published device list; a failure to confirm is reported plainly rather than left for a later
+ *    case to trip over. It is preferred to a finally clause because SuitManager runs it on a
+ *    strict superset of that clause's paths - including the run in which this case is SKIPPED and
+ *    run_test() is never entered at all.
  *
  * @pass_criteria
  *  - All five required YAML posts return HTTP 200; the before-probe parses with result.success
@@ -240,7 +249,14 @@ def _await_peer(logical_address, expect_present, label):
         getDeviceList result mapping (empty when the last read was unusable), and the peer's
         entry from that reading or None.
     """
-    deadline = time.time() + LIFECYCLE_TIMEOUT_SECONDS
+    # MONOTONIC, not the wall clock. This bound is a DURATION - "give the plugin twenty seconds of
+    # ping rounds to notice" - and time.time() is the wall clock: NTP stepping it, or a container's
+    # clock being corrected while the suite runs, moves it under a loop that compares against a
+    # stored value. Backwards makes a 20 second budget arbitrarily long; forwards expires it on the
+    # first comparison and reports a peer that appeared perfectly normally as never having appeared.
+    # This helper carries the verdict for both directions of the lifecycle, so a spurious expiry
+    # here fails the case outright. time.monotonic cannot be stepped.
+    deadline = time.monotonic() + LIFECYCLE_TIMEOUT_SECONDS
     result = {}
     entry = None
     while True:
@@ -255,11 +271,14 @@ def _await_peer(logical_address, expect_present, label):
             if result.get("success") is True and (entry is not None) == expect_present:
                 log_warning(f"  {label} device list: {response}")
                 return True, result, entry
-        if time.time() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             if response and not response.startswith("< No response"):
                 log_warning(f"  {label} device list (last sample): {response}")
             return False, result, entry
-        time.sleep(LIFECYCLE_POLL_SECONDS)
+        # Capped by what is left, so the last sleep of the loop cannot carry the wait past the
+        # deadline it is enforcing.
+        time.sleep(min(LIFECYCLE_POLL_SECONDS, remaining))
 
 
 def _device_inventory():
@@ -287,6 +306,82 @@ def _device_inventory():
     )
     return True, result.get("numberofdevices"), addresses
 
+# True while a peer this case attached to the emulated topology has NOT been confirmed gone.
+#
+# DEFINED AT MODULE SCOPE, which it was not. The only statements touching this name were
+# `global _peer_outstanding` and `_peer_outstanding = False` INSIDE run_test(), so the module
+# attribute did not exist until run_test() had been entered at least once - and the restoration
+# hook below, which SuitManager calls even for a case it SKIPPED, would have raised NameError
+# instead of restoring anything. Defined here it is readable on every path, including the one
+# where run_test() never runs.
+_peer_outstanding = False
+
+
+def cleanup():
+    """Detach the peer this case attached, and CONFIRM the emulated topology is back.
+
+    SuitManager runs this unconditionally - after a pass, a failure, an exception, and for a case
+    it SKIPPED because a producer failed - which is a strict superset of the paths a finally clause
+    inside run_test() could cover, and it is why the restoration lives here.
+
+    Idempotent in both directions: when run_test() confirmed the removal it clears the flag and
+    this reports that and posts nothing, and re-posting Device_Remove.yaml for a peer that is
+    already gone is itself harmless - removeDevice() does nothing at all unless the peer's
+    m_isDevicePresent is set (HdmiCecSinkImplementation.cpp:2487).
+
+    The restoration is VERIFIED rather than assumed. A vComponent post that returns HTTP 200 says
+    the document was accepted, not that the plugin observed the departure - the plugin learns of it
+    on its next ping round - so the published device list is re-read until the address is absent,
+    which is the same observable run_test() itself is decided on.
+
+    Returns:
+        True when there was nothing to restore, or the peer was removed AND confirmed absent.
+        False when the removal post was refused, or the peer is still listed after the lifecycle
+        window - in which case the emulated topology is left altered and the message says so,
+        including the fact that the next run of this case will fail its own precondition.
+    """
+    global _peer_outstanding
+    if not _peer_outstanding:
+        log_info(
+            "TCID27 cleanup: no peer is outstanding - the removal was already confirmed, or "
+            "nothing was ever added - so there is nothing to restore"
+        )
+        return True
+
+    log_info(
+        f"TCID27 cleanup: {ADDED_PEER_NAME!r} may still be attached; re-posting the removal"
+    )
+    if not _post_hdmicec("Device_Remove.yaml"):
+        log_error(
+            "TCID27 cleanup: the vComponent removal post was refused, so "
+            f"{ADDED_PEER_NAME!r} is still in the emulated topology. Reset it before re-running: "
+            "this case's own precondition check will otherwise fail on the next run"
+        )
+        return False
+    time.sleep(CEC_TOPOLOGY_PACING_SECONDS)
+
+    try:
+        absent, _, _ = _await_peer(ADDED_PEER_LOGICAL_ADDRESS, False, "cleanup post-remove")
+    except json.JSONDecodeError:
+        log_error(
+            "TCID27 cleanup: a device-list reply during the confirmation was not JSON, so the "
+            f"removal of {ADDED_PEER_NAME!r} could not be confirmed"
+        )
+        return False
+
+    if not absent:
+        log_error(
+            f"TCID27 cleanup: logical address {ADDED_PEER_LOGICAL_ADDRESS} is still listed "
+            f"{LIFECYCLE_TIMEOUT_SECONDS:.0f}s after the removal, so {ADDED_PEER_NAME!r} is left "
+            "in the emulated topology for every case that follows"
+        )
+        return False
+
+    _peer_outstanding = False
+    log_success(f"✔ TCID27 cleanup: {ADDED_PEER_NAME} is gone, the baseline topology is back")
+    return True
+
+
 def run_test():
     """Walk one test-only peer through appear / announce / mutate / depart, on membership.
 
@@ -300,15 +395,14 @@ def run_test():
       * and the reference sample must SURVIVE the whole lifecycle - every address present before
         the add is still present after the removal, which is what proves the removal took away
         only what the add created.
-    An earlier revision could make none of those claims. It asserted only after_count <= mid_count
-    and argued at length that a growth assertion was impossible because the peer being added,
-    "GameConsole", was ALREADY in the baseline topology so the add could legitimately be a no-op.
-    That premise was simply untrue of this tree: Device_Config_Add_Network.yaml declares six peers -
-    SAMSUNG, YAMAHA, DENON, PANASONIC, LG and SONY beneath VTV - and GameConsole is not one of them,
-    which is why it leaves port 4 of the audio system free for exactly this triple. So the add IS a
-    real transition, the removal takes away exactly what the add created, and both directions are
-    assertable. All three fixtures - Device_Add.yaml, Device_Status.yaml and Device_Remove.yaml -
-    name "GameConsole", the same name ADDED_PEER_NAME carries, and
+    All three claims rest on the added peer being genuinely absent from the baseline topology, which
+    is a property of this tree rather than an assumption: Device_Config_Add_Network.yaml declares six
+    peers beneath the VTV television - SAMSUNG, YAMAHA, DENON, PANASONIC, LG and SONY - and
+    "GameConsole" is not one of them, which is why port 4 of the audio system is free for exactly
+    this triple. The add is therefore a real transition and the removal takes away exactly what the
+    add created, so both directions are assertable rather than only the weaker "did not grow". All
+    three fixtures - Device_Add.yaml, Device_Status.yaml and Device_Remove.yaml - name
+    "GameConsole", the same name ADDED_PEER_NAME carries, and
     Init_Devicelist_Populate.verify_topology_consistency() is what keeps a claim about the topology
     checkable rather than a comment.
     WHAT IS NOT OBSERVABLE: the OnDeviceRemoved notification. A curl request/response cannot
@@ -395,6 +489,18 @@ def run_test():
     # addDevice() - before it can show up in a device-list read, which is a longer path than a
     # single frame injection.
     ok_add = _post_hdmicec("Device_Add.yaml")
+    # MARKED HERE, BEFORE THE SETTLE AND BEFORE ANY ASSERTION.
+    #
+    # _peer_outstanding used to be set to False at the top of run_test() and never set to True
+    # anywhere, so it was a dead flag: nothing could read it and learn that a peer was attached.
+    # It is set the instant the add is ACCEPTED, because from that moment the emulated topology
+    # carries a peer this case put there - and every line below is a place the case can return or
+    # raise. It is cleared only when the peer's ABSENCE has been confirmed, so an unconfirmed
+    # removal leaves it set and cleanup() tries again.
+    # run_test() already declares `global _peer_outstanding` at its top, so no second declaration
+    # is needed - and Python rejects one after the name has been assigned in the same function.
+    if ok_add:
+        _peer_outstanding = True
     time.sleep(CEC_TOPOLOGY_PACING_SECONDS)
 
     # ACT 2 - MUTATE. Device_Status.yaml drives the same peer to power_status "off" and marks it
@@ -581,6 +687,11 @@ def run_test():
         )
         log_error("TCID27_Device_Add_Remove_Discovery_Flow Failed ❌")
         return False
+
+    # The peer is CONFIRMED absent, so the topology this case altered is demonstrably back and the
+    # restoration hook below has nothing left to do. Cleared here rather than after the removal
+    # POST, because a post that was accepted is not a removal that took effect - `absent` above is.
+    _peer_outstanding = False
 
     # ALSO NOT ASSERTED, AND NOT AN OVERSIGHT: that OnDeviceRemoved fired. The notification goes
     # to registered Thunder subscribers, and a curl request/response exchange is not one, so this

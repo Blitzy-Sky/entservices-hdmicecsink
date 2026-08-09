@@ -67,7 +67,7 @@
  * @precondition
  *  - A device under test - physical hardware or a QEMU target - is running WPEFramework with
  *    the org.rdk.HdmiCecSink plugin activated and reachable over JSON-RPC.
- *  - Init_Devicelist_Populate has seeded the emulated topology, including the VAUDIO
+ *  - Init_Devicelist_Populate has seeded the emulated topology, including the YAMAHA
  *    AudioSystem peer at CEC logical address 5, and has left HDMI-CEC ENABLED. Both
  *    conditions are load-bearing for exchange 2: RequestAudioDevicePowerStatus returns
  *    Core::ERROR_GENERAL when CEC is disabled, when no logical address has been allocated, or
@@ -150,6 +150,7 @@ import json
 from utils import (
     send_curl_command,
     send_vcomponent_command,
+    sanitise_for_log,
     HDMICEC_CMD_BASE,
     log_info,
     log_success,
@@ -163,7 +164,7 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 def _post_hdmicec(yaml_file):
     """Post a HdmiCec vComponent YAML command."""
     http_code, body = send_vcomponent_command(f"{HDMICEC_CMD_BASE}/{yaml_file}")
-    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {body}")
+    log_info(f"  vComponent POST {yaml_file}: HTTP {http_code}  {sanitise_for_log(body)}")
     return http_code == 200
 
 
@@ -454,13 +455,13 @@ def run_test():
         log_error("TCID24_Audio_Status_And_Power_Flow Failed ❌")
         return False
 
-    # VALUE ASSERTION ON `connected`, NOT A TYPE ASSERTION. An earlier revision checked only
-    # isinstance(connected, bool), reasoning from the sink's own L2 suite, which asserts
-    # EXPECT_FALSE(connected) (../../L2Tests/tests/HdmiCecSink_L2Test.cpp:1827 over COM-RPC, :2539
-    # over JSON-RPC). THAT CITATION DOES NOT TRANSFER: the L2 host discovers no audio system at
-    # all, whereas this suite REQUIRES the VAUDIO peer at logical address 5 as a @precondition and
-    # addDevice() sets hdmiCecAudioDeviceConnected unconditionally for that address (:2457-2459),
-    # with nothing on any path this module drives clearing it.
+    # VALUE ASSERTION ON `connected`, NOT A TYPE ASSERTION, and the distinction from the sink's L2
+    # suite is the reason. That suite asserts EXPECT_FALSE(connected) in
+    # GetAudioDeviceConnectedStatus_COMRPC and GetAudioDeviceConnectedStatus_JSONRPC
+    # (../../L2Tests/tests/HdmiCecSink_L2Test.cpp) because its in-process host discovers no audio
+    # system at all. THAT DOES NOT TRANSFER HERE: this suite REQUIRES the YAMAHA audio system at
+    # logical address 5 as a @precondition, addDevice() sets hdmiCecAudioDeviceConnected
+    # unconditionally for that address, and nothing on any path this module drives clears it.
     connected_before = _read_flag(HdmiCecSinkApis.get_audio_device_connected_status, "connected")
     if connected_before is not True:
         log_error(

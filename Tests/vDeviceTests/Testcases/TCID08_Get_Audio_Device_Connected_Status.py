@@ -47,6 +47,7 @@ import json
 
 from utils import (
     send_curl_command,
+    sanitise_for_log,
     log_info,
     log_success,
     log_error,
@@ -58,7 +59,7 @@ import HdmiCECSink_Curl as HdmiCecSinkApis
 
 # The CEC logical address of an audio system, and the address Init_Devicelist_Populate bootstraps
 # as a precondition of the whole suite. addDevice() keys the connected flag off exactly this value
-# (HdmiCecSinkImplementation.cpp:2457).
+# (HdmiCecSinkImplementation.cpp:2456-2459).
 AUDIO_SYSTEM_LOGICAL_ADDRESS = 5
 
 
@@ -136,32 +137,85 @@ def run_test():
             result = {}
         connected = result.get("connected")
 
-        # TYPE-ONLY ASSERTION ON `connected` - DO NOT STRENGTHEN THIS INTO A VALUE CHECK.
-        # Neither True nor False is a claim this testcase can honestly make. The sink's own L2
-        # suite asserts the counter-intuitive value for exactly this reason: its
-        # GetAudioDeviceConnectedStatus_JSONRPC case in
-        # ../../L2Tests/tests/HdmiCecSink_L2Test.cpp checks HasLabel("connected") and then
-        # EXPECT_FALSE(result["connected"].Boolean()) - currently lines 2538-2539, though the
-        # test NAME is the stable reference and the line numbers are not - because no audio
-        # system is ever discovered in that in-process host. The flag mirrors
-        # HdmiCecSinkImplementation::hdmiCecAudioDeviceConnected, false from construction and
-        # set true only inside addDevice() when a peer appears at logical address 5
-        # (HdmiCecSinkImplementation.cpp:2459), then false again by removeDevice() for that
-        # address (:2503). Nothing forces that discovery to have completed by suite position
-        # 8: the YAMAHA peer at address 5 is seeded by Init_Devicelist_Populate, and the ARC
-        # exchange a reader might assume gates the flag is driven later, by
-        # TCID20_ARC_Initiation_Flow at position 20. Pinning the value would therefore fail in
-        # one valid environment or the other. `success` is different - the implementation sets
-        # it unconditionally (:1331-1336) - so requiring True there is a measured claim.
-        if result.get("success") is True and isinstance(connected, bool):
-            log_info(f"Observed audio device connected state: {connected}")
-            elapsed_time = time.perf_counter() - start_time
-            log_success(log_with_timing("TCID08_Get_Audio_Device_Connected_Status Passed ✅", elapsed_time))
-            return True
+        if result.get("success") is not True:
+            log_error(
+                "✖ getAudioDeviceConnectedStatus reported success="
+                f"{sanitise_for_log(result.get('success'), max_chars=32)}, not True; the "
+                "implementation sets that member unconditionally "
+                "(HdmiCecSinkImplementation.cpp:1331-1336), so anything else means the reply is "
+                "not the published shape"
+            )
+            log_warning(f"Actual  : {json.dumps(parsed, indent=2, sort_keys=True)}")
+            log_error("TCID08_Get_Audio_Device_Connected_Status Failed ❌")
+            return False
 
-        log_warning(f"Actual  : {json.dumps(parsed, indent=2, sort_keys=True)}")
-        log_error("TCID08_Get_Audio_Device_Connected_Status Failed ❌")
-        return False
+        if not isinstance(connected, bool):
+            log_error(
+                "✖ getAudioDeviceConnectedStatus reported a non-boolean connected member "
+                f"({sanitise_for_log(connected, max_chars=64)})"
+            )
+            log_warning(f"Actual  : {json.dumps(parsed, indent=2, sort_keys=True)}")
+            log_error("TCID08_Get_Audio_Device_Connected_Status Failed ❌")
+            return False
+
+        log_info(f"Observed audio device connected state: {connected}")
+
+        # THE VALUE IS ASSERTED, AND THE PRECONDITION BEHIND IT IS ASSERTED FIRST.
+        #
+        # An earlier revision accepted EITHER boolean and left _audio_system_present() defined but
+        # never called - so the case passed with no audio system connected at all, which is the
+        # one outcome it exists to detect. It could not honestly have done more at the time: the
+        # emulated network declared its audio-system peer as a Tuner, so logical address 5 was
+        # never allocated and `connected` could only ever have been false.
+        #
+        # That is fixed. vcomponent_configurations/commands/Device_Config_Add_Network.yaml now
+        # declares YAMAHA as an AudioSystem, whose vComponent address pool is the single value 5,
+        # and Init_Devicelist_Populate.py bootstraps that address specifically and FAILS if the
+        # middleware never registers it. So by the time this case runs, address 5 is present by
+        # construction - and `hdmiCecAudioDeviceConnected` is set inside addDevice() for exactly
+        # that address (HdmiCecSinkImplementation.cpp:2456-2459-2459) and cleared only by
+        # removeDevice() for it (:2503), neither of which any earlier case in the suite calls.
+        #
+        # The two readings are taken in this order deliberately. When the flag is false, the
+        # device list says whether the cause is a peer that is absent - a topology or seeding
+        # failure, upstream of this API - or a peer that is present while the flag disagrees with
+        # it, which is a defect in the plugin's own bookkeeping. The diagnostics name which.
+        #
+        # (The L2 suite's GetAudioDeviceConnectedStatus_JSONRPC case asserts EXPECT_FALSE for the
+        # same member, and that is not a contradiction: its in-process host discovers no peers at
+        # all, so false is correct there for the same reason true is correct here.)
+        present = _audio_system_present()
+        if not present:
+            log_error(
+                f"✖ getDeviceList does not list logical address {AUDIO_SYSTEM_LOGICAL_ADDRESS}, "
+                "so the audio-system precondition this case rests on was never established. "
+                "Init_Devicelist_Populate.py bootstraps that address and fails if the middleware "
+                "does not register it, so reaching this point means the device list lost a peer "
+                "it had already learned."
+            )
+            log_error("TCID08_Get_Audio_Device_Connected_Status Failed ❌")
+            return False
+        log_success(
+            f"✔ logical address {AUDIO_SYSTEM_LOGICAL_ADDRESS} is present in the device list"
+        )
+
+        if connected is not True:
+            log_error(
+                f"✖ the audio system is discovered at logical address "
+                f"{AUDIO_SYSTEM_LOGICAL_ADDRESS} but getAudioDeviceConnectedStatus reports "
+                "connected=False. addDevice() sets hdmiCecAudioDeviceConnected for that address "
+                "(HdmiCecSinkImplementation.cpp:2456-2459-2459) and only removeDevice() for it clears "
+                "the flag (:2503), so the device list and the flag disagreeing is a defect in "
+                "the plugin's bookkeeping rather than a missing precondition."
+            )
+            log_warning(f"Actual  : {json.dumps(parsed, indent=2, sort_keys=True)}")
+            log_error("TCID08_Get_Audio_Device_Connected_Status Failed ❌")
+            return False
+
+        log_success("✔ connected reports True, consistent with the discovered audio system")
+        elapsed_time = time.perf_counter() - start_time
+        log_success(log_with_timing("TCID08_Get_Audio_Device_Connected_Status Passed ✅", elapsed_time))
+        return True
     except json.JSONDecodeError:
         log_error("Invalid JSON response")
         log_error("TCID08_Get_Audio_Device_Connected_Status Failed ❌")

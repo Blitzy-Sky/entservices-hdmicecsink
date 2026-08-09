@@ -21,8 +21,10 @@
  *          Standby, so it may leave the emulated peers powered down after this case returns, and
  *          the sink's command surface publishes no inverse to undo that - the nearest method,
  *          SendAudioDevicePowerOnMessage, only requests System Audio Mode. This case therefore
- *          cannot restore what it changed and does not pretend to; the comment closing run_test()
- *          records why that is tolerable and what was deliberately not done instead.
+ *          cannot restore what it changed and does not pretend to. Whether that residual affects a
+ *          later case has NOT been observed: the argument recorded at the close of run_test() is
+ *          that each later case re-establishes its own preconditions through its own vComponent
+ *          posts, which is a reading of those modules rather than a measurement of a run.
  *
  * @precondition
  *  - The org.rdk.HdmiCecSink plugin is active and reachable at the JSON-RPC endpoint utils.py
@@ -40,8 +42,12 @@
  *  - vcomponent_configurations/commands/*.yaml (for emulation-based scenarios)
  *
  * @expected_result
- *  - The sink accepts the request, answers with a success acknowledgement, and emits the standby
- *    broadcast onto the CEC bus toward its peers.
+ *  - OBSERVED BY THIS CASE: the sink accepts the request and answers with a success
+ *    acknowledgement. That acknowledgement is the whole of what this transport reports.
+ *  - INTENDED, NOT OBSERVED: the acknowledged request makes the sink emit CEC <Standby> onto the
+ *    bus toward its peers. A one-shot curl request/response cannot see a bus frame, and no
+ *    published method reports one, so nothing below asserts it and this case must not be read as
+ *    evidence that the broadcast was sent.
  *
  * @pass_criteria
  *  - The reply equals {"jsonrpc":"2.0","id":42,"result":{"success":true}} exactly and run_test()
@@ -125,12 +131,11 @@ def run_test():
     # widening this module's import set. The limitation is reported rather than forced, which is
     # what this engagement requires of fixture state exactly as it requires of coverage.
     #
-    # Leaving the residual is safe rather than merely unavoidable: no later module depends on the
-    # peers still being awake, because each re-establishes its own preconditions through its own
-    # vComponent posts - Device_Setapi_Open_Pass.yaml clears a driver fault, Device_Status.yaml
-    # sets a peer's power state explicitly, and Device_Image_View_On.yaml with the active-source
-    # fixtures drive wake behaviour where a flow needs it. The precedent from the source suite is
-    # structural rather than observed: it declares this same broadcast as its very first case,
-    # TCID01_Send_Standby_Message, with 32 cases after it, so its author treated a standby
-    # broadcast as safe to precede a whole suite. Neither suite has been executed here, and
-    # nothing in this comment claims otherwise.
+    # WHY THE RESIDUAL IS TOLERATED, stated as the reading it is rather than as a measurement: no
+    # later module in this suite reads peer power state as an inherited precondition, because each
+    # re-establishes what it needs through its own vComponent posts - Device_Setapi_Open_Pass.yaml
+    # clears a driver fault, Device_Status.yaml sets a peer's power state explicitly, and
+    # Device_Image_View_On.yaml with the active-source fixtures drive wake behaviour where a flow
+    # needs it. The source suite orders itself the same way, declaring this same broadcast as its
+    # first case with 32 cases after it. Neither suite has been executed here, so this is an
+    # argument from the modules' text and not evidence from a run.

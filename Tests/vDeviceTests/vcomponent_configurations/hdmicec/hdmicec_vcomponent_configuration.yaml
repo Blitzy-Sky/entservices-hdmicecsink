@@ -22,9 +22,13 @@
 # THE EMULATED DEVICE IS THE DEVICE UNDER TEST ITSELF, NOT A PEER.
 #
 # The vComponent replaces the HDMI-CEC HAL beneath the sink plugin, and the block below declares
-# the identity that HAL presents for the DUT. HdmiCecOpen resolves hdmicec/emulated_device against
-# the device map and then, for a TV, fixes physical address 0.0.0.0 and leaves the logical address
-# at 0x0F for the application to claim (rdk-halif-test-hdmi_cec/vcomponent/src/vcHdmiCec.c:770-775).
+# the identity that HAL presents for the DUT. It carries the same key set as the source plugin's
+# profile document, which this one is modelled on byte for byte apart from the commentary: a name,
+# the four identity fields, the fault flag and the controller port. HdmiCecOpen resolves the
+# emulated device BY NAME against the configured device map - "VTV" here has to be the name the
+# ../commands/Device_Config*.yaml documents give the root node - and then, for a TV, fixes physical
+# address 0.0.0.0 and leaves the logical address at 0x0F for the application to claim
+# (rdk-halif-test-hdmi_cec/vcomponent/src/vcHdmiCec.c:726, :747, :770-775).
 #
 # device_type MUST BE "TV", and that is a HAL requirement rather than a preference.
 # HdmiCecSinkImplementation::allocateLAforTV() claims LogicalAddress::TV for the sink, and
@@ -51,7 +55,7 @@
 # still the unknown sentinel 15.15.15.15. Because this suite seeds that address explicitly, an
 # audio system anywhere else disables every ARC flow silently, so it is placed on HDMI input 1 -
 # the input this suite's own fixtures pin as the ARC port and the only one they report connected
-# (test_HdmiCecSink.cpp:853, HdmiCecSink_L2Test.cpp:961 and :1224 all stub getHDMIARCPortId to 1).
+# (test_HdmiCecSink.cpp:857-868, HdmiCecSink_L2Test.cpp:1466-1479 and :1740-1751 all stub getHDMIARCPortId to 1).
 # That peer is declared as YAMAHA in ../commands/Device_Config.yaml and
 # ../commands/Device_Config_Add_Network.yaml, which are the documents a test case posts to
 # materialise the network; the directed exchanges in hdmicec_vcomponent_cec_responses.yaml and the

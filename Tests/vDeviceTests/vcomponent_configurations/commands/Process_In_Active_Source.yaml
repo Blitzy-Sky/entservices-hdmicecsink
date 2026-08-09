@@ -21,15 +21,18 @@
 # <Inactive Source> from SONY, the playback peer the routing flows switch to and away from.
 #
 # THE PHYSICAL ADDRESS OPERAND IS 3.0.0.0 AND IT IS NOT FREE TO CHOOSE.
-# ../Device_Config_Add_Network.yaml allocates SONY logical address 4 at physical address
-# 3.0.0.0 - HDMI input 2 of the sink television - and Process_Active_Source.yaml, the
-# document this one reverses, carries the same 3.0.0.0 for the same peer. An earlier
-# revision of this file carried 2.0.0.0, which is the AUDIO SYSTEM's address, and the drift
-# was not inert: updateActiveSource writes the operand straight into the addressed entry's
-# m_physicalAddr, so an <Inactive Source> naming 2.0.0.0 MOVES logical address 4 on top of
-# the audio system's port and takes the ARC counterpart's address with it - which makes
-# process(InitiateArc)'s deviceList[0x5].m_physicalAddr comparison fail for every ARC
-# fixture that runs afterwards.
+# Device_Config_Add_Network.yaml allocates SONY logical address 4 at physical address 3.0.0.0 -
+# HDMI input 2 of the sink television - and Process_Active_Source.yaml, the document this one
+# reverses, carries the same 3.0.0.0 for the same peer. The two must agree, because the PAIR is
+# what makes them one peer's announcement and withdrawal rather than two unrelated frames.
+#
+# WHAT THE OPERAND DOES AND DOES NOT DO. updateInActiveSource clears deviceList[4].m_isActiveSource,
+# resets m_currentActiveSource when the departing peer is the one holding it, and reports the
+# operand verbatim in the OnInActiveSource notification. It does NOT write m_physicalAddr - only
+# updateActiveSource, on the <Active Source> side, does that - so an operand naming another
+# address here does not MOVE the peer. What it does instead is publish an address the peer does not
+# hold and break the pairing with Process_Active_Source.yaml, which is why the value is not free to
+# choose.
 #
 # 0x40  header: initiator 4 (SONY), destination 0 - the sink television. DIRECTED: the CEC
 #       specification addresses <Inactive Source> to the television, and the sink's

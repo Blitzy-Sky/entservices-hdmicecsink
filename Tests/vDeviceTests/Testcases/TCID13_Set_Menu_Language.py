@@ -74,6 +74,7 @@ import time
 import json
 from utils import (
     send_curl_command,
+    device_inventory,
     log_info,
     log_success,
     log_error,
@@ -82,51 +83,6 @@ from utils import (
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
-
-def _result_object(response_text):
-    """Return the JSON-RPC result mapping from a response body, or an empty mapping.
-
-    A JSON-RPC error envelope carries "error" instead of "result", and a malformed body could
-    carry a non-object "result" or not be an object at all. Every such case collapses to {} so
-    the caller reports a MISSING FIELD rather than raising AttributeError out of run_test(). A
-    body that is not JSON at all still raises json.JSONDecodeError, which run_test() handles as
-    the documented failure. Three call sites share this, which is why it is factored out.
-    Args:
-        response_text: Raw response string as returned by utils.send_curl_command
-    Returns:
-        The "result" mapping when the body is a JSON object carrying one, otherwise {}.
-    """
-    body = json.loads(response_text)
-    if not isinstance(body, dict):
-        return {}
-    result = body.get("result")
-    return result if isinstance(result, dict) else {}
-
-
-def _device_inventory():
-    '''Return (readable, count, sorted_logical_addresses) from the published getDeviceList method.
-
-    readable is False when the reply could not be read as a JSON-RPC result reporting success,
-    which is deliberately distinct from an empty inventory.
-    '''
-    response = send_curl_command(HdmiCecSinkApis.get_device_list)
-    if not response or response.startswith("< No response"):
-        return False, None, None
-    try:
-        result = _result_object(response)
-    except json.JSONDecodeError:
-        return False, None, None
-    if result.get("success") is not True:
-        return False, None, None
-    device_list = result.get("deviceList")
-    if not isinstance(device_list, list):
-        return False, None, None
-    addresses = sorted(
-        device["logicalAddress"]
-        for device in device_list
-        if isinstance(device, dict) and isinstance(device.get("logicalAddress"), int)
-    )
-    return True, result.get("numberofdevices"), addresses
 
 def run_test():
     start_time = time.perf_counter()
@@ -140,8 +96,22 @@ def run_test():
     }
 
     # Inventory snapshot BEFORE the write, so the invariant below compares two real observations
-    # rather than one observation against an assumption.
-    inventory_readable, before_count, before_addresses = _device_inventory()
+    # rather than one observation against an assumption. utils.device_inventory is the suite's one
+    # reader of the CEC population - it returns (readable, count, frozenset-of-logical-addresses)
+    # and refuses every unusable reply, so `readable` False below means "no invariant can be
+    # asserted", never "the population is empty".
+    inventory_readable, before_count, before_addresses = device_inventory(
+        HdmiCecSinkApis.get_device_list
+    )
+
+    # The baseline is a PRECONDITION, refused before the write rather than after it. A case that
+    # writes first and only then discovers it cannot compare has already perturbed the device it
+    # was going to make a claim about, and its verdict would rest on the acknowledgement alone
+    # while still reading as though the invariant had been evaluated.
+    if not inventory_readable:
+        log_error("✖ the device inventory could not be read, so no invariant can be asserted")
+        log_error("TCID13_Set_Menu_Language Failed ❌")
+        return False
     log_info(f"Device inventory before: {before_count} devices at {before_addresses}")
 
     log_info("Executing the curl command set menu language")
@@ -185,12 +155,9 @@ def run_test():
         # tautology: an implementation that perturbed the device list while encoding the language -
         # a stray addDevice, a dropped entry, a reset of the poll state - would break it, and the
         # acknowledgement alone would still read green.
-        if not inventory_readable:
-            log_error("✖ the device inventory could not be read, so no invariant can be asserted")
-            log_error("TCID13_Set_Menu_Language Failed ❌")
-            return False
-
-        after_readable, after_count, after_addresses = _device_inventory()
+        after_readable, after_count, after_addresses = device_inventory(
+            HdmiCecSinkApis.get_device_list
+        )
         if not after_readable:
             log_error("✖ the device inventory became unreadable after setMenuLanguage")
             log_error("TCID13_Set_Menu_Language Failed ❌")

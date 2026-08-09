@@ -84,11 +84,11 @@ def _read_enabled(label):
 def _restore_enabled():
     """Re-enable HDMI-CEC and VERIFY it, since every following case needs it enabled.
 
-    F13's remediation names this explicitly: the restoring call used to be dispatched with its
-    reply discarded, so a restoration that silently failed would leave a disabled plugin to the
-    rest of the suite - and the very next case, TCID31_Repeated_Enable_Idempotent, would then be
-    the one to fail for this module's omission. The acknowledgement and the read-back are both
-    required here so the fault is reported where it happens.
+    A restoring call whose reply is discarded cannot tell a restoration that failed from one that
+    worked, and a silently failed one would leave a disabled plugin to the rest of the suite - the
+    very next case, TCID31_Repeated_Enable_Idempotent, would then fail for this module's omission.
+    The acknowledgement and the read-back are both required here so the fault is reported where it
+    happens.
     """
     if not require_ack(HdmiCecSinkApis.set_enabled_true, "restoring setEnabled(true)"):
         log_error(
@@ -119,8 +119,8 @@ def run_test():
     # be observed after EACH of the two writes - one reading cannot distinguish "still false" from
     # "false for the first time". And a write whose reply is discarded is indistinguishable from
     # one that never left the host: a plugin that was already disabled would report false on both
-    # reads whether or not either request arrived, which is exactly how this case used to be able
-    # to pass on no evidence.
+    # reads whether or not either request arrived, so without the acknowledgements this case could
+    # pass on no evidence at all.
     observation_ok = False
     if require_ack(HdmiCecSinkApis.set_enabled_false, "first setEnabled(false)"):
         first_enabled = _read_enabled("getEnabled after the first disable")
