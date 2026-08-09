@@ -350,10 +350,13 @@
 #          plugin/HdmiCecSinkImplementation.h exempt for the reason given with the L2 floors
 #          below.  `l2` exits 0.
 #  Separately from those dated figures, and checkable right now rather than measured:
-#  HdmiCecSink_L2Test.cpp holds 128 TEST_F cases, four of them carrying a DISABLED_ prefix, so
-#  124 are eligible to run.  That is the CURRENT file, not the tree the L2 row above was
-#  measured from, so do not read 120 as today's eligible count -- re-run `l2` for that.  The
-#  L2 floors block says why those four are disabled.
+#  HdmiCecSink_L2Test.cpp holds 128 TEST_F cases and `grep -c DISABLED_` over it returns ZERO,
+#  so all 128 are eligible to run.  The four route and port-map cases that were disabled at an
+#  intermediate commit are ENABLED in this tree and pass; the one assertion the shared,
+#  out-of-scope CEC mock cannot satisfy sits behind a runtime availability check inside each of
+#  them, so nothing is bought by disabling anything.  128 is the CURRENT eligible count, not the
+#  tree the L2 row above was measured from, so do not read 120 as today's figure -- re-run `l2`
+#  for that.  The L2 floors block says what the mock still blocks, and why.
 #  L2 did NOT always clear the bar.  It was measured at aggregate 78.17% with
 #  HdmiCecSinkImplementation.cpp at 77.98% and HdmiCecSinkImplementation.h at 70.76%, and it
 #  was closed the only honest way -- by adding L2 cases that reach the port-map and route
@@ -760,19 +763,28 @@ readonly L2_GATE_EXEMPT=(
 # a full run.  Both are properties of a SHARED, OUT-OF-SCOPE mock, so the gap is REPORTED with the
 # exact mock change it needs rather than worked around here.
 #
-# NOTHING WAS REMOVED to accommodate that, and nothing may be: the four route-chain cases remain
-# in HdmiCecSink_L2Test.cpp carrying a DISABLED_ prefix
-# (DISABLED_ActiveRouteIsResolvedThroughTheRegisteredPortChain,
-# DISABLED_ActiveRouteResolvesADeeperDeviceChain, DISABLED_ActiveRouteForADeviceDirectlyOnAPort,
-# DISABLED_DeviceRemovalUnregistersTheChildFromThePortMap), and inbound <Feature Abort> coverage
-# is confined to the broadcast-rejection path, which production returns early on and which the
-# uninitialised member is therefore never reached from.  The file holds 128 TEST_F cases, four of
-# them disabled, so 124 are eligible to run.
+# NOTHING WAS REMOVED to accommodate that, and nothing was disabled either.  The four route-chain
+# cases are ENABLED in this tree and pass -- ActiveRouteIsResolvedThroughTheRegisteredPortChain,
+# ActiveRouteResolvesADeeperDeviceChain, ActiveRouteForADeviceDirectlyOnAPort and
+# DeviceRemovalUnregistersTheChildFromThePortMap all carry no DISABLED_ prefix, and
+# `grep -c DISABLED_` over HdmiCecSink_L2Test.cpp returns ZERO, so all 128 TEST_F cases are
+# eligible to run.  Each of the four asserts unconditionally everything that IS observable -- that
+# COM-RPC and JSON-RPC agree about whether a route is available, and that an unavailable route
+# reports zero length and an empty description rather than stale state -- and puts only the
+# claimed-port branch behind an `if (available)` guard, so the blocked half can never produce a
+# false green and starts asserting the moment the framework gains one representation.  Inbound
+# <Feature Abort> coverage is likewise confined to the broadcast-rejection path, which production
+# returns early on and from which the uninitialised member is therefore never reached.
 #
-# plugin/HdmiCecSinkImplementation.h is L2_GATE_EXEMPT for the same reason and is given no L2
-# floor: the disabled route-chain cases are what would cover it.  That coverage is NOT lost
-# overall -- every affected path is covered by this repository's own L1 suite, whose floors below
-# are unchanged and which measures plugin/HdmiCecSinkImplementation.h at 100.0%.
+# plugin/HdmiCecSinkImplementation.h is L2_GATE_EXEMPT because of the MOCK DEFECT ITSELF, not
+# because anything is disabled: with getByteValue returning wire bytes where ccec returns nibbles,
+# addChild's port-match guard can never hold, so no L2 test of any kind can claim a port and reach
+# the port-map bodies through the production frame path.  It is given no L2 floor for the same
+# reason -- a floor on a verdict this level cannot influence would be a second, contradictory
+# judgement on the same file.  That coverage is NOT lost overall: every affected path is covered
+# by this repository's own L1 suite, which constructs HdmiPortMap in-test so both sides of every
+# comparison are digit-built and the guards hold, and whose floors below are unchanged and which
+# measures plugin/HdmiCecSinkImplementation.h at 100.0%.
 # Nothing was excluded and COVERAGE_MIN was not lowered to reach the L2 figures below.
 #   The file each level EXEMPTS is deliberately given no floor for that level:
 #   plugin/Module.cpp has none at L1 and plugin/HdmiCecSink.cpp none at L2, because a floor on
@@ -2948,8 +2960,14 @@ gate_exempt_reason() {
             log "        by the SHARED CEC MOCK.  entservices-testframework/Tests/mocks/HdmiCec.h"
             log "        carries a PhysicalAddress representation that is incompatible with the one the"
             log "        production header expects, so the announced address never matches and the"
-            log "        chain is never registered; the four route-map cases in this repository's L2"
-            log "        file are DISABLED_ for exactly that reason and say so in place."
+            log "        chain is never registered.  The four route-map cases in this repository's L2"
+            log "        file are ENABLED and pass: each asserts unconditionally what is observable -"
+            log "        that COM-RPC and JSON-RPC agree on route availability, and that an"
+            log "        unavailable route reports zero length and an empty description rather than"
+            log "        stale state - and guards only the claimed-port branch behind 'if (available)',"
+            log "        so they cannot produce a false green and begin asserting the rest as soon as"
+            log "        the mock gains one representation.  The exemption rests on the mock defect"
+            log "        itself, not on any test being withheld."
             log "        The required change is a single-representation PhysicalAddress in that mock"
             log "        header.  It is a read-only authority for this pass (AAP Sec. 0.10.2), so the"
             log "        change is REPORTED, NOT MADE, and no in-scope file can substitute for it -"

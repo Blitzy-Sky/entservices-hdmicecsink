@@ -1568,11 +1568,15 @@ TEST_F(HdmiCecSinkInitializedEventDsTest, onHdmiOutputHDCPStatusEvent)
 // constructible and assignable under the mocked headers this suite compiles against.
 TEST_F(HdmiCecSinkInitializedEventDsTest, powerModeChange)
 {
+    // ASSERT_TRUE(pwrMgrModeChangeEventHandler != nullptr);
+
     IARM_Bus_PWRMgr_EventData_t eventData;
     eventData.data.state.newState =IARM_BUS_PWRMGR_POWERSTATE_ON;
     eventData.data.state.curState =IARM_BUS_PWRMGR_POWERSTATE_STANDBY;
 
     (void) eventData;
+
+    // pwrMgrModeChangeEventHandler(IARM_BUS_PWRMGR_NAME, IARM_BUS_PWRMGR_EVENT_MODECHANGED, &eventData , 0);
 }
 
 // DISABLED, and it stays disabled: the JSON-RPC method it invokes does not exist.
@@ -3798,7 +3802,17 @@ TEST_F(HdmiCecSinkFrameProcessingTest, InjectReportPowerStatus_AudioSystem_After
     EXPECT_EQ(Core::ERROR_NONE, handler.Invoke(connection, _T("requestAudioDevicePowerStatus"), _T("{}"), requestResponse));
     EXPECT_EQ(requestResponse, string("{\"success\":true}"));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // NO WAIT HERE, AND NONE IS NEEDED - the success above already IS the ordering guarantee.
+    //
+    // RequestAudioDevicePowerStatus runs entirely on the calling thread
+    // [entservices-hdmicecsink/plugin/HdmiCecSinkImplementation.cpp:2208-2237]: it sends
+    // <Give Device Power Status> to the audio system, sets m_audioDevicePowerStatusRequested and
+    // only then reports success.  So by the time the Invoke above has returned ERROR_NONE with
+    // {"success":true}, the flag the injected reply below depends on is already set and there is
+    // no asynchronous work left to settle.  A fixed sleep here would pace the test off the clock
+    // for an effect that has already happened, which is what AAP Sec. 0.9.5 rules out ("no new
+    // test introduces a real sleep or a wall-clock wait"); it would also mask a regression that
+    // made this path asynchronous, because the test would then pass for the wrong reason.
 
     uint8_t audioSystemPowerStatusFrame[] = { 0x50, 0x90, 0x00 }; // From Audio System LA=5, Power On
     EXPECT_NO_THROW(InjectCECFrame(audioSystemPowerStatusFrame, sizeof(audioSystemPowerStatusFrame)));
