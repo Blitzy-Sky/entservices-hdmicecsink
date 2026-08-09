@@ -12,7 +12,7 @@
  *          holds exactly those 24 and nothing else, and then proves that the plugin's
  *          readable state survives the whole sweep.
  *
- *          Five things are asserted, and only five:
+ *          Six things are asserted, and only six:
  *            1. the Process_*.yaml tree matches the approved inventory EXACTLY in both
  *               directions, every entry is a regular file, and every entry carries a declared
  *               expectation - so a deleted document is a named failure rather than a
@@ -22,11 +22,15 @@
  *               recorded reason for being retained without one - so a fixture cannot sit in
  *               the tree unconsumed and unexplained, which is indistinguishable from one
  *               whose consumer was deleted;
- *            3. every fixture on the sweep is ACCEPTED by the vComponent (HTTP 200);
- *            4. org.rdk.HdmiCecSink.getDeviceList answers with a well-formed envelope
+ *            3. every opcode named in the sibling emulated-response table is one the
+ *               vComponent's parser can resolve, and every request/response half written as a
+ *               mapping carries an opcode key - so an exchange the emulator would silently
+ *               decline to carry cannot be added while looking like coverage;
+ *            4. every fixture on the sweep is ACCEPTED by the vComponent (HTTP 200);
+ *            5. org.rdk.HdmiCecSink.getDeviceList answers with a well-formed envelope
  *               before and after the sweep, and the initiator encoded in each of the six
  *               registering fixtures' own payloads appears in the device list afterwards;
- *            5. org.rdk.HdmiCecSink.getActiveSource stays answerable across the six
+ *            6. org.rdk.HdmiCecSink.getActiveSource stays answerable across the six
  *               fixtures that move the active-source and routing state.
  *
  *          WHAT IS NOT ASSERTED MATTERS AS MUCH. A handler whose only effect is an outbound
@@ -123,6 +127,10 @@ from utils import (
     # topology is a topology change, which travels the whole pipeline before a device-list read can
     # reflect it - the same window Act 1 and Act 4 of TCID27 use for the same reason.
     CEC_TOPOLOGY_PACING_SECONDS,
+    # The 55 opcode names the vComponent's parser resolves, declared once in utils.py and read
+    # here by _verify_response_table_opcodes so the response table's own claim that the
+    # constraint is ENFORCED is true of the code rather than of the comment.
+    SUPPORTED_VCOMPONENT_OPCODES,
 )
 import HdmiCECSink_Curl as HdmiCecSinkApis
 
@@ -477,21 +485,37 @@ FIXTURES_THAT_MOVE_ACTIVE_SOURCE = tuple(sorted(
 # ── THE OTHER HALF OF THE FIXTURE TREE: THE Device_*.yaml FAMILY ─────────────────────────────────
 #
 # Every command document in this directory now has a declared status, which is the point of the two
-# tables below. Thirty of the fifty-three Device_*.yaml documents had NO consumer at all: no module
-# posted them, nothing named them, and nothing recorded whether that was deliberate. An unconsumed
-# fixture is not harmless - it is indistinguishable from a fixture whose consumer was deleted or
-# renamed, so real lost coverage looks exactly like a document that was never meant to be posted.
+# tables below. Twenty-eight of the fifty-three Device_*.yaml documents have NO consumer: no module
+# posts them, nothing names them, and before these tables existed nothing recorded whether that was
+# deliberate. An unconsumed fixture is not harmless - it is indistinguishable from a fixture whose
+# consumer was deleted or renamed, so real lost coverage looks exactly like a document that was
+# never meant to be posted.
 #
-# They are RETAINED. Every one of them is a reviewed emulator command that a future case may
-# legitimately reach for. What they carry instead is an explicit status, checked against the tree by
-# _verify_device_fixture_inventory below: either a named consuming module, verified to actually
-# reference the filename, or a recorded reason for being retained without one.
+# Those twenty-eight are RETAINED. Every one of them is a reviewed emulator command that a future
+# case may legitimately reach for. What they carry instead is an explicit status, checked against
+# the tree by _verify_device_fixture_inventory below: either a named consuming module, verified to
+# actually reference the filename, or a recorded reason for being retained without one.
+#
+# THE SPLIT IS 25 CONSUMED / 28 RETAINED, and the two numbers are derived from the tables rather
+# than written here twice - the success line prints len() of each. Getting the split wrong is not
+# something the check below can catch: it asserts that every document has SOME status, so a live
+# fixture mis-declared as retained passes while under-stating the suite's own coverage. That is
+# exactly what had happened to the <Get CEC Version> pair, which TCID05_Get_CEC_Version posts.
 #
 # DEVICE_FIXTURE_CONSUMERS - posted by the module named. The check reads that module and requires the
 # filename to appear in it, so a rename on either side is a named failure rather than a silent orphan.
 DEVICE_FIXTURE_CONSUMERS = {
     "Device_Add.yaml": "TCID27_Device_Add_Remove_Discovery_Flow",
+    # The <Get CEC Version> / <CEC Version> pair. TCID05_Get_CEC_Version drives the directed
+    # exchange with BOTH documents - it names them as GET_CEC_VERSION_YAML and CEC_VERSION_YAML and
+    # posts each through send_vcomponent_command - so they are consumed, not retained. They were
+    # previously declared under the "alternative framing" reason, which read as though the
+    # Process_*.yaml equivalents were the only ones on any sweep; that made two live fixtures look
+    # like library documents nobody posts, and the inventory check cannot catch that class of
+    # mistake because it asserts only that SOME status exists for every file.
+    "Device_CEC_Version.yaml": "TCID05_Get_CEC_Version",
     "Device_Config_Add_Network.yaml": "Init_Devicelist_Populate",
+    "Device_Get_CEC_Version.yaml": "TCID05_Get_CEC_Version",
     "Device_Image_View_On.yaml": "TCID25_Standby_Coordination_Flow",
     "Device_In_Active_Source.yaml": "TCID18_Set_Active_Source_Flow",
     "Device_Initiate_Arc.yaml": "TCID20_ARC_Initiation_Flow",
@@ -539,8 +563,6 @@ DEVICE_FIXTURES_RETAINED = {
     "Device_CEC_Message_Userdef.yaml":
         "alternative framing: injects <Active Source> as a user-defined message; "
         "Process_Active_Source.yaml is on the sweep and TCID17/TCID18 drive that flow",
-    "Device_CEC_Version.yaml":
-        "alternative framing: Process_CEC_Version.yaml is the one on the sweep",
     "Device_Config.yaml":
         "emulator control, and not the topology this suite configures: Device_Config_Add_Network.yaml "
         "is, declaring the six peers rather than an empty map",
@@ -548,8 +570,6 @@ DEVICE_FIXTURES_RETAINED = {
         "alternative framing: Process_Device_Vendor_ID.yaml is the one on the sweep",
     "Device_Feature_Abort.yaml":
         "alternative framing: Process_Feature_Abort.yaml is the one on the sweep",
-    "Device_Get_CEC_Version.yaml":
-        "alternative framing: Process_Get_CEC_Version.yaml is the one on the sweep",
     "Device_Get_Menu_Language.yaml":
         "alternative framing: the sink answers <Get Menu Language> with an outbound frame this "
         "transport cannot read, and TCID13_Set_Menu_Language covers the readable half",
@@ -693,6 +713,115 @@ def _verify_device_fixture_inventory(commands_dir):
         f"✔ every Device_*.yaml document has a declared status: "
         f"{len(DEVICE_FIXTURE_CONSUMERS)} posted by a verified consumer, "
         f"{len(DEVICE_FIXTURES_RETAINED)} retained with a recorded reason"
+    )
+    return True
+
+
+# ── THE RESPONSE TABLE'S OPCODE VOCABULARY ───────────────────────────────────────────────────────
+#
+# The emulated-response document that the vComponent answers peer requests from. It is a sibling of
+# the command tree rather than part of it, which is why the path is derived from commands_dir's
+# parent instead of from HDMICEC_CMD_BASE.
+RESPONSE_TABLE_YAML = "hdmicec_vcomponent_cec_responses.yaml"
+
+# Flow-style rows, so both halves of an exchange sit inside braces on one line:
+#     - request: { opcode: "GiveOsdName", type: "Direct", payload: null}
+#       response: { opcode: "SetOsdName", type: "Direct", payload: ["osd_name"]}
+# _OPCODE_NAME_PATTERN lifts the names; _EXCHANGE_HALF_PATTERN lifts each brace group so a half
+# written WITHOUT an opcode key is caught too. A `response: null` half carries no braces and is
+# correctly not matched - it declares that the peer absorbs the request without replying.
+_OPCODE_NAME_PATTERN = re.compile(r'opcode:\s*"([^"]+)"')
+_EXCHANGE_HALF_PATTERN = re.compile(r'(request|response):\s*\{([^}]*)\}')
+
+
+def _verify_response_table_opcodes(commands_dir):
+    """True when every opcode name in the response table is one the emulator can resolve.
+
+    THE CHECK THAT MAKES AN UNRESOLVABLE EXCHANGE IMPOSSIBLE TO ADD QUIETLY. The response table
+    names each opcode as a string, and vcCommand_GetOpCode resolves it against gOpCodeStrVal; a
+    name outside that table becomes CEC_OPCODE_UNKNOWN and ParseCommand returns without putting
+    anything on the bus (vcHdmiCec.c:180-184). Nothing about that is observable from a test: the
+    POST is accepted, HTTP 200 comes back, and the exchange never happens - so an unresolvable row
+    reads exactly like coverage. utils.SUPPORTED_VCOMPONENT_OPCODES carries the 55 resolvable
+    names and this function is what compares the document against them.
+
+    Three properties, each reported on its own:
+      * the document is present and readable - an absent response table is a named failure, not a
+        vacuous pass;
+      * it declares at least one opcode. This is the non-vacuity guard: if the document's shape
+        ever changes so the pattern stops matching, the check must fail rather than report success
+        over an empty set;
+      * every declared name is a member of the vocabulary, and every request/response half written
+        as a mapping actually carries an opcode key.
+
+    Comment lines are stripped before anything is matched, because this document's header
+    deliberately NAMES the opcodes the emulator cannot resolve - GetMenuLanguage, ReportAudioStatus
+    and the latency and short-audio-descriptor pairs - as the record of what is BLOCKED on a
+    production change to the read-only emulator. Matching those would turn the file's own honesty
+    into a failure.
+
+    Static: reads one file, contacts nothing, and is called before the sweep posts anything.
+
+    Args:
+        commands_dir: pathlib.Path of the vComponent command-document directory. The response
+            table sits in the sibling hdmicec/ directory.
+    Returns:
+        True when all three hold; False with the reason already logged otherwise.
+    """
+    problems = []
+    table_path = commands_dir.parent / "hdmicec" / RESPONSE_TABLE_YAML
+
+    try:
+        raw = table_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        log_error(
+            f"✖ cannot read the response table {RESPONSE_TABLE_YAML}: {exc}. The emulated replies "
+            "this suite's directed exchanges depend on are declared there, so an unreadable "
+            "document is a fixture defect rather than a plugin one"
+        )
+        return False
+
+    body = "\n".join(
+        line for line in raw.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    declared = _OPCODE_NAME_PATTERN.findall(body)
+    if not declared:
+        log_error(
+            f"✖ {RESPONSE_TABLE_YAML} declares no opcode at all. Either the document was emptied "
+            "or its row shape changed - and a membership check over an empty set would pass while "
+            "asserting nothing, so this is reported as a failure"
+        )
+        return False
+
+    unknown = sorted({name for name in declared if name not in SUPPORTED_VCOMPONENT_OPCODES})
+    if unknown:
+        problems.append(
+            f"{len(unknown)} opcode name(s) in {RESPONSE_TABLE_YAML} are not in the vComponent's "
+            f"vocabulary: {', '.join(sanitise_for_log(name, max_chars=64) for name in unknown)}. "
+            "vcCommand_GetOpCode resolves each of these to CEC_OPCODE_UNKNOWN and the exchange is "
+            "never carried, so the row reads like coverage while exercising nothing. Either spell "
+            "it as one of the 55 names in utils.SUPPORTED_VCOMPONENT_OPCODES, or record the "
+            "exchange as BLOCKED in this document's header the way the others are"
+        )
+
+    for half, contents in _EXCHANGE_HALF_PATTERN.findall(body):
+        if "opcode:" not in contents:
+            problems.append(
+                f"a {half} half of an exchange in {RESPONSE_TABLE_YAML} carries no opcode key: "
+                f"{{{sanitise_for_log(contents, max_chars=128)}}}. The emulator reads the opcode "
+                "by name, so a half without one describes an exchange it cannot perform"
+            )
+
+    if problems:
+        for problem in problems:
+            log_error(f"✖ {problem}")
+        return False
+
+    log_success(
+        f"✔ every opcode in {RESPONSE_TABLE_YAML} is one the vComponent resolves: "
+        f"{len(declared)} declaration(s), {len(set(declared))} distinct name(s), all members of "
+        f"the {len(SUPPORTED_VCOMPONENT_OPCODES)}-name vocabulary"
     )
     return True
 
@@ -942,6 +1071,20 @@ def run_test():
         log_error(
             "TCID33_Process_Yaml_Health_Check Failed: a Device_*.yaml document has no declared "
             "status, or a declared consumer no longer posts it"
+        )
+        return False
+
+    # The third document family in the same tree: the emulated-response table the vComponent
+    # answers directed requests from. Checked here, beside the two inventory checks and before
+    # anything is posted, for the same reason they are - an opcode the emulator's parser cannot
+    # resolve is a fixture defect, and it is the one fixture defect that produces no symptom at
+    # all: the POST is accepted and the exchange silently never happens. The document's header
+    # states that this constraint is enforced rather than merely described, and this call is what
+    # makes that true.
+    if not _verify_response_table_opcodes(commands_dir):
+        log_error(
+            "TCID33_Process_Yaml_Health_Check Failed: the emulated-response table names an opcode "
+            "the vComponent cannot resolve, so the exchange it describes would never be carried"
         )
         return False
 

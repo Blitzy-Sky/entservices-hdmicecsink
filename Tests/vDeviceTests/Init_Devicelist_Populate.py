@@ -1045,9 +1045,17 @@ def verify_topology_consistency():
             log_error(f"Init_Devicelist_Populate Failed ❌: topology mismatch: {problem}")
         return False
 
+    # THE MESSAGE NAMES EXACTLY THE THREE SOURCES THIS FUNCTION READ, AND NO MORE.
+    # Only each peer's ReportPhysicalAddress document is opened here - it is the one that carries a
+    # physical address and a device-type byte to compare. The SetOSDName and DeviceVendorID
+    # documents are the sibling validator's subject, so a line claiming "the payload documents
+    # agree" would print green while one of those two disagreed, which is precisely the
+    # "a run that seeds one address and verifies another looks almost exactly like a run that
+    # succeeded" failure mode verify_seed_payload_consistency()'s own docstring warns about. Both
+    # validators run at Step 0a, so the pair still covers all three documents per peer.
     log_success(
-        f"  ✓ the network document, the seed table and the payload documents agree on all "
-        f"{len(EXPECTED_TOPOLOGY)} peers"
+        f"  ✓ the network document, the seed table and each peer's ReportPhysicalAddress payload "
+        f"agree on all {len(EXPECTED_TOPOLOGY)} peers"
     )
     return True
 
@@ -1359,17 +1367,15 @@ def run_test():
         log_error("Init_Devicelist_Populate Failed ❌: getDeviceList success != true")
         return False
 
-    # Both gates are resolved through validators that refuse an unrecognised value by name.
-    # run_test() still owes its caller a bool on every path, so a refusal is a logged False
-    # rather than an exception - but it IS a failure now, not a silent fallback.
-    gate_ok, strict_multi = _resolve_strict_multi()
-    if not gate_ok:
-        return False
-
-    gate_ok, min_devices_required = _resolve_min_devices(strict_multi)
-    if not gate_ok:
-        return False
-
+    # THE GATES ARE NOT RE-RESOLVED HERE, and that is deliberate.
+    #
+    # strict_multi and min_devices_required were resolved and reported at Step -1, before the
+    # device was touched, and both resolvers are pure readers of the environment - so a second
+    # resolution could not return a different answer within one run. What it did do was validate
+    # the same two values a second time and log the same refusal twice, which reads as two
+    # separate configuration problems. The values established at Step -1 are the ones the
+    # comparison below and the strict-mode branches further down use, so the mode that governs
+    # enforcement is fixed before any evidence is collected rather than re-decided after it.
     if not isinstance(num_devices, int) or num_devices < min_devices_required:
         log_error(
             f"Init_Devicelist_Populate Failed ❌: numberofdevices={num_devices}, "

@@ -56,6 +56,15 @@ metacharacters, or that begins with "-", is refused - curl reads a leading "-" a
 and an endpoint must never be able to become one. An override that fails validation stops the
 suite with an error naming the variable to fix; it is never silently replaced by the default.
 
+The 1-65535 rule applies to the port however it is expressed, so JSONRPC_PORT=99999 and
+WPEFRAMEWORK_JSONRPC_URL=http://host:99999/jsonrpc are both refused at import, and so is a
+port of 0 in either form. Two accepted shapes are worth naming because they look odd and are
+allowed on purpose: a zero-padded port such as JSONRPC_PORT=007 (decimal and inside the range,
+so it is used as given), and a host containing a hyphen anywhere, including first, such as
+TARGET_HOST=-evil. A host is never an argument on its own - what reaches curl is the composed
+URL, which always begins "http" - so the leading-"-" prohibition is a rule about a whole
+endpoint override, not about the host inside one.
+
 Examples:
 
 # when running directly inside QEMU guest (services on localhost)
@@ -93,6 +102,12 @@ The vComponent YAML command documents are read from a directory resolved in this
   2. <this directory>/vcomponent_configurations/commands  when that directory exists
   3. /etc/hdmicec/vcomponent_configurations/commands      the on-device location
 
+An empty HDMICEC_CMD_BASE falls through to the next source, as every other override does. A
+non-empty one is taken verbatim: it is not tested for existence at import and "/tmp/../etc" is
+not collapsed or rejected there, because the check that matters is the one applied to every
+document actually posted, described next. A root that does not exist therefore costs a refusal
+naming the document, not a startup error.
+
 Path trust expectations. Every document posted to the vComponent API must resolve inside
 either this suite's own vcomponent_configurations/ tree or the configured HDMICEC_CMD_BASE,
 and the file is reached by walking the path one component at a time from that root with
@@ -112,8 +127,8 @@ you name becomes postable by this suite. Point it at a directory you control tha
 vComponent command documents. Do not point it at a shared or world-writable location such as
 /tmp, and do not point it at a tree whose contents another user can replace between runs.
 
-Complete set of environment variables this suite reads. Every one is optional, and nothing
-outside this list is consulted:
+Complete set of environment variables this suite CONFIGURES ITSELF FROM. Every one is
+optional, and no other variable influences any decision this suite makes:
 - AUTO_ACTIVATE_PLUGINS              default on; set to 0, false or no to skip activation
 - TARGET_HOST                        default 127.0.0.1
 - JSONRPC_PORT                       default 9998
@@ -130,6 +145,14 @@ outside this list is consulted:
                                      only and takes no part in endpoint or path resolution
 - Init_Devicelist_Populate_STRICT_MULTI   described under Initialization gates below
 - Init_Devicelist_Populate_MIN_DEVICES    described under Initialization gates below
+
+Four further variables are READ but configure nothing. PATH, HOME, LANG and LC_ALL form the
+allow-list of names copied into the environment each curl child is started with: curl is run
+with a minimal environment built from scratch rather than an inherited one, so that a proxy or
+authentication variable in the caller's shell cannot silently retarget or decorate a request.
+They are passed through unchanged when set, PATH falls back to /usr/bin:/bin when it is not,
+and none of them takes any part in endpoint, path or gate resolution. PATH is also listed under
+Prerequisites below, because python3 and curl have to be findable.
 
 Troubleshooting:
 - If you see connection errors, verify WPEFramework JSON-RPC and the vComponent API are reachable using the endpoint overrides above.
@@ -234,6 +257,29 @@ Static validation applied to the suite:
   module attribute only when it is used, so an unresolvable name would otherwise survive import
   and surface as an AttributeError at device-execution time.
 - YAML well-formedness parsing of every document under vcomponent_configurations/.
+- The suite's own fixture-consistency validators, run directly. Five of them need no device, no
+  emulator and no network - they read only files this suite owns - so they are the one part of
+  this suite that IS executable here, and they are what catches a fixture set that has drifted
+  out of agreement with itself before a device is ever booked:
+
+    cd Tests/vDeviceTests
+    python3 -c "import Init_Devicelist_Populate as i; \
+      raise SystemExit(0 if (i.verify_seed_payload_consistency() \
+                             and i.verify_topology_consistency()) else 1)"
+    python3 -c "import sys; sys.path.insert(0, 'Testcases'); \
+      from pathlib import Path; \
+      import TCID33_Process_Yaml_Health_Check as t; \
+      d = Path('vcomponent_configurations/commands').resolve(); \
+      raise SystemExit(0 if (t._verify_fixture_inventory(d) \
+                             and t._verify_device_fixture_inventory(d) \
+                             and t._verify_response_table_opcodes(d)) else 1)"
+
+  Both commands exit 0 on agreement and non-zero with the mismatch named. They are also reached
+  from run_test() at Step 0a and at the head of the breadth sweep, but running them on their own
+  is what makes them useful while L3 execution stays deferred: the drift they detect - a seed
+  address that disagrees with its payload documents, a fixture with no declared status, an opcode
+  the emulator cannot resolve - produces no symptom at run time. The frames register one address
+  while the verification waits for another, or the exchange is accepted and never carried.
 
 Prerequisites that were not available, and so were not used:
 - A QEMU target.

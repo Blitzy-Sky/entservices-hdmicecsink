@@ -100,6 +100,55 @@ CEC_PIPELINE_PACING_SECONDS = 1.5   # a frame whose effect must reach the device
 CEC_TOPOLOGY_PACING_SECONDS = 2.0   # a device add or remove - the longest path through the pipeline
 
 
+# ── the opcode names the vComponent's parser actually knows ──────────────────────────────────────
+#
+# THE VOCABULARY THE RESPONSE TABLE IS CHECKED AGAINST, so that "the emulator understands this
+# name" is a fact a test asserts rather than a claim a comment makes.
+#
+# vcomponent_configurations/hdmicec/hdmicec_vcomponent_cec_responses.yaml names an opcode as a
+# STRING, and the emulator resolves it through vcCommand_GetOpCode against its own table. A name
+# outside that table resolves to CEC_OPCODE_UNKNOWN, whereupon ParseCommand logs
+# "Opcode[<name>] Unknown" and RETURNS WITHOUT SENDING ANYTHING (vcHdmiCec.c:180-184). That
+# failure is invisible from a test's point of view - the POST is accepted, HTTP 200 comes back,
+# and the exchange the row describes simply never happens - so a row written in a name the parser
+# does not know is worse than no row at all, because it reads like coverage. This constant plus
+# TCID33_Process_Yaml_Health_Check._verify_response_table_opcodes() is what turns that from a
+# silent omission into a named failure before the sweep posts anything.
+#
+# PROVENANCE, so a reader can re-derive it rather than trust it: these are the 55 rows of
+# gOpCodeStrVal in rdk-halif-test-hdmi_cec/vcomponent/src/vcCommand.c:27-83, spelled by the CMD_*
+# string macros in vcCommand.h, and they are listed below in that table's own order.
+# vcCommand.h defines 57 CMD_* macros rather than 55: CMD_HOTPLUG ("HotPlug") is an opcode
+# spelling that the table does not carry, and CMD_DATA_OSD_NAME ("osd_name") is a payload-symbol
+# key rather than an opcode at all - which is why the macro count is not the vocabulary size.
+# rdk-halif-test-hdmi_cec/** is read-only for this pass (AAP Sec. 0.10.2), so this list tracks
+# that table; it does not extend it. An exchange whose opcode is absent from it cannot be
+# expressed as an emulated response and is recorded as BLOCKED in the response table's header.
+SUPPORTED_VCOMPONENT_OPCODES = frozenset((
+    # tuner, recording and deck control
+    "FeatureAbort", "ImageViewOn", "TunerStepIncrement", "TunerStepDecrement",
+    "TunerDeviceStatus", "GiveTunerDeviceStatus", "RecordOn", "RecordStatus", "RecordOff",
+    "TextViewOn", "RecordTvScreen", "GiveDeckStatus", "DeckStatus", "DeckControl", "Play",
+    "TuneDigitalService", "TuneAnalogService", "TuneSource", "TuneChannel",
+    # discovery and identity
+    "GivePhysicalAddress", "ReportPhysicalAddress", "GiveOsdName", "SetOsdName",
+    "GiveDeviceVendorId", "DeviceVendorId", "GiveCecVersion", "CecVersion",
+    "GiveDevicePowerStatus", "ReportPowerStatus", "SetMenuLanguage", "GiveDeviceFeature",
+    "ReportDeviceFeature", "SetOsdString",
+    # audio
+    "GiveAudioStatus", "SystemAudioModeRequest", "SetSystemAudioMode", "SystemAudioModeStatus",
+    "GiveAudioModeStatus", "GiveSystemAudioModeStatus", "SetAudioRate",
+    # user control and power
+    "UserControlPressed", "UserControlReleased", "Standby",
+    # routing and stream path
+    "SetStreamPath", "RequestActiveSource", "ActiveSource", "InactiveSource", "RoutingChange",
+    "RoutingInformation",
+    # audio return channel
+    "InitiateArc", "ReportArcInitiated", "ReportArcTerminated", "RequestArcInitiation",
+    "RequestArcTermination", "TerminateArc",
+))
+
+
 # The import set above is the standard-library dependency contract this module publishes in
 # its docstring, and every sibling module in the suite is written against it, so the two are
 # kept in step deliberately:
@@ -254,7 +303,19 @@ def _validate_endpoint(url, label):
 # ALLOWLIST (a full-match pattern per value kind) with a metacharacter denylist as an
 # independent second gate: TARGET_HOST must be a hostname, IPv4 address or bracketed IPv6
 # literal; the two ports must be decimal and inside 1-65535, so a shape-valid 99999 is still
-# refused; and a complete URL override must match a plain http(s)://host[:port][/path].
+# refused; and a complete URL override must match a plain http(s)://host[:port][/path] AND
+# carry a port in that same 1-65535 range, so `http://h:99999/x` and `http://h:0/x` are refused
+# here at import rather than by every request the suite would otherwise have gone on to make.
+# The range rule is therefore one rule with one meaning, whichever key expresses the endpoint.
+#
+# Two shapes are accepted that look odd and are deliberately allowed, so that the accepted set
+# is exactly what the README documents and no more:
+#   * a zero-padded port such as "007" - decimal, inside the range, and what the operator typed;
+#   * a host containing a hyphen anywhere, including first, such as "-evil". The hyphen is in
+#     the documented host charset, and a host can never be read by curl as an option because
+#     the value that reaches argv is the composed URL, which always begins "http". The
+#     leading-"-" prohibition applies to a whole endpoint override, and _validate_endpoint
+#     enforces it there.
 #
 # The transport is argv-based (see send_curl_command and _run_curl: no shell is ever
 # involved), so this is fail-closed input hygiene rather than the primary injection control -
@@ -335,15 +396,29 @@ def _validated_port(name, value):
     return value
 
 
+# `or default`, NOT `os.environ.get(name, default)`, and the difference is the whole contract.
+#
+# A positional default applies only when the key is ABSENT. An exported-but-empty variable -
+# which is what `export TARGET_HOST=${TARGET_HOST}` or `export JSONRPC_PORT=` in a wrapper
+# script produces - hands back "", and "" is not a hostname or a port, so the allowlist below
+# would refuse it and the whole suite would fail to import over a variable the operator never
+# meant to set. `or` treats unset and empty as the same thing, which is exactly what this
+# module's precedence comment above, the two URL resolutions below and the suite's README all
+# state: a variable that is unset OR empty falls through to the next source. HDMICEC_CMD_BASE
+# is written the same way for the same reason.
+#
+# An empty value therefore yields the DEFAULT; a value that is present but wrong - " ", "abc",
+# "0", "99999", "h;id" - is still refused by name, because falling through on those would
+# silently retarget the suite after a typo.
 TARGET_HOST = _validated(
     "TARGET_HOST",
-    os.environ.get("TARGET_HOST", "127.0.0.1"),
+    os.environ.get("TARGET_HOST") or "127.0.0.1",
     _HOST_RE,
     "a hostname, IPv4 address, or bracketed IPv6 address using only letters, digits, "
     "dot, underscore, hyphen, colon and square brackets",
 )
-JSONRPC_PORT = _validated_port("JSONRPC_PORT", os.environ.get("JSONRPC_PORT", "9998"))
-VCOMPONENT_PORT = _validated_port("VCOMPONENT_PORT", os.environ.get("VCOMPONENT_PORT", "8080"))
+JSONRPC_PORT = _validated_port("JSONRPC_PORT", os.environ.get("JSONRPC_PORT") or "9998")
+VCOMPONENT_PORT = _validated_port("VCOMPONENT_PORT", os.environ.get("VCOMPONENT_PORT") or "8080")
 
 
 # Characters that have no place in a plain http(s)://host:port/path endpoint and that a shell
@@ -384,7 +459,17 @@ def _validated_endpoint(source, value):
             f"unreserved characters - RFC 3986 permits sub-delims such as ';' and '$' inside a "
             f"path and this suite deliberately does not."
         )
-    return value
+    # THE PATTERN IS A SHAPE CHECK, NOT A RANGE CHECK, so the numeric gate is applied too.
+    #
+    # _URL_RE's port group is `[0-9]{1,5}`, which admits 99999 and 0 - neither of which is a TCP
+    # port. Without this line a URL-form override carrying such a port passed validation at
+    # import and then failed on every single request, so the suite started and reported 33
+    # failures instead of naming the one variable to fix. _validate_endpoint is the per-request
+    # gate that already decomposes the URL and range-checks the port (and refuses embedded
+    # credentials and a leading "-"), so it is reused here rather than duplicated: one
+    # definition of "an acceptable endpoint", applied at definition time and again per request,
+    # which is what its own docstring promises and what the README's override contract states.
+    return _validate_endpoint(value, source)
 
 
 def _resolve_endpoint(names, default, default_source):

@@ -943,50 +943,21 @@ def run_suite(suite_name):
                 f"Waiting for {callsign} to report itself activated and to answer "
                 f"{readiness_probe['method'] if readiness_probe else 'no probe'}..."
             )
-            ready, ready_elapsed = wait_for_plugin_ready(callsign, readiness_probe)
-            if ready:
-                log_success(f"Plugin {callsign} ready after {ready_elapsed:.2f}s")
-            else:
-                log_warning(
-                    f"Plugin {callsign} was not both activated and dispatching within "
-                    f"{ready_elapsed:.2f}s; the cases below will run anyway and their own "
-                    "assertions decide the verdict"
-                )
-            # "Activated" and "dispatching its own methods" are two different observables, and a
-            # plugin reaches the first before the second.  readiness_probe is the suite's
-            # declaration of the second, so it is polled here rather than slept through: the wait
-            # returns on the first answering read and reports its own elapsed time, and an expiry
-            # is a warning rather than a verdict because the cases' own assertions decide that.
-            ready, ready_elapsed = wait_for_plugin_ready(callsign, readiness_probe)
-            if ready:
-                log_success(
-                    f"{callsign} answered its readiness probe after {ready_elapsed:.2f}s"
-                )
-            else:
-                log_warning(
-                    f"{callsign} did not answer its readiness probe within {ready_elapsed:.2f}s; "
-                    "the cases below will run anyway and their own assertions decide the verdict"
-                )
-            # "Activated" and "dispatching its own methods" are two different observables, and a
-            # plugin reaches the first before the second.  readiness_probe is the suite's
-            # declaration of the second, so it is polled here rather than slept through: the wait
-            # returns on the first answering read and reports its own elapsed time, and an expiry
-            # is a warning rather than a verdict because the cases' own assertions decide that.
-            ready, ready_elapsed = wait_for_plugin_ready(callsign, readiness_probe)
-            if ready:
-                log_success(
-                    f"{callsign} answered its readiness probe after {ready_elapsed:.2f}s"
-                )
-            else:
-                log_warning(
-                    f"{callsign} did not answer its readiness probe within {ready_elapsed:.2f}s; "
-                    "the cases below will run anyway and their own assertions decide the verdict"
-                )
+            # EXACTLY ONE POLL, and that is the whole point of the budget.
+            #
             # "activated" is the framework's word for the request having been accepted; the
             # plugin is only USABLE once it dispatches its own methods.  readiness_probe is the
             # observable for that, so it is polled here rather than a fixed post-activation
             # pause being taken.  An expiry is reported and the cases still run - their own
             # assertions decide the verdict - because a slow bring-up is not by itself a failure.
+            #
+            # This call must not be repeated.  wait_for_plugin_ready is itself the bounded
+            # observation: it returns on the first read where every declared observable holds,
+            # and otherwise at PLUGIN_READY_TIMEOUT_S.  A second call therefore cannot learn
+            # anything the first did not - a plugin that is up has already returned True - while
+            # each extra call adds another whole budget to a bring-up that is failing, and the
+            # warning below would name a budget smaller than the wait actually taken.  One call
+            # keeps the worst case at PLUGIN_READY_TIMEOUT_S, which is the number reported.
             ready, ready_elapsed = wait_for_plugin_ready(callsign, readiness_probe)
             if ready:
                 observed = (
@@ -1075,22 +1046,16 @@ def run_suite(suite_name):
             # under this case's banner, and it runs on every path above - pass, fail, exception
             # and skip alike. _run_cleanup swallows nothing but propagates nothing either, so
             # the stdout restore below is always reached.
+            #
+            # Its outcome is CARRIED, not recorded here.  An unrestored device is a property of
+            # the RUN rather than a verdict on this case, and the summary that names it is
+            # printed outside this captured-output block, so cleanup_ok travels out through the
+            # finally and is appended to cleanup_failures exactly once below, next to the log
+            # line that reports it.  Recording it here as well would name the same case twice in
+            # `Cases whose cleanup failed: [...]` and overstate how many restorations failed.
             cleanup_ok = _run_cleanup(tc_name, tc_cleanup)
-            if not cleanup_ok:
-                # Recorded, not raised.  An unrestored device is a property of the RUN, not a
-                # verdict on this case, so it is collected here and applied once to the suite
-                # result - which is exactly what this function's contract promises and what
-                # cleanup_failures is read for at the end.
-                cleanup_failures.append(tc_name)
         finally:
             sys.stdout = original_stdout
-
-        # Recorded OUTSIDE the captured-output block so the summary below can name it. Without
-        # this, cleanup_failures stayed empty for every run and the documented rule -- "an
-        # unrestored device is not a clean run" -- was unenforceable, because the verdict at the
-        # end of this function tests a list nothing ever appended to.
-        if not cleanup_ok:
-            cleanup_failures.append(tc_name)
 
         output = captured.getvalue()
         # REPLAY, not composition - and therefore the one print() in this module that must stay a
@@ -1104,15 +1069,15 @@ def run_suite(suite_name):
         # the thing to fix, here or there.
         print(output, end="")
 
-        # A FAILED RESTORATION IS RECORDED HERE, and this is the only place it can be.
+        # A FAILED RESTORATION IS RECORDED HERE, EXACTLY ONCE, and this is the only place it can
+        # be.
         #
         # cleanup_failures is printed in the summary and folded into the suite verdict by the
-        # return statement below, but nothing ever appended to it: the outcome of _run_cleanup
-        # was computed and then dropped. The consequence was that the two mechanisms built to
-        # make an unrestored device visible - the summary line and the `not cleanup_failures`
-        # term in the verdict - could never fire, so a suite that left the device dirty in every
-        # single case still exited 0 and printed no cleanup line at all. Recording it is what
-        # makes those two mechanisms mean what they say.
+        # return statement below, so the two mechanisms built to make an unrestored device
+        # visible - the summary line and the `not cleanup_failures` term in the verdict - depend
+        # on this append happening. It happens once per failing case and nowhere else: one entry
+        # is what makes `Cases whose cleanup failed: [...]` a count of failed restorations rather
+        # than a count of the places that record them.
         #
         # It is recorded SEPARATELY from the case verdict, and deliberately so. _run_cleanup's
         # own contract is that restoration is not a verdict: a cleanup failure must not turn a
@@ -1158,6 +1123,14 @@ def run_suite(suite_name):
         # NOT after the last case. There is no following case for the bus to be quiet for, so
         # settling here would only add the budget to the run's duration - up to SETTLE_TIMEOUT_S
         # of it if the device is busy shutting down - and report a warning nothing acts on.
+        #
+        # ONE WAIT PER GAP, and the guard is on settle_probe as well as on the index. A suite
+        # that declares no settle probe has nothing to observe, and wait_for_settled would
+        # return (True, 0.0, None) for it - so the guard keeps the log honest instead of
+        # announcing a settle that was never measured. Repeating the wait would multiply both
+        # the budget (SETTLE_TIMEOUT_S per extra call, over 32 gaps) and the round trips
+        # (SETTLE_STABLE_READS per extra call on a quiet bus) while telling the reader nothing
+        # the first wait had not already established.
         if settle_probe and index != last_index:
             settled, settle_elapsed, last_value = wait_for_settled(settle_probe)
             if settled:
@@ -1168,61 +1141,10 @@ def run_suite(suite_name):
             else:
                 log_warning(
                     f"{settle_probe['method']} did not report {SETTLE_STABLE_READS} consecutive "
-                    f"equal readings within {settle_elapsed:.2f}s after {tc_name} "
-                    f"(last {settle_probe['result_key']}={last_value}); the cases that follow may "
-                    "run against a bus that is still changing, or a plugin that is no longer "
-                    "serving"
-                )
-
-        # Then let the bus go quiet before the next case observes it.  settle_probe is the suite's
-        # declaration of the one piece of plugin state inbound CEC traffic changes, and consecutive
-        # equal readings of it are what "settled" means as an observable - so this replaces a fixed
-        # inter-case sleep and returns immediately on a quiet bus.  Skipped after the LAST case,
-        # because nothing follows it that could observe unsettled state, and paying the wait there
-        # would only lengthen the run.
-        if index != last_index:
-            settled, settle_elapsed, settle_value = wait_for_settled(settle_probe)
-            if settled:
-                log_info(
-                    f"Bus settled after {tc_name} in {settle_elapsed:.2f}s (probe read "
-                    f"{settle_value})"
-                )
-            else:
-                log_warning(
-                    f"Bus had not settled {settle_elapsed:.2f}s after {tc_name} (last probe read "
-                    f"{settle_value}); the next case may observe state still in flight"
-                )
-
-        # Then let the bus go quiet before the next case observes it.  settle_probe is the suite's
-        # declaration of the one piece of plugin state inbound CEC traffic changes, and consecutive
-        # equal readings of it are what "settled" means as an observable - so this replaces a fixed
-        # inter-case sleep and returns immediately on a quiet bus.  Skipped after the LAST case,
-        # because nothing follows it that could observe unsettled state, and paying the wait there
-        # would only lengthen the run.
-        if index != last_index:
-            settled, settle_elapsed, settle_value = wait_for_settled(settle_probe)
-            if settled:
-                log_info(
-                    f"Bus settled after {tc_name} in {settle_elapsed:.2f}s (probe read "
-                    f"{settle_value})"
-                )
-            else:
-                log_warning(
-                    f"Bus had not settled {settle_elapsed:.2f}s after {tc_name} (last probe read "
-                    f"{settle_value}); the next case may observe state still in flight"
-                )
-
-        # Then wait for the bus to go QUIET before the next case starts, by polling the state
-        # inbound CEC traffic changes until consecutive readings agree - the bounded-observation
-        # replacement for a fixed inter-case sleep. Skipped after the LAST case, where there is
-        # no next case for it to protect and the wait would be pure dead time.
-        if index != last_index:
-            settled, settle_elapsed, settle_value = wait_for_settled(settle_probe)
-            if settle_probe and not settled:
-                log_warning(
-                    f"the bus had not settled {SETTLE_TIMEOUT_S}s after {tc_name} "
-                    f"(waited {settle_elapsed:.2f}s, last reading {settle_value!r}); the next "
-                    "case starts against traffic that is still arriving"
+                    f"equal readings within {SETTLE_TIMEOUT_S}s after {tc_name} "
+                    f"(waited {settle_elapsed:.2f}s, last {settle_probe['result_key']}="
+                    f"{last_value}); the cases that follow may run against a bus that is still "
+                    "changing, or a plugin that is no longer serving"
                 )
 
     log_info(f"\n{'='*60}")

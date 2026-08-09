@@ -133,8 +133,14 @@ get_vendor_id = [
 #   3. HdmiCecSinkImplementation::getCecVersion() is a private void internal helper called only
 #      from Configure() -- it neither returns a value to a caller nor is wired to the JSON-RPC
 #      surface;
-#   4. a workspace-wide grep for _T("getCecVersion") finds exactly one site, inside the sink L1
-#      test that stays disabled for precisely this reason.
+#   4. a workspace-wide grep for _T("getCecVersion") finds exactly two sites, both in the sink L1
+#      test file and both saying the same thing: HdmiCecSinkInitializedEventDsTest
+#      .DISABLED_getCecVersion (test_HdmiCecSink.cpp:1615), which stays disabled for precisely
+#      this reason, and HdmiCecSinkDsTest
+#      .cecVersionIsNotAPublishedMethodButIsObservableThroughTheDeviceList (:6745), which asserts
+#      the absence directly - EXPECT_NE(Core::ERROR_NONE, handler.Exists(_T("getCecVersion")))
+#      with a getDeviceList Exists() control beside it so a broken dispatcher cannot make the
+#      negative pass vacuously.
 # The mechanism behind all four: the method is absent from IHdmiCecSink.h's published set and
 # therefore from Exchange::JHdmiCecSink::Register, which is the plugin's only JSON-RPC
 # registration path. Publishing it is a production change - a declaration on
@@ -233,25 +239,39 @@ set_active_source = [
 
 # The three key-control commands below address logical address 5, the Audio System.
 #
-# That is the address the suite's own topology gives the emulated device ITSELF, not merely one
-# of its peers. vcomponent_configurations/hdmicec/hdmicec_vcomponent_configuration.yaml and the
-# config.emulated_device block of vcomponent_configurations/commands/Device_Config_Add_Network.yaml
-# both declare device_type "AudioSystem", and the vComponent offers an audio system exactly one
-# logical address - LOGICAL_ADDRESS_AUDIOSYSTEM == 5 - so 5 is fixed rather than chosen. Two
-# properties follow, and together they are why every key-control command here targets it:
+# ADDRESS 5 IS A PEER OF THE DEVICE UNDER TEST, NOT THE DEVICE UNDER TEST. The emulated device is
+# the television VTV: vcomponent_configurations/hdmicec/hdmicec_vcomponent_configuration.yaml and
+# the config.emulated_device block of vcomponent_configurations/commands/
+# Device_Config_Add_Network.yaml both declare name "VTV" with device_type "TV", and that is a HAL
+# requirement rather than a preference - HdmiCecAddLogicalAddress refuses the request outright
+# unless the emulated device is a TV AND the address is 0 (vcHdmiCec.c:845-849), so a DUT declared
+# as anything else could neither claim an address nor transmit a frame. The audio system is the
+# child peer YAMAHA, declared in the same network document beneath VTV at physical address
+# 2.0.0.0, and the vComponent offers an audio system exactly one logical address -
+# LOGICAL_ADDRESS_AUDIOSYSTEM == 5 (vcCommand.h:199, the single candidate in
+# vcDevice_AllocateLogicalAddress) - so 5 is fixed rather than chosen. The authoritative statement
+# of all of this is the header of hdmicec_vcomponent_configuration.yaml, which names this module
+# as one of the four documents that move together with it.
 #
-#   * It is present as soon as the topology is configured. Device_Config_Add_Network.yaml is the
-#     FIRST document Init_Devicelist_Populate.py posts, so address 5 exists before any per-peer
-#     payload is injected.
-#   * It is the one address whose registration is separately observable. HdmiCecSinkImplementation
-#     ::addDevice() raises ReportAudioDeviceConnectedStatus only under `if(logicalAddress == 0x5)`;
-#     every other address gets OnDeviceAdded alone.
+# Two properties of that peer are why every key-control command here targets it rather than
+# another one, and both are properties of address 5 specifically:
 #
-# Other logical addresses ARE occupied in this topology - the DeviceListConfig/ payloads seed
-# peers as initiators 1 (DENON), 2 (LG), 3 (SAMSUNG), 4 (SONY), 5 (YAMAHA) and 8 (PANASONIC), so a
-# command sent to 4 would reach a real peer once Init_Devicelist_Populate.py has injected its
-# ReportPhysicalAddress document. Address 5 is preferred because it needs no such injection to be
-# there. Every address in that list is fixed by Device_Config_Add_Network.yaml together with the
+#   * Its registration is separately observable. HdmiCecSinkImplementation::addDevice() raises
+#     ReportAudioDeviceConnectedStatus only under `if(logicalAddress == 0x5)`
+#     (HdmiCecSinkImplementation.cpp:2456-2462); every other address gets OnDeviceAdded alone.
+#   * It is the only initiator the sink's ARC gate accepts. process(InitiateArc) and
+#     process(TerminateArc) both open with `if((!(header.from.toInt() == 0x5)) || (header.to ==
+#     BROADCAST)) return;` (:510-513 and :537-540), so the ARC flows in TCID20 and TCID21 are
+#     bound to this address too. Keeping the key-control commands on it means one peer's state is
+#     what every one of those cases reads.
+#
+# The other five addresses ARE occupied, and a command sent to one of them also reaches a real
+# peer: Device_Config_Add_Network.yaml declares DENON, LG, SAMSUNG, SONY and PANASONIC alongside
+# YAMAHA, and the emulator allocates all six logical addresses - 1, 2, 3, 4, 5 and 8 - when that
+# document is posted, which Init_Devicelist_Populate.py does first. What the DeviceListConfig/
+# payloads add is the SINK's own knowledge of those peers: until a peer's ReportPhysicalAddress
+# frame is injected, the plugin's device list holds no entry for it, whatever the emulator's map
+# says. Every address in that list is fixed by Device_Config_Add_Network.yaml together with the
 # vComponent's per-role address pools, and Init_Devicelist_Populate.verify_topology_consistency()
 # is what keeps this comment and those documents from drifting apart.
 send_key_press_event = [

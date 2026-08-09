@@ -24,6 +24,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -38,6 +39,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <thread>
 #include <unistd.h>
 // Used to change the power state for onpowermodechanged event
 #include <interfaces/IPowerManager.h>
@@ -45,6 +47,55 @@
 #define EVNT_TIMEOUT (5000)
 #define HDMICECSINK_CALLSIGN _T("org.rdk.HdmiCecSink.1")
 #define HDMICECSINK_L2TEST_CALLSIGN _T("L2tests.1")
+
+namespace {
+/*
+ * COM-RPC acquisition bounds, named rather than written as literals at the call site so each value
+ * has one place to change and one recorded reason. They are all durations in milliseconds.
+ *
+ *  - kComRpcOpenAttemptMs   the per-attempt budget handed to Open(). Unchanged from the literal that
+ *                           preceded it, so a first attempt behaves exactly as it always did.
+ *  - kComRpcOpenTimeoutMs   the total window across retries. A single 3 s attempt is enough on an
+ *                           idle host but not on a loaded one, and not when the endpoint below is
+ *                           momentarily owned by another process: a bounded retry turns that into a
+ *                           slower success instead of a failed test, and the bound keeps a genuinely
+ *                           absent plugin from hanging the suite.
+ *  - kComRpcRetryIntervalMs the pause between attempts. Long enough not to spin, short enough that
+ *                           the window holds several attempts.
+ *  - kComRpcCloseTimeoutMs  the bounded close applied to a client before it is released, so teardown
+ *                           hands the channel back instead of leaving it to lapse, and cannot block
+ *                           indefinitely while doing so.
+ */
+const uint32_t kComRpcOpenAttemptMs = 3000;
+const uint32_t kComRpcOpenTimeoutMs = 20000;
+const uint32_t kComRpcRetryIntervalMs = 250;
+const uint32_t kComRpcCloseTimeoutMs = 2000;
+
+/*
+ * The filesystem path of the COM-RPC endpoint this suite connects to.
+ *
+ * The path is host-global: every Thunder host on the machine binds the same name, so two L2 runs on
+ * one host connect through the same socket and the second one's Open() can return null against a
+ * plugin that is demonstrably activated. That was reproduced on this host - a sibling process owned
+ * /tmp/communicator and six cases failed with "Failed to get HdmiCecSink Plugin Interface" while the
+ * log showed the plugin active - so the value is read from the environment here instead of being
+ * compiled in, and an operator can give a run its own endpoint.
+ *
+ * The default is the path the framework's own controller uses, so behaviour with no override set is
+ * byte-for-byte what it was. Note the override is only half of the story and deliberately so: the
+ * host side of the socket is bound by entservices-testframework (Tests/L2Tests/L2testController.cpp
+ * and the mock proxies), which AAP section 0.10.2 places out of scope for edits, so pointing this
+ * suite elsewhere requires the operator to point the host there too. The bounded retry above is the
+ * half that removes the false failures in the default configuration.
+ */
+std::string ComRpcEndpoint()
+{
+    const char* const endpointOverride = ::getenv("L2TEST_COMRPC_PATH");
+    return ((endpointOverride != nullptr) && (endpointOverride[0] != '\0'))
+        ? std::string(endpointOverride)
+        : std::string("/tmp/communicator");
+}
+} // namespace
 
 #define TEST_LOG(x, ...)                                                                                                                         \
     fprintf(stderr, "\033[1;32m[%s:%d](%s)<PID:%d><TID:%d>" x "\n\033[0m", __FILE__, __LINE__, __FUNCTION__, getpid(), gettid(), ##__VA_ARGS__); \
@@ -451,12 +502,12 @@ typedef enum : uint32_t {
 } HdmiCecSinkL2test_async_events_t;
 
 //=====================================================================================
-// PROPERTIES OF THIS SUITE A READER NEEDS - ONE INVARIANT, AND FOUR CONDITIONS REPORTED NOT FIXED
+// PROPERTIES OF THIS SUITE A READER NEEDS - ONE INVARIANT, AND THREE CONDITIONS REPORTED NOT FIXED
 //
 // They are recorded at the top of the file they apply to, where someone editing the suite will
 // meet them, and COVERAGE_TRACEABILITY_REPORT.md carries them as well. Each is a real property of
 // the code as it stands, verified in this tree; none of them makes the suite fail, and each of the
-// four conditions would take a change wider than its value to remove.
+// three conditions would take a change wider than its value to remove.
 //
 // 1. AN INVARIANT TO KEEP, not a defect. HdmiCecSinkNotificationHandler::m_event_signalled is the
 //    bit mask every callback ORs into and WaitForRequestStatus reads, so it MUST hold a defined
@@ -467,27 +518,18 @@ typedef enum : uint32_t {
 //    the same mutex the handlers take, so every registration starts from a known value. Both are
 //    load-bearing: do not drop either, and add any new member to the initialiser list with them.
 //
-// 2. Four negative cases (InjectImageViewOnFrameBroadcastAndVerifyNoEvent,
-//    InjectTextViewOnFrameBroadcastAndVerifyNoEvent,
-//    InjectImageViewOnFromUnregisteredAddressAndVerifyNoEvent,
-//    InjectTextViewOnFromUnregisteredAddressAndVerifyNoEvent) each block for the full 5000 ms
-//    EVNT_TIMEOUT proving an absence, about 20 s of the suite's wall time. The production fan-out
-//    they are asserting against runs synchronously inside listener->notify(), so a much shorter
-//    grace would be sound - InjectFeatureAbortFrameBroadcastAndVerifyNoEvent below uses 1500 ms and
-//    explains why - but shortening the existing four means editing tests that pass.
-//
-// 3. HdmiHotplugDisconnectAndVerifyDeviceRemovedEvent depends on the asynchronous poll sweep
+// 2. HdmiHotplugDisconnectAndVerifyDeviceRemovedEvent depends on the asynchronous poll sweep
 //    reacting to the re-armed throwing ping() within EVNT_TIMEOUT. It announces every peer first so
 //    at least one is present whatever the sweep's phase, which makes it robust rather than lucky,
 //    but the pass is still timing-dependent rather than causally forced.
 //
-// 4. Several tests read the fixture members m_logicalAddress/m_keyCode, which the JSON-RPC
+// 3. Several tests read the fixture members m_logicalAddress/m_keyCode, which the JSON-RPC
 //    dispatchers write from the Thunder notification thread, without holding the fixture's m_mutex.
 //    The happens-before edge supplied by WaitForRequestStatus makes this safe in practice. The
 //    handler's own accessors take the lock (see below); the fixture-level members are read directly
 //    by existing passing test bodies, which are not rewritten here.
 //
-// 5. The suite reaches the plugin only through JSON-RPC and COM-RPC, so implementation state that no
+// 4. The suite reaches the plugin only through JSON-RPC and COM-RPC, so implementation state that no
 //    registered method exposes cannot be asserted at this level at all - for example the CEC-version
 //    and m_featureAborts bookkeeping a directed Feature Abort performs. That one is compounded by a
 //    mock defect which makes the directed frame crash outright; both are set out in full at the
@@ -1583,6 +1625,22 @@ HdmiCecSink_L2Test::~HdmiCecSink_L2Test()
     status = DeactivateService("org.rdk.PowerManager");
     EXPECT_EQ(Core::ERROR_NONE, status);
 
+    // Hand the COM-RPC channel back explicitly instead of letting it lapse when the proxy is
+    // destroyed. The endpoint is host-global (see ComRpcEndpoint), so a client that is released
+    // without being closed leaves a connection for the next run to contend with; the close is
+    // bounded so teardown cannot stall on it. Ordered after the deactivations, matching
+    // HdmiCecSource_L2Test's destructor in the sibling suite. The raw interface pointers are
+    // deliberately NOT touched here: test bodies in this file release them without nulling the
+    // member, so releasing again from the destructor would be a double release.
+    if (HdmiCecSink_Client.IsValid()) {
+        HdmiCecSink_Client->Close(kComRpcCloseTimeoutMs);
+        HdmiCecSink_Client.Release();
+    }
+
+    if (HdmiCecSink_Engine.IsValid()) {
+        HdmiCecSink_Engine.Release();
+    }
+
     removeFile("/tmp/pwrmgr_restarted");
     removeFile("/opt/persistent/ds/cecData_2.json");
     removeFile("/opt/uimgr_settings.bin");
@@ -1841,6 +1899,17 @@ HdmiCecSink_L2Test_STANDBY::~HdmiCecSink_L2Test_STANDBY()
 
     status = DeactivateService("org.rdk.PowerManager");
     EXPECT_EQ(Core::ERROR_NONE, status);
+
+    // Same reasoning as HdmiCecSink_L2Test's destructor: the shared endpoint gets its channel back
+    // explicitly, within a bound, and the raw interface pointers are left alone.
+    if (HdmiCecSink_Client.IsValid()) {
+        HdmiCecSink_Client->Close(kComRpcCloseTimeoutMs);
+        HdmiCecSink_Client.Release();
+    }
+
+    if (HdmiCecSink_Engine.IsValid()) {
+        HdmiCecSink_Engine.Release();
+    }
 
     removeFile("/opt/uimgr_settings.bin");
 }
@@ -2237,13 +2306,64 @@ MATCHER_P(MatchRequest, data, "")
     return match;
 }
 
+/* COM-RPC acquisition helper for this fixture.
+ *
+ * CONTRACT: returns Core::ERROR_NONE if and only if BOTH handles this fixture's tests go on to
+ * use are non-null -- the plugin shell in m_controller_cecSink AND the IHdmiCecSink interface in
+ * m_cecSinkPlugin.  Any other outcome returns Core::ERROR_GENERAL and additionally records a
+ * GoogleTest failure naming the stage that failed.
+ *
+ * WHY THE CONTRACT HAD TO BE TIGHTENED.  The earlier body set return_value = ERROR_NONE as soon
+ * as the shell opened, without checking QueryInterface<IHdmiCecSink>() had succeeded, so a null
+ * interface was handed back with a success status.  A caller that trusted the status then
+ * dereferenced nullptr.
+ *
+ * WHY THE FAILURE IS RECORDED HERE RATHER THAN LEFT TO THE RETURN CODE ALONE.  This helper has
+ * two distinct call idioms in this file and a bare return code is only honest in one of them:
+ *
+ *   * ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject()) -- the newer cases.  A
+ *     return code is enough here: the assertion fails and the test stops.
+ *   * if (CreateHdmiCecSinkInterfaceObject() != Core::ERROR_NONE) { TEST_LOG(...) } else { ... }
+ *     -- the pre-existing cases, whose bodies Directive 5 forbids modifying.  Here a bare
+ *     failing return code makes the test log a line, skip its whole body and report SUCCESS.
+ *     Returning an honest error without recording a failure would therefore have converted a
+ *     loud null-dereference into a silent vacuous pass -- a worse defect than the one being
+ *     fixed, and invisible in a green run.
+ *
+ * ADD_FAILURE() is non-fatal, so control flow is unchanged for every caller; it only guarantees
+ * that a run which could not acquire the interface cannot be reported as a passing run.  In a
+ * healthy environment none of these arms is taken: the fixture's tests exercise real SetOSDName
+ * and GetOSDName round trips over this interface and assert ERROR_NONE on them.
+ *
+ * The shell is released on the null-interface arm and the member reset, because on that arm no
+ * caller reaches the Release() at the end of its body and the handle would otherwise leak.
+ *
+ * ACQUISITION IS ALSO RETRIED WITHIN A BOUND.  The endpoint is host-global (see ComRpcEndpoint
+ * above), so a single attempt can lose to a process that momentarily owns the socket, and a loaded
+ * host can miss a 3 s attempt against a plugin that is perfectly healthy.  Both were observed here,
+ * as six cases failing at "Failed to get HdmiCecSink Plugin Interface" while the log recorded the
+ * plugin as activated.  Retrying inside kComRpcOpenTimeoutMs makes that a slower success; keeping
+ * the bound makes a genuinely absent plugin fail the caller instead of hanging the suite, and the
+ * ADD_FAILURE() above is raised once the bound expires rather than on each attempt.
+ *
+ * Requiring BOTH handles also mirrors CreateHdmiCecSourceInterfaceObject in the sibling
+ * entservices-hdmicecsource L2 suite, so the two suites now express the same contract.
+ */
 uint32_t HdmiCecSink_L2Test::CreateHdmiCecSinkInterfaceObject()
 {
     uint32_t return_value = Core::ERROR_GENERAL;
 
+    // A test may acquire more than once. Hand the previous channel back before opening another,
+    // rather than letting it lapse when the proxy is overwritten: the endpoint is shared, so a
+    // channel nobody closes is a channel every other run has to work around.
+    if (HdmiCecSink_Client.IsValid()) {
+        HdmiCecSink_Client->Close(kComRpcCloseTimeoutMs);
+        HdmiCecSink_Client.Release();
+    }
+
     TEST_LOG("Creating HdmiCecSink_Engine");
     HdmiCecSink_Engine = Core::ProxyType<RPC::InvokeServerType<1, 0, 4>>::Create();
-    HdmiCecSink_Client = Core::ProxyType<RPC::CommunicatorClient>::Create(Core::NodeId("/tmp/communicator"), Core::ProxyType<Core::IIPCServer>(HdmiCecSink_Engine));
+    HdmiCecSink_Client = Core::ProxyType<RPC::CommunicatorClient>::Create(Core::NodeId(ComRpcEndpoint().c_str()), Core::ProxyType<Core::IIPCServer>(HdmiCecSink_Engine));
 
     TEST_LOG("Creating HdmiCecSink_Engine Announcements");
 #if ((THUNDER_VERSION == 2) || ((THUNDER_VERSION == 4) && (THUNDER_VERSION_MINOR == 2)))
@@ -2251,11 +2371,51 @@ uint32_t HdmiCecSink_L2Test::CreateHdmiCecSinkInterfaceObject()
 #endif
     if (!HdmiCecSink_Client.IsValid()) {
         TEST_LOG("Invalid HdmiCecSink_Client");
+        ADD_FAILURE() << "CreateHdmiCecSinkInterfaceObject: the COM-RPC CommunicatorClient for "
+                         "/tmp/communicator is not valid, so no interface could be acquired. "
+                         "Every assertion this test would have made is unreachable; the run is "
+                         "not evidence that the behaviour under test works.";
     } else {
-        m_controller_cecSink = HdmiCecSink_Client->Open<PluginHost::IShell>(_T("org.rdk.HdmiCecSink"), ~0, 3000);
-        if (m_controller_cecSink) {
-            m_cecSinkPlugin = m_controller_cecSink->QueryInterface<Exchange::IHdmiCecSink>();
-            return_value = Core::ERROR_NONE;
+        // Bounded retry: each attempt gets kComRpcOpenAttemptMs, the whole acquisition gets
+        // kComRpcOpenTimeoutMs.  A lost race for the host-global endpoint is retried; a genuinely
+        // absent plugin still fails the caller instead of hanging the suite.
+        const auto deadline
+            = std::chrono::steady_clock::now() + std::chrono::milliseconds(kComRpcOpenTimeoutMs);
+
+        for (;;) {
+            m_controller_cecSink = HdmiCecSink_Client->Open<PluginHost::IShell>(_T("org.rdk.HdmiCecSink"), ~0, kComRpcOpenAttemptMs);
+            if (m_controller_cecSink != nullptr) {
+                m_cecSinkPlugin = m_controller_cecSink->QueryInterface<Exchange::IHdmiCecSink>();
+                if (m_cecSinkPlugin != nullptr) {
+                    TEST_LOG("Successfully created HdmiCecSink Plugin Interface");
+                    return_value = Core::ERROR_NONE;
+                    break;
+                }
+
+                // The shell is released on the null-interface arm and the member reset, because on
+                // that arm no caller reaches the Release() at the end of its body and the handle
+                // would otherwise leak.
+                TEST_LOG("QueryInterface<Exchange::IHdmiCecSink> returned nullptr on a valid shell");
+                m_controller_cecSink->Release();
+                m_controller_cecSink = nullptr;
+            } else {
+                TEST_LOG("Failed to open the org.rdk.HdmiCecSink shell over COM-RPC");
+            }
+
+            if (std::chrono::steady_clock::now() >= deadline) {
+                ADD_FAILURE() << "CreateHdmiCecSinkInterfaceObject: the org.rdk.HdmiCecSink "
+                                 "interface could not be acquired within kComRpcOpenTimeoutMs. "
+                                 "Either Open<PluginHost::IShell>() kept returning nullptr, so the "
+                                 "plugin is not reachable over COM-RPC, or the shell opened and "
+                                 "QueryInterface<Exchange::IHdmiCecSink>() kept returning nullptr, "
+                                 "so no interface is available. Reporting success in either case is "
+                                 "what handed callers a null interface with an ERROR_NONE status; "
+                                 "the status is now honest and the failure is recorded, so a run "
+                                 "that could not acquire the interface cannot be reported as a "
+                                 "passing run.";
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(kComRpcRetryIntervalMs));
         }
     }
     return return_value;
@@ -2622,6 +2782,116 @@ TEST_F(HdmiCecSink_L2Test, SendKeyPressEvent_COMRPC)
             TEST_LOG("m_controller_cecSink is NULL");
         }
     }
+}
+
+/*
+ * The sink ACCEPTS an unsupported key code and an out-of-range logical address on its outbound key
+ * API and drops the unsupported one later, on its own thread. It does not reject either at the call,
+ * and this case pins the sink's actual contract rather than borrowing the sibling suite's.
+ *
+ * That asymmetry is the point. entservices-hdmicecsource has SendKeyPressEventWithInvalidLogicalAddress
+ * and SendKeyPressEventWithInvalidKeyCode, and both expect a non-ERROR_NONE return, because the source
+ * implementation validates inside the call. The sink does not:
+ *   - SendKeyPressEvent (HdmiCecSinkImplementation.cpp:1643) pushes a SendKeyInfo onto m_SendKeyQueue,
+ *     sets successResult.success and returns ERROR_NONE unconditionally - no key code and no address
+ *     is examined;
+ *   - the key thread later reads the queue and calls getUIKeyCode (cpp:3386), whose default arm returns
+ *     KEY_UNSUPPORTED, and the frame is then simply not transmitted ("Unsupported Key code : 0x..");
+ *   - the logical address is never validated anywhere - sendKeyPressEvent (cpp:1197) hands it straight
+ *     to LogicalAddress(logicalAddress).
+ * Writing this case the source way would fail against correct sink code, so the difference is asserted
+ * deliberately and recorded here for whoever compares the two suites next.
+ *
+ * The final wait is a LIVENESS barrier, not an exact-count proof: g_sinkSendToCount is process-wide and
+ * the discovery sweep transmits too (that limitation is set out at length on the ARC case further down),
+ * so it establishes that the key thread serviced the queue after these calls rather than that a
+ * specific frame was the one that moved it. Per-frame outbound payload assertions live in the sink L1
+ * suite, where the encoder is observable.
+ */
+TEST_F(HdmiCecSink_L2Test, SendKeyPressEventWithUnsupportedKeyCodeAndOutOfRangeAddressIsAcceptedThenDropped)
+{
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener())
+        << "CEC could not be enabled, so the key thread has no connection to transmit on.";
+
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_controller_cecSink);
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    // 0xFF is outside getUIKeyCode's table, so its default arm returns KEY_UNSUPPORTED.
+    HdmiCecSinkSuccess unsupportedKeyResult;
+    unsupportedKeyResult.success = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->SendKeyPressEvent(0x4, 0xFF, unsupportedKeyResult))
+        << "the sink accepts every key code at the API and filters later; a rejection here would be a "
+           "contract change";
+    EXPECT_TRUE(unsupportedKeyResult.success);
+
+    // 0xFF is not a CEC logical address either - the valid range is 0 to 15 - and the sink does not
+    // check it. VOLUME_UP is used so the queue entry is one the key thread will act on.
+    HdmiCecSinkSuccess outOfRangeAddressResult;
+    outOfRangeAddressResult.success = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->SendKeyPressEvent(0xFF, 0x41, outOfRangeAddressResult))
+        << "the sink does not validate the logical address on this path";
+    EXPECT_TRUE(outOfRangeAddressResult.success);
+
+    // A supported key code to a real address, then wait for the bus to move: the queue has been
+    // serviced by the time this returns, which is when "the unsupported entry produced no transmission"
+    // becomes an observation rather than a guess.
+    const int sendsBefore = g_sinkSendToCount.load();
+    HdmiCecSinkSuccess supportedKeyResult;
+    supportedKeyResult.success = false;
+    EXPECT_EQ(Core::ERROR_NONE, m_cecSinkPlugin->SendKeyPressEvent(0x4, 0x41, supportedKeyResult));
+    EXPECT_TRUE(supportedKeyResult.success);
+    EXPECT_TRUE(WaitUntil([sendsBefore]() { return g_sinkSendToCount.load() > sendsBefore; },
+        std::chrono::milliseconds(EVNT_TIMEOUT)))
+        << "no frame reached the CEC connection after a supported key code, so the key thread never "
+           "serviced the queue and nothing can be concluded about the entries before it";
+
+    // Three malformed-or-not entries later, the plugin is still serving requests.
+    JsonObject params, result;
+    EXPECT_EQ(Core::ERROR_NONE,
+        InvokeServiceMethod("org.rdk.HdmiCecSink.1", "getDeviceList", params, result))
+        << "the plugin stopped answering after an unsupported key code and an out-of-range address";
+    EXPECT_TRUE(result.HasLabel("numberofdevices"));
+}
+
+/*
+ * The JSON-RPC surface rejects a method it does not implement and a callsign nothing is registered
+ * under, and keeps serving afterwards.
+ *
+ * Every other JSON-RPC case in this file invokes a method that exists on the callsign that owns it, so
+ * nothing here established what the surface does with a request it cannot satisfy - a suite can be
+ * entirely green and still not know that. Both legs are bounded by INVOKE_TIMEOUT inside
+ * InvokeServiceMethod, so a rejection that arrives as an error and one that arrives as a timeout are
+ * both caught by the same assertion; what matters is that neither is reported as success and neither
+ * leaves the plugin unable to answer the real call that follows.
+ */
+TEST_F(HdmiCecSink_L2Test, UnknownJsonRpcMethodAndUnregisteredCallsignAreBothRejected)
+{
+    JsonObject unknownMethodParams, unknownMethodResult;
+    EXPECT_NE(Core::ERROR_NONE,
+        InvokeServiceMethod("org.rdk.HdmiCecSink.1", "thisMethodDoesNotExist", unknownMethodParams, unknownMethodResult))
+        << "a method the plugin does not implement was reported as succeeding";
+
+    JsonObject wrongCallsignParams, wrongCallsignResult;
+    EXPECT_NE(Core::ERROR_NONE,
+        InvokeServiceMethod("org.rdk.HdmiCecSinkNoSuchPlugin.1", "getDeviceList", wrongCallsignParams, wrongCallsignResult))
+        << "a callsign nothing is registered under was reported as succeeding";
+
+    JsonObject params, result;
+    EXPECT_EQ(Core::ERROR_NONE, InvokeServiceMethod("org.rdk.HdmiCecSink.1", "getDeviceList", params, result))
+        << "the plugin stopped answering after two rejected requests";
+    EXPECT_TRUE(result.HasLabel("numberofdevices"));
+    EXPECT_TRUE(result.HasLabel("success"));
 }
 
 // Test cases to validate SendUserControlPressed COMRPC
@@ -5323,8 +5593,11 @@ TEST_F(HdmiCecSink_L2Test, InjectAbortFrameBroadcastIgnoreCase)
 // The wait is deliberately short rather than the file's usual EVNT_TIMEOUT. The reporting fan-out at
 // cpp:2250-2258 runs synchronously inside listener->notify(), so once the injection loop below has
 // returned the COM-RPC leg has already had its chance; only the JSON-RPC hop is asynchronous, and a
-// short grace covers it. Waiting the full five seconds would only add dead time of the kind
-// condition 2 in the header note describes.
+// short grace covers it. Waiting the full five seconds here would be dead time, because this case has
+// no barrier event to cut the wait short - unlike the four Image/Text View On negatives, which pass an
+// EVNT_TIMEOUT to WaitForRequestStatus as a BOUND and return the moment their barrier event lands
+// (measured 6330-6374 ms per case against 6316 ms for the positive case they mirror, so none of them
+// pays the timeout).
 TEST_F(HdmiCecSink_L2Test, InjectFeatureAbortFrameBroadcastAndVerifyNoEvent)
 {
     JSONRPC::LinkType<Core::JSON::IElement> jsonrpc(HDMICECSINK_CALLSIGN, HDMICECSINK_L2TEST_CALLSIGN);
@@ -5454,6 +5727,11 @@ TEST_F(HdmiCecSink_L2Test, InjectBareHeaderPollingFrameChangesNothingAndLeavesTh
     // and the case failed at this very assertion - the sampler discovered the devices, not the
     // injected frame.  Two adjacent samples are the only form of this assertion that measures the
     // frame rather than the measurement, so the wait was removed rather than replaced.
+    //
+    // A BOUNDED RESAMPLE OF getDeviceList WAS THE OTHER CANDIDATE AND IS DELIBERATELY NOT USED,
+    // for the reason measured above: the resample is itself a device-list read, so it signals the
+    // discovery thread this assertion is trying to hold still.  Removing the wait satisfies the
+    // same no-blind-sleep requirement without that side effect.
     //
     // A poll carries no address, no name and no vendor, so it cannot make a device known: the
     // population must be exactly what it was, and the plugin must still answer.

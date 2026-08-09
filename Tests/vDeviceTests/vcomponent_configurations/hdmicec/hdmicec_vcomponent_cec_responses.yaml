@@ -22,8 +22,12 @@
 # EVERY OPCODE NAME BELOW IS A NAME THE vCOMPONENT'S PARSER ACTUALLY KNOWS.
 #
 # The emulator resolves these strings through vcCommand_GetOpCode, which looks them up in
-# gOpCodeStrVal (rdk-halif-test-hdmi_cec/vcomponent/src/vcCommand.c:27-84 - 57 names, spelled by the
-# CMD_* macros in vcCommand.h). A name outside that table resolves to CEC_OPCODE_UNKNOWN, and
+# gOpCodeStrVal (rdk-halif-test-hdmi_cec/vcomponent/src/vcCommand.c:27-83 - 55 names, spelled by the
+# CMD_* macros in vcCommand.h). The VOCABULARY IS 55 NAMES, NOT 57: vcCommand.h defines 57 CMD_*
+# string macros, two of which are not rows of that table - CMD_HOTPLUG ("HotPlug") is an opcode
+# spelling the table does not carry, and CMD_DATA_OSD_NAME ("osd_name") is a payload-symbol key
+# rather than an opcode - so the macro count is not the size of the vocabulary. A name outside
+# that table resolves to CEC_OPCODE_UNKNOWN, and
 # ParseCommand then logs "Opcode[<name>] Unknown" and RETURNS WITHOUT SENDING ANYTHING
 # (vcHdmiCec.c:180-184). That failure is silent from a test's point of view: the post is accepted,
 # HTTP 200 comes back, and the exchange the row describes simply never happens - so a row written
@@ -54,10 +58,16 @@
 # ../commands/*.yaml raw user_defined frames instead, which carry their bytes directly and bypass
 # the name table entirely.
 #
-# THE CONSTRAINT IS ENFORCED, NOT JUST DESCRIBED. utils.SUPPORTED_VCOMPONENT_OPCODES carries the
-# same 55 names, and TCID33_Process_Yaml_Health_Check asserts that every opcode string in this file
-# is a member of it - so a row added later in a name the parser cannot resolve fails a test rather
-# than going quietly missing at run time.
+# THE CONSTRAINT IS ENFORCED, NOT JUST DESCRIBED, AND HERE IS THE MECHANISM BY NAME.
+# utils.SUPPORTED_VCOMPONENT_OPCODES carries the same 55 names, derived from that table and listed
+# in its order. TCID33_Process_Yaml_Health_Check._verify_response_table_opcodes() reads this file
+# with its comment lines stripped - so the BLOCKED names written in prose above are not mistaken
+# for rows - and refuses three things: an opcode name that is not a member of the vocabulary, a
+# request or response half written as a mapping without an opcode key, and a document that
+# declares no opcode at all, which would let a membership check pass while asserting nothing. It
+# runs from run_test() beside the two fixture-inventory checks, BEFORE the sweep posts anything.
+# So a row added later in a name the parser cannot resolve fails a test rather than going quietly
+# missing at run time, and this paragraph can be checked rather than believed.
 HdmiCec:
   cec_messages:
     # Role-independent exchanges carried over from the HdmiCecSource template.

@@ -74,29 +74,28 @@ namespace
 // because the production macro is defined in a .cpp, not in a header.
 static const char* const CEC_SETTINGS_FILE_PATH = "/opt/persistent/ds/cecData_2.json";
 
-static void removeFile(const char* fileName)
-{
-    if (std::remove(fileName) != 0) {
-        printf("File %s failed to remove\n", fileName);
-        perror("Error deleting file");
-    } else {
-        printf("File %s successfully deleted\n", fileName);
-    }
-}
-
-static void createFile(const char* fileName, const char* fileContent)
-{
-    removeFile(fileName);
-
-    std::ofstream fileContentStream(fileName);
-    fileContentStream << fileContent;
-    fileContentStream << "\n";
-    fileContentStream.close();
-}
+// removeFile()/createFile() USED TO LIVE HERE and are gone rather than merely unused.
+//
+// They were the unguarded route to /etc/device.properties - HdmiCecSinkDsTest's constructor called
+// createFile() on it and its destructor called removeFile() on it - and both are now handled by
+// ScopedDeviceProperties, which takes custody, snapshots the host's own state (including "absent")
+// and restores it on every exit path.  Nothing else in this translation unit called either one, so
+// leaving them behind would be dead code that this suite's own quality bar forbids AND a
+// -Wunused-function error under the CI build's -Wall -Werror.  The functions that replaced them are
+// symlink-guarded, custody-serialised and atomic, which is why the raw pair is not kept "just in
+// case": using it again would reintroduce exactly the host-global clobber it caused.
 
 // Path that HdmiCecSinkImplementation compiles into CEC_SETTING_ENABLED_FILE.
 constexpr const char* kCecSettingsFile = "/opt/persistent/ds/cecData_2.json";
 constexpr const char* kCecSettingsDirectory = "/opt/persistent/ds";
+
+// The profile file entservices-helpers' searchRdkProfile() reads, and which BOTH
+// HdmiCecSink::Initialize and HdmiCecSink::Deinitialize consult before doing anything.
+constexpr const char* kDevicePropertiesFile = "/etc/device.properties";
+// The profile the sink plugin requires: Initialize returns "Not supported" for anything else, and
+// Deinitialize returns early without stopping the polling thread.  The trailing newline matches
+// what createFile() wrote before this was routed through the scope guard.
+constexpr const char* kSinkProfileContents = "RDK_PROFILE=TV\n";
 
 // True only for a regular file owned by this process; a symlink, directory, device node
 // or foreign-owned file is rejected rather than followed, because these are predictable
@@ -451,12 +450,31 @@ public:
         : m_custody(kCecSettingsFile)
     {
         if (!m_custody.Held()) {
-            ADD_FAILURE_AT(__FILE__, __LINE__)
-                << "could not take custody of " << kCecSettingsFile
-                << " within the bound, so this fixture will NOT touch it: capturing and "
-                   "restoring it while another run holds it would destroy that run's copy. "
-                   "The plugin will load whatever is there, which may make this test fail for "
-                   "a reason that is not its own.";
+            // REPORTED HERE, VERDICT DELIVERED IN SetUp() - and the verdict is SKIPPED, not
+            // FAILED.
+            //
+            // The detect-and-refuse decision itself is correct and stays: capturing and restoring
+            // this path while another run holds it would destroy that run's copy.  But having
+            // refused, this fixture provisions nothing, so the precondition every case in it
+            // depends on was never established and NOTHING WAS MEASURED.  A failure would report a
+            // defect no test observed, and that is exactly what it used to do: measured across six
+            // runs on this shared host, 24 "could not take custody" refusals turned into red cases
+            // - 4 of 15 repeats of one filter, 5 red cases in another - none of them anything to do
+            // with the code under test.
+            //
+            // The skip cannot be raised from here.  GTEST_SKIP() expands to `return <void
+            // expression>`, which C++14 does not allow in a constructor (GCC: "returning a value
+            // from a constructor"), and this guard is constructed as a fixture member.  So the fact
+            // is recorded on the object and HdmiCecSinkInitializeTest::SetUp() - a plain void
+            // member function, which is where GoogleTest documents GTEST_SKIP() as belonging -
+            // turns it into the verdict.  The destructor below restores nothing, because nothing
+            // was captured, so the host is left entirely to its owner.
+            printf("could not take custody of %s within the bound, so this fixture will NOT touch "
+                   "it: capturing and restoring it while another run holds it would destroy that "
+                   "run's copy.  Nothing was provisioned and nothing will be measured; SetUp() "
+                   "reports this case as SKIPPED rather than failed.  Re-run when %s.l1test.lock "
+                   "is free.\n",
+                kCecSettingsFile, kCecSettingsFile);
             return;
         }
 
@@ -519,6 +537,11 @@ public:
             removeOwnedRegularFile(kCecSettingsFile);
         }
     }
+
+    // Whether custody was granted, which is what separates "this test was not run" from "this
+    // test found something wrong".  Read by HdmiCecSinkInitializeTest::SetUp(), which turns a
+    // refusal into a skip; see the constructor for why the verdict cannot be raised there.
+    bool CustodyHeld() const { return m_custody.Held(); }
 
 private:
     // FIRST member: custody is acquired before the snapshot and released after the restore.
@@ -613,15 +636,43 @@ private:
  */
 class ScopedDeviceProperties {
 public:
-    explicit ScopedDeviceProperties(const char* fileName)
+    /*
+     * armed == false means DO NOT TOUCH THIS PATH AT ALL - not the capture, not the restore.
+     *
+     * It exists because this guard is now also used as a fixture member alongside a
+     * PathCustodyLock over the same path, and a guard that captured and restored without holding
+     * that lock would be fail-open: its restore could put a stale snapshot over a cooperating
+     * peer's update, which is the exact failure the lock exists to prevent.  Callers that own the
+     * path for the duration of one test body (and take custody for that window through the
+     * write/restore helpers) get the default and are unaffected.
+     */
+    explicit ScopedDeviceProperties(const char* fileName, const bool armed = true)
         : m_fileName(fileName)
         , m_contents()
         , m_mode(0644)
         , m_captured(false)
+        , m_wasPresent(false)
     {
+        if (!armed) {
+            printf("File %s: custody was not granted, so it is neither captured nor restored and "
+                   "is left entirely to its owner\n",
+                m_fileName);
+            return;
+        }
+
         const int fd = ::open(m_fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         if (fd < 0) {
-            printf("File %s could not be captured: %s\n", m_fileName, strerror(errno));
+            // ABSENT IS A STATE, NOT AN ERROR, and telling the two apart is what lets the
+            // destructor put the host back either way.  A fixture that provisions this path on a
+            // host which did not have it must REMOVE it again; one that overwrites a host's own
+            // file must put the bytes back.  Collapsing both into "nothing captured" is what left
+            // a provisioned profile behind on hosts that never had one.
+            if (errno == ENOENT) {
+                m_captured = true;
+                m_wasPresent = false;
+            } else {
+                printf("File %s could not be captured: %s\n", m_fileName, strerror(errno));
+            }
             return;
         }
 
@@ -634,6 +685,7 @@ public:
                 m_contents.append(buffer, static_cast<std::string::size_type>(bytesRead));
             }
             m_captured = (bytesRead == 0);
+            m_wasPresent = m_captured;
         } else {
             printf("File %s is not a regular file; refusing to modify it\n", m_fileName);
         }
@@ -645,12 +697,31 @@ public:
 
     ~ScopedDeviceProperties()
     {
-        if (m_captured) {
+        if (!m_captured) {
+            return;
+        }
+        if (m_wasPresent) {
             (void)write(m_contents);
+            return;
+        }
+        // The host did not have this file, so it must not have it afterwards either.  ENOENT is
+        // success: absent is the state being asked for, and a sibling fixture of this suite may
+        // legitimately have removed the entry in between.  std::remove rather than unlink because
+        // this binary is linked with -Wl,-wrap,unlink and a direct unlink() would be redirected to
+        // the Wraps mock and remove nothing.
+        if ((std::remove(m_fileName) != 0) && (errno != ENOENT)) {
+            printf("File %s could not be removed to restore the host's absent state: %s\n",
+                m_fileName, strerror(errno));
         }
     }
 
+    // True when the host's state was captured - which now includes "captured as absent", so a
+    // fixture can provision this path and still hand the host back exactly as it found it.
     bool IsCaptured() const { return m_captured; }
+    // Whether the host's own file existed.  Kept separate from IsCaptured() because the two say
+    // different things: the callers that read Contents() need a file to have been there, while the
+    // destructor needs to know which of the two restores to perform.
+    bool WasPresent() const { return m_wasPresent; }
     const std::string& Contents() const { return m_contents; }
 
     bool write(const std::string& contents) const
@@ -702,6 +773,7 @@ private:
     std::string m_contents;
     mode_t m_mode;
     bool m_captured;
+    bool m_wasPresent;
 };
 // ScopedGlobalFile - a plain-iostream snapshot of one process-global file - USED TO LIVE HERE and
 // has been removed as a class, not merely stopped being used.  Its single instantiation bracketed
@@ -805,6 +877,31 @@ protected:
     virtual ~HdmiCecSinkInitializeTest() override
     {
         plugin.Release();
+    }
+
+    /*
+     * The one thing this fixture does in SetUp(), and the reason it has one at all: turn a refused
+     * custody lock on the persisted-settings path into a SKIP rather than a failure.
+     *
+     * Every case under this fixture depends on the settings file having been put into its known
+     * state, and when custody could not be taken the guard deliberately touched nothing - so that
+     * state was never established and nothing the body asserts would be measuring what it claims.
+     * Reporting "not measured" is the truthful verdict; reporting a failure blames the code under
+     * test for another run's lock.  See ScopedCecSettingsFile's constructor for why this verdict is
+     * delivered here instead of there.
+     *
+     * Derived fixtures that add their own SetUp() must call this one first.
+     */
+    void SetUp() override
+    {
+        if (!persistedCecSettings.CustodyHeld()) {
+            GTEST_SKIP()
+                << "custody of " << kCecSettingsFile << " is held by another run on this host, so "
+                   "this fixture deliberately left it alone and the known settings state every "
+                   "case here depends on was never established.  Nothing was measured and nothing "
+                   "was changed - this is a SKIP, not a failure.  Re-run when "
+                << kCecSettingsFile << ".l1test.lock is free.";
+        }
     }
 };
 
@@ -1025,9 +1122,57 @@ protected:
         }
     }
 
+    /*
+     * CUSTODY AND A SNAPSHOT OF /etc/device.properties, held for this fixture's whole lifetime.
+     *
+     * Declared as the first two members of this fixture on purpose.  Members are constructed after
+     * the base subobject and before this constructor's body, and destroyed after its destructor
+     * body has run, so the pair brackets BOTH the profile this fixture provisions before
+     * plugin->Initialize() and the profile HdmiCecSink::Deinitialize re-reads on the way out.
+     *
+     * WHAT IT REPLACED AND WHY.  The constructor used to call createFile() straight onto the host
+     * path and the destructor used to removeFile() it unconditionally - so a host that had its own
+     * /etc/device.properties lost its contents, and a host that had none was left with this
+     * suite's.  Worse, nothing serialised the path: this machine runs many checkouts of this
+     * repository at once and the SOURCE plugin's suite provisions the same file with
+     * RDK_PROFILE=STB.  When that lands between this fixture's Initialize and its Deinitialize,
+     * HdmiCecSink::Deinitialize takes its `profileType == STB` early return, never calls
+     * SetEnabled(false), and the polling thread it should have stopped goes on calling
+     * Connection::ping() into a CEC mock this fixture is about to delete.  The mock guards that
+     * pointer with a NON-FATAL EXPECT_NE and then dereferences it anyway, so the process
+     * SEGFAULTS rather than failing a test - measured, with the backtrace running
+     * Connection::ping -> HdmiCecSinkImplementation::pingDevices -> threadRun.
+     *
+     * The custody lock makes cooperating writers - the source plugin's suite takes the same lock
+     * on the same path - wait instead of interleaving.  It is not fail-open: without custody the
+     * guard captures nothing, the provisioning below reports it, and the host is left alone.
+     */
+    PathCustodyLock devicePropertiesCustody{ kDevicePropertiesFile };
+    // ARMED ONLY WHEN CUSTODY WAS GRANTED, and the declaration order above is what makes that
+    // knowable here: without the lock this guard captures nothing and restores nothing, so a run
+    // that could not serialise itself leaves the path entirely to whoever holds it.
+    ScopedDeviceProperties devicePropertiesGuard{ kDevicePropertiesFile, devicePropertiesCustody.Held() };
+    // Whether the constructor managed to put the TV profile on the path.  Read by SetUp().
+    bool m_devicePropertiesProvisioned{ true };
+
     HdmiCecSinkDsTest(): HdmiCecSinkInitializeTest()
     {
-        createFile("/etc/device.properties", "RDK_PROFILE=TV");
+        // The TV profile goes on through the guard that captured the host's own file, so the
+        // object that provisions it is the object that puts the host's state back - including
+        // putting the file back to ABSENT when that is what it found.  Byte-identical to what
+        // createFile("/etc/device.properties", "RDK_PROFILE=TV") wrote, so the plugin sees exactly
+        // the file it saw before.
+        if (!devicePropertiesGuard.IsCaptured() || !devicePropertiesGuard.write(kSinkProfileContents)) {
+            // Recorded, not asserted, and turned into a SKIP by SetUp() below - for the same
+            // reason as the settings-file guard: with custody refused this fixture has provisioned
+            // no profile, so the plugin would come up (or refuse to) against whatever another run
+            // left on the host, and nothing measured under it would be about the code under test.
+            m_devicePropertiesProvisioned = false;
+            printf("could not provision %s with the TV profile this fixture requires (custody %s); "
+                   "SetUp() reports this case as SKIPPED rather than measuring against another "
+                   "run's file\n",
+                kDevicePropertiesFile, devicePropertiesCustody.Held() ? "held" : "NOT granted");
+        }
         p_iarmBusImplMock  = new NiceMock <IarmBusImplMock>;
         IarmBus::setImpl(p_iarmBusImplMock);
 
@@ -1162,7 +1307,8 @@ protected:
 
         EXPECT_EQ(string(""), plugin->Initialize(&service));
 
-        // Hand every test a settled bus. Initialize() -> CECEnable() spawns the polling thread,
+        // Hand every test a settled bus (see the wait at the end of this constructor).
+        // Initialize() -> CECEnable() spawns the polling thread,
         // which claims the TV logical address, broadcasts <Report Physical Address>, pings the
         // bus and only then parks for HDMICECSINK_PING_INTERVAL_MS. Until that sweep finishes it
         // is concurrently writing deviceList[], m_numberOfDevices and the CEC connection that
@@ -1172,9 +1318,63 @@ protected:
         // wait for. Tests that depend on a quiet bus call waitForBusToSettle() themselves.
         (void)waitForBusToSettle(2000);
     }
+
+    // Adds this fixture's own precondition to the base fixture's: with custody of
+    // /etc/device.properties refused, the constructor could not put the TV profile on the path, so
+    // the plugin under test is running against whatever another run on this host left there and
+    // nothing measured below would be about this code.  Skipped rather than failed, for the same
+    // reason as the settings-file guard.  The base SetUp() runs first and may skip on its own
+    // account; a skip already recorded is not undone by continuing here.
+    void SetUp() override
+    {
+        HdmiCecSinkInitializeTest::SetUp();
+
+        if (!m_devicePropertiesProvisioned) {
+            GTEST_SKIP()
+                << "custody of " << kDevicePropertiesFile << " is held by another run on this host, "
+                   "so this fixture could not provision the TV profile it requires and the plugin "
+                   "was initialised against a foreign file.  Nothing was measured - this is a SKIP, "
+                   "not a failure.  Re-run when " << kDevicePropertiesFile << ".l1test.lock is free.";
+        }
+    }
+
     virtual ~HdmiCecSinkDsTest() override {
 
+        // Re-state the profile immediately before Deinitialize, because Deinitialize READS IT
+        // AGAIN and its whole behaviour turns on the answer: HdmiCecSink::Deinitialize calls
+        // searchRdkProfile() and returns early for STB or NOT_FOUND, skipping SetEnabled(false)
+        // and the implementation Release - which is what stops the polling thread.  See the
+        // member declarations above for the crash that follows when it does.  Two lines here are
+        // what make the teardown deterministic no matter what else on this host wrote the file
+        // while this fixture's case was running.
+        if (devicePropertiesGuard.IsCaptured()) {
+            (void)devicePropertiesGuard.write(kSinkProfileContents);
+        }
+
         plugin->Deinitialize(&service);
+
+        // Wait for the implementation to be gone before releasing anything it can still call.
+        // Deinitialize releases it, its destructor runs CECDisable() (which stops and joins the
+        // polling thread) and only then clears the static _instance pointer - so a cleared
+        // _instance is the production code's own published proof that no CEC worker thread is
+        // still running.  The mocks those threads call into are deleted a few lines below, so
+        // this is the last point at which waiting is worth anything.
+        //
+        // Reported, not asserted: the condition it guards against is a host-level profile
+        // problem that the re-statement above already closes, and a verdict here would blame
+        // whichever test happened to own the fixture.
+        const int kTeardownWaitMs = 5000;
+        int waitedMs = 0;
+        while ((Plugin::HdmiCecSinkImplementation::_instance != nullptr) && (waitedMs < kTeardownWaitMs)) {
+            usleep(10 * 1000);
+            waitedMs += 10;
+        }
+        if (Plugin::HdmiCecSinkImplementation::_instance != nullptr) {
+            printf("HdmiCecSinkDsTest: the plugin implementation was still alive %d ms after "
+                   "Deinitialize, so its polling thread may outlive the mocks this fixture is "
+                   "about to release\n",
+                waitedMs);
+        }
 
         Core::IWorkerPool::Assign(nullptr);
         workerPool.Release();
@@ -1182,7 +1382,10 @@ protected:
         dispatcher->Release();
         PluginHost::IFactories::Assign(nullptr);
 
-        removeFile("/etc/device.properties");
+        // NO removeFile HERE.  devicePropertiesGuard hands the host's own file back when it is
+        // destroyed a moment from now - to its captured contents and mode, or to ABSENT if that
+        // is what was there.  Deleting it unconditionally destroyed a host-global file this
+        // suite did not own.
 
         IarmBus::setImpl(nullptr);
         if (p_iarmBusImplMock != nullptr)

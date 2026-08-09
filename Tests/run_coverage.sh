@@ -341,22 +341,31 @@
 #  These are dated observations, not promises about the tree you are looking at: the figures
 #  move whenever the suites or the plugin move, and re-measuring them is precisely this
 #  script's job.
-#      L1: 324 tests green, aggregate 86.2% (1837/2131).  HdmiCecSink.cpp 94.9%,
-#          HdmiCecSink.h 99.2%, HdmiCecSinkImplementation.cpp 83.7%,
-#          HdmiCecSinkImplementation.h 100.0%; plugin/Module.cpp exempt at 0/1.  `l1` exits 0.
-#      L2: 120 tests green across two shards, aggregate 80.0% (1705/2130).
-#          HdmiCecSink.h 93.8%, HdmiCecSinkImplementation.cpp 80.0%, Module.cpp 100.0%;
-#          plugin/HdmiCecSink.cpp exempt at its 78.0% ceiling and
-#          plugin/HdmiCecSinkImplementation.h exempt for the reason given with the L2 floors
-#          below.  `l2` exits 0.
+#      L1: 329 tests green, aggregate 86.4% (1842/2131).  HdmiCecSink.cpp 94.9% (56/59),
+#          HdmiCecSink.h 99.2% (127/128), HdmiCecSinkImplementation.cpp 84.0% (1487/1771),
+#          HdmiCecSinkImplementation.h 100.0% (172/172); plugin/Module.cpp exempt at 0/1.
+#          `l1` exits 0.
+#      L2: 130 tests green across two shards, aggregate 81.2% (1730/2130).
+#          HdmiCecSink.h 93.8% (120/128), HdmiCecSinkImplementation.cpp 81.4% (1442/1771),
+#          Module.cpp 100.0% (1/1); plugin/HdmiCecSink.cpp exempt at its 78.0% (46/59) ceiling
+#          and plugin/HdmiCecSinkImplementation.h exempt at 70.8% (121/171) for the reason given
+#          with the L2 floors below.  `l2` exits 0.
+#      Both levels' filtered traces hold exactly the FIVE production files above and nothing
+#      else, which is what the exclusion globs are for; the cross-level best-single-level verdict each run
+#      prints shows every exempt target clearing the bar at the other level.
 #  Separately from those dated figures, and checkable right now rather than measured:
-#  HdmiCecSink_L2Test.cpp holds 128 TEST_F cases and `grep -c DISABLED_` over it returns ZERO,
-#  so all 128 are eligible to run.  The four route and port-map cases that were disabled at an
+#  HdmiCecSink_L2Test.cpp holds 130 TEST_F cases and `grep -c DISABLED_` over it returns ZERO,
+#  so all 130 are eligible to run.  The four route and port-map cases that were disabled at an
 #  intermediate commit are ENABLED in this tree and pass; the one assertion the shared,
 #  out-of-scope CEC mock cannot satisfy sits behind a runtime availability check inside each of
-#  them, so nothing is bought by disabling anything.  128 is the CURRENT eligible count, not the
-#  tree the L2 row above was measured from, so do not read 120 as today's figure -- re-run `l2`
-#  for that.  The L2 floors block says what the mock still blocks, and why.
+#  them, so nothing is bought by disabling anything.  130 is the CURRENT eligible count, and the L2
+#  row above was re-captured on that same 130-case tree -- the two added negative cases moved no
+#  figure in it -- so read those numbers as today's and re-run `l2` if the tree has moved on again.
+#  The L2 floors block says what the mock still blocks, and why.
+#  RECORDED RATHER THAN SILENTLY APPLIED: an earlier revision of this comment asserted four
+#  DISABLED_-prefixed cases and "124 eligible".  The four names it gave are not in the file and the
+#  arithmetic followed from them; both were wrong, and the four route-chain cases it named are
+#  present, ENABLED and passing.
 #  L2 did NOT always clear the bar.  It was measured at aggregate 78.17% with
 #  HdmiCecSinkImplementation.cpp at 77.98% and HdmiCecSinkImplementation.h at 70.76%, and it
 #  was closed the only honest way -- by adding L2 cases that reach the port-map and route
@@ -744,21 +753,27 @@ readonly L2_GATE_EXEMPT=(
 # Format: <path relative to the repository>=<recorded baseline line coverage percentage>
 #
 # LEVEL-SCOPED, and for a measured reason: the two levels reach genuinely different code, so
-# the SAME sources give HdmiCecSinkImplementation.h 100% under L1 and 92.4% under L2, and
-# HdmiCecSink.h 99.2% under L1 and 97.7% under L2.  Applying an L1 baseline to an L2 trace
-# would report a "regression" that never happened, so each level's floors come from a trace
-# measured at that level and are never carried across.
+# the SAME sources give HdmiCecSinkImplementation.h 100.0% under L1 and 70.8% under L2 -- the
+# reason is in the exemption block above, no L2 test can reach HdmiPortMap through the shared
+# mock -- and HdmiCecSink.h 99.2% under L1 and 93.8% under L2.  Applying an L1 baseline to an L2
+# trace would report a "regression" that never happened, so each level's floors come from a trace
+# measured at that level and are never carried across.  An earlier revision of this comment
+# quoted 92.4% and 97.7% for those two L2 figures; neither matches any capture, and the 92.4%
+# additionally contradicted the 70.8% the exemption block states a few lines above.  Read the live
+# figures off the per-file table this run prints -- this comment exists to explain the
+# level-scoping, not to be a second source of truth for the numbers.
 #
-# The L2 floors were MEASURED, not chosen.  Each figure is the measured value recorded exactly,
-# with no margin added.  Before they existed this level had no floor at all, so nothing protected
-# the move from 78.17% -- a later change could have handed most of it back and still passed the
-# bar.
+# The L2 floors were MEASURED, not chosen: each is the value a real L2 capture reported at the
+# point the floor was recorded, with no margin added.  They are HISTORICAL baselines and are
+# deliberately not re-based on every later capture, so a "now" figure is expected to sit at or
+# above its floor rather than exactly on it.  Before they existed this level had no floor of any
+# kind, so a later change could have handed a gain back and still passed the bar.
 #
-# WHY FIVE CAPABILITIES ARE NOT REPRESENTED IN THESE FLOORS.  Five L2 cases -- four driving the
-# HdmiPortMap route chain and one injecting a DIRECTED inbound <Feature Abort> -- CANNOT PASS
-# against entservices-testframework/Tests/mocks/HdmiCec.h as this project must use it.  That mock
-# leaves AbortReason::impl uninitialised, so injecting a directed <Feature Abort> frame terminates
-# the host with SIGSEGV, and its PhysicalAddress::getByteValue returns raw wire bytes where ccec
+# WHY ONE CAPABILITY IS NOT REPRESENTED IN THESE FLOORS.  The HdmiPortMap route chain, and a
+# DIRECTED inbound <Feature Abort>, CANNOT be exercised end-to-end against
+# entservices-testframework/Tests/mocks/HdmiCec.h as this project must use it.  That mock leaves
+# AbortReason::impl uninitialised, so injecting a directed <Feature Abort> frame terminates the
+# host with SIGSEGV, and its PhysicalAddress::getByteValue returns raw wire bytes where ccec
 # returns nibbles, so the port-match guard can never hold and addChild logs ZERO invocations across
 # a full run.  Both are properties of a SHARED, OUT-OF-SCOPE mock, so the gap is REPORTED with the
 # exact mock change it needs rather than worked around here.
@@ -767,7 +782,7 @@ readonly L2_GATE_EXEMPT=(
 # cases are ENABLED in this tree and pass -- ActiveRouteIsResolvedThroughTheRegisteredPortChain,
 # ActiveRouteResolvesADeeperDeviceChain, ActiveRouteForADeviceDirectlyOnAPort and
 # DeviceRemovalUnregistersTheChildFromThePortMap all carry no DISABLED_ prefix, and
-# `grep -c DISABLED_` over HdmiCecSink_L2Test.cpp returns ZERO, so all 128 TEST_F cases are
+# `grep -c DISABLED_` over HdmiCecSink_L2Test.cpp returns ZERO, so all 130 TEST_F cases are
 # eligible to run.  Each of the four asserts unconditionally everything that IS observable -- that
 # COM-RPC and JSON-RPC agree about whether a route is available, and that an unavailable route
 # reports zero length and an empty description rather than stale state -- and puts only the
@@ -775,6 +790,12 @@ readonly L2_GATE_EXEMPT=(
 # false green and starts asserting the moment the framework gains one representation.  Inbound
 # <Feature Abort> coverage is likewise confined to the broadcast-rejection path, which production
 # returns early on and from which the uninitialised member is therefore never reached.
+#
+# MEASURED ELIGIBILITY, and a withdrawn claim recorded rather than quietly replaced: the file holds
+# 130 TEST_F cases and ZERO carry a DISABLED_ prefix (`grep -c DISABLED_` on it returns 0), so 130
+# are eligible and 130 execute -- confirmed by the shard results this run writes.  An earlier
+# revision of this comment named four DISABLED_-prefixed cases that do not exist in the file and
+# derived "124 eligible" from them; both the names and the arithmetic were wrong.
 #
 # plugin/HdmiCecSinkImplementation.h is L2_GATE_EXEMPT because of the MOCK DEFECT ITSELF, not
 # because anything is disabled: with getByteValue returning wire bytes where ccec returns nibbles,
@@ -2881,6 +2902,135 @@ per_file_report() {
             gate_exempt_reason "$level" "$path"
         done
     fi
+
+    report_cross_level_union "$level" "$exempt_below" "$REPORT_BELOW_TARGETS"
+}
+
+# ------------------------------------------------------------------------------------
+# CROSS-LEVEL UNION VERDICT.
+#
+# The specification's bar (section 0.9.2) is stated PER TARGET, and a target is a production
+# file -- not a (file, level) pair.  This runner necessarily gates per level, because a level is
+# all one run can measure, so a file that clears the bar at the other level still needs a
+# level-scoped waiver here.  Read level by level those waivers look like extra carve-outs beyond
+# the two plugin Module.cpp files the specification names; read as a UNION they are redundant,
+# because the target itself is above the bar.
+#
+# This block states that from the measurements instead of from prose.  For every file below the
+# bar at this level it prints the other level's figure and the resulting per-TARGET verdict, and
+# it prefers a LIVE figure -- the sibling level's filtered trace under the same artifact root --
+# falling back to a recorded reference only when that trace is absent, and labelling which of the
+# two it used every time.  Nothing here can change the gate: the gate has already been decided
+# per level by apply_gate(), and this is reporting, not judgement.
+# ------------------------------------------------------------------------------------
+# Recorded cross-level line coverage, used ONLY when the sibling level's trace is not present in
+# this artifact root.  Every figure is a measured value from a real capture of that level, and it
+# is printed labelled "recorded" so it is never mistaken for something this run measured.
+readonly CROSS_LEVEL_REFERENCE=(
+    'l1/plugin/HdmiCecSink.cpp=94.9'
+    'l1/plugin/HdmiCecSink.h=99.2'
+    'l1/plugin/HdmiCecSinkImplementation.cpp=84.0'
+    'l1/plugin/HdmiCecSinkImplementation.h=100.0'
+    'l1/plugin/Module.cpp=0.0'
+    'l2/plugin/HdmiCecSink.cpp=78.0'
+    'l2/plugin/HdmiCecSink.h=93.8'
+    'l2/plugin/HdmiCecSinkImplementation.cpp=81.4'
+    'l2/plugin/HdmiCecSinkImplementation.h=70.8'
+    'l2/plugin/Module.cpp=100.0'
+)
+
+# Line coverage of one repo-relative path in one filtered trace, as a percentage with one
+# decimal, or empty when the path is not in the trace.  Reads the trace's own LF/LH records so
+# the figure is the trace's, not a re-derivation.
+trace_line_pct() { # $1 = trace path, $2 = repo-relative file path
+    local trace="$1" want="$2"
+    [ -f "$trace" ] || return 0
+    awk -v want="$want" '
+        /^SF:/ { cur = substr($0, 4); keep = (index(cur, want) && substr(cur, length(cur) - length(want) + 1) == want); next }
+        keep && /^LF:/ { lf = substr($0, 4) + 0 }
+        keep && /^LH:/ { lh = substr($0, 4) + 0 }
+        END { if (lf > 0) printf "%.1f", (100.0 * lh) / lf }
+    ' "$trace" 2>/dev/null
+}
+
+cross_level_reference_pct() { # $1 = level, $2 = repo-relative path
+    local key="$1/$2" entry
+    for entry in "${CROSS_LEVEL_REFERENCE[@]}"; do
+        case "$entry" in
+            "$key="*) printf '%s' "${entry#*=}"; return 0 ;;
+        esac
+    done
+}
+
+report_cross_level_union() { # $1 = this level, $2 = exempt-below list, $3 = below-bar list
+    local level="$1" exempt_below="$2" below="$3"
+    local paths other other_trace
+    # Every file below the bar at this level, waived or not: those are the only ones for which
+    # the union changes anything.
+    paths="$(printf '%s\n%s\n' "$exempt_below" "$below" | awk 'NF {print $1}' | sort -u)"
+    [ -n "$paths" ] || return 0
+
+    case "$level" in
+        l1) other='l2' ;;
+        l2) other='l1' ;;
+        *)  return 0 ;;
+    esac
+    other_trace="$ARTIFACT_ROOT/$REPO_NAME/$other/filtered_coverage_$other.info"
+
+    rule
+    log "cross-level verdict: BEST SINGLE LEVEL per target (the specification's bar is per TARGET; this"
+    log "    runner gates per level).  This compares the two levels' line percentages and reports the"
+    log "    higher one; it is NOT a union of their covered line sets, which would be >= this figure."
+    if [ -f "$other_trace" ]; then
+        log "    ${other^^} figures below are MEASURED, read from $other_trace"
+    else
+        log "    ${other^^} figures below are RECORDED baselines, not measured by this run: no ${other^^}"
+        log "    trace exists at $other_trace.  Run '${other}' into the same --output-dir to have them"
+        log "    measured instead."
+    fi
+
+    local unresolved=0 path this_pct that_pct best best_level source
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        this_pct="$(printf '%s\n%s\n' "$exempt_below" "$below" | awk -v p="$path" '$1 == p {print $2; exit}')"
+        that_pct="$(trace_line_pct "$other_trace" "$path")"
+        if [ -n "$that_pct" ]; then
+            source='measured'
+        else
+            that_pct="$(cross_level_reference_pct "$other" "$path")"
+            source='recorded'
+        fi
+        if [ -z "$that_pct" ]; then
+            warn "    $path: ${level^^} ${this_pct}%, ${other^^} unknown -- no trace and no recorded"
+            warn "        baseline, so this target's union verdict cannot be stated."
+            unresolved=$((unresolved + 1))
+            continue
+        fi
+        # Integer comparison on tenths keeps this to shell arithmetic; the printed values keep
+        # their decimal.
+        if [ "${that_pct%.*}${that_pct#*.}" -gt "${this_pct%.*}${this_pct#*.}" ] 2>/dev/null; then
+            best="$that_pct"; best_level="${other^^}"
+        else
+            best="$this_pct"; best_level="${level^^}"
+        fi
+        if [ "${best%.*}" -ge "$COVERAGE_MIN" ] 2>/dev/null; then
+            log "    $path: ${level^^} ${this_pct}%, ${other^^} ${that_pct}% ($source) -> best ${best}% at ${best_level}: TARGET MEETS the ${COVERAGE_MIN}% bar"
+        else
+            warn "    $path: ${level^^} ${this_pct}%, ${other^^} ${that_pct}% ($source) -> best ${best}% at ${best_level}: TARGET IS BELOW the ${COVERAGE_MIN}% bar AT EVERY LEVEL"
+            unresolved=$((unresolved + 1))
+        fi
+    done <<EOF
+$paths
+EOF
+
+    if [ "$unresolved" -eq 0 ]; then
+        log "    Every target below the bar at ${level^^} clears it at ${other^^}, so each ${level^^} waiver"
+        log "    above is redundant under the per-target reading and none of them hides a real gap."
+    else
+        warn "    $unresolved target(s) above are NOT accounted for by the other level.  A waiver for"
+        warn "    one of those would be a genuine carve-out and must be justified as such, not as a"
+        warn "    level artefact."
+    fi
 }
 
 # ------------------------------------------------------------------------------------
@@ -2901,10 +3051,12 @@ report_floors() {
     log "must-not-regress floors (recorded ${level^^} baseline percentages, not live measurements):"
     if [ "$level" = l2 ]; then
         log "    Recorded per level and never carried across: the two levels reach different code, so"
-        log "    HdmiCecSinkImplementation.h measures 100% under L1 and 92.4% under L2 from the same"
-        log "    sources.  These L2 figures were measured by this script once the L2 cases that closed"
-        log "    the gap were in place; before them the level had no floor at all and nothing"
-        log "    protected the move from 78.17% to 84.4%."
+        log "    HdmiCecSinkImplementation.h measures 100.0% under L1 and 70.8% under L2 from the same"
+        log "    sources -- which is why it is L2_GATE_EXEMPT and given no L2 floor.  These L2 floors"
+        log "    were measured by this script from a real L2 capture taken once the cases that closed"
+        log "    the aggregate gap were in place; before them the level had no floor of any kind."
+        log "    They are HISTORICAL baselines and are not re-based on later captures, so each 'now'"
+        log "    figure below is expected to sit at or above its floor rather than exactly on it."
     fi
     if [ -n "$ok" ]; then
         printf '%s\n' "$ok" | while read -r path now floor; do
@@ -3068,6 +3220,107 @@ apply_gate() {
 }
 
 # ------------------------------------------------------------------------------------
+# ARTIFACT PROVENANCE.
+#
+# Coverage numbers are only evidence if they can be tied to a revision.  Numbers with no
+# revision are indistinguishable from numbers produced by a different checkout, a different
+# runner body or a different toolchain -- and once separated from their tree they cannot be
+# re-attached, because nothing in an lcov trace records where it came from.
+#
+# This runner already CHECKED provenance before measuring -- verify_library_provenance() refuses
+# a test library belonging to the other plugin, and the build-tree check refuses a build
+# configured from a different source tree -- but it did not RECORD it, so its traces shipped
+# without the manifest both sibling runners write.  That asymmetry made sink figures less
+# reproducible than source ones for no reason, and it is what these three functions close.
+#
+# The runner's OWN sha256 is included because a trace can outlive the script that made it.  If
+# the recorded hash does not match the script now on disk, the artifact was produced by a
+# different runner and its acceptance decision does not transfer.
+#
+# BOTH PLUGINS EMIT IDENTICALLY NAMED TEST LIBRARIES, so a trace that does not record which
+# plugin's build tree it came from is genuinely ambiguous here, not merely unattributed.  The
+# manifest therefore records the level and the build directory alongside the revisions.
+# ------------------------------------------------------------------------------------
+git_sha_of() { # $1 = repository path;  prints "<sha> (<branch>)<dirty marker>" or "unavailable"
+    local repo="$1" sha branch dirty=''
+    command -v git >/dev/null 2>&1 || { printf 'unavailable (no git)\n'; return 0; }
+    git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { printf 'unavailable (not a repository)\n'; return 0; }
+    sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || sha=''
+    [ -n "$sha" ] || { printf 'unavailable (no HEAD)\n'; return 0; }
+    branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)" || branch='?'
+    # Tracked paths only: untracked build residue is not a content difference and must not be
+    # reported as one, or every instrumented tree would read as dirty.
+    if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        dirty='  [DIRTY: tracked files modified]'
+    fi
+    printf '%s (%s)%s\n' "$sha" "$branch" "$dirty"
+}
+
+sha256_of() { # $1 = file;  prints the hex digest, or a reason
+    local f="$1"
+    [ -f "$f" ] || { printf 'absent\n'; return 0; }
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$f" 2>/dev/null | awk '{print $1; exit}'
+    else
+        printf 'unavailable (no sha256sum)\n'
+    fi
+}
+
+write_provenance() { # $1 = level (l1|l2)
+    local level="$1"
+    PROVENANCE_TXT="$LEVEL_ARTIFACT_DIR/provenance.txt"
+
+    {
+        printf '%s %s coverage -- ARTIFACT PROVENANCE\n' "$REPO_NAME" "${level^^}"
+        printf '==============================================================\n\n'
+        printf 'Generated (UTC)      : %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unavailable')"
+        printf 'Host                 : %s\n' "$(uname -n 2>/dev/null || printf 'unavailable')"
+        printf 'Clone index          : %s\n' "${CLONE_INDEX:-unset}"
+        printf 'Level                : %s\n' "${level^^}"
+        printf 'Workspace root       : %s\n' "$WS"
+        printf 'Repository root      : %s\n' "$REPO_ROOT"
+        printf 'Artifact directory   : %s\n' "$LEVEL_ARTIFACT_DIR"
+        printf 'Build directory      : %s\n' "$LEVEL_BUILD_DIR"
+        printf 'Install directory    : %s\n' "$LEVEL_INSTALL_DIR"
+        printf '\nREVISIONS\n'
+        printf '  superproject       : %s\n' "$(git_sha_of "$WS")"
+        local sub
+        for sub in hdmicec entservices-hdmicecsource entservices-hdmicecsink entservices-testframework \
+                   entservices-apis entservices-helpers Thunder ThunderTools; do
+            if [ -d "$WS/$sub" ]; then
+                printf '  %-18s : %s\n' "$sub" "$(git_sha_of "$WS/$sub")"
+            fi
+        done
+        printf '\nRUNNER AND CONFIGURATION\n'
+        printf '  runner path        : %s\n' "$SCRIPT_PATH"
+        printf '  runner sha256      : %s\n' "$(sha256_of "$SCRIPT_PATH")"
+        printf '  runner bytes       : %s\n' "$(wc -c <"$SCRIPT_PATH" 2>/dev/null | tr -d ' ' || printf 'unavailable')"
+        printf '  lcov config        : %s\n' "$(sha256_of "$SCRIPT_DIR/L1Tests/.lcovrc_l1")"
+        printf '  line bar           : %s%%\n' "$COVERAGE_MIN"
+        printf '  branch data        : forced on (--rc branch_coverage=1)\n'
+        printf '  L2 shards          : %s\n' "${L2_SHARDS:-unset}"
+        printf '\nTOOLCHAIN\n'
+        printf '  lcov               : %s\n' "$(lcov_run --version 2>/dev/null | head -n1 || printf 'unavailable')"
+        printf '  gcov               : %s\n' "$(gcov --version 2>/dev/null | head -n1 || printf 'unavailable')"
+        printf '  compiler           : %s\n' "$("${CXX:-g++}" --version 2>/dev/null | head -n1 || printf 'unavailable')"
+        printf '\nHOW TO CHECK THIS ARTIFACT STILL APPLIES\n'
+        # The backticks below are literal text in the manifest -- two commands for a human to
+        # run, not command substitutions -- so single quotes are exactly right here.
+        # shellcheck disable=SC2016
+        printf '  1. Compare the superproject revision above with `git rev-parse HEAD`.\n'
+        # shellcheck disable=SC2016
+        printf '  2. Compare the runner sha256 above with `sha256sum %s`.\n' "$SCRIPT_PATH"
+        printf '  If either differs, these numbers were produced from a different tree or a\n'
+        printf '  different script, and the acceptance decision they carry does not transfer.\n'
+    } >"$PROVENANCE_TXT" || die "could not write $PROVENANCE_TXT"
+
+    chmod 600 -- "$PROVENANCE_TXT" 2>/dev/null || true
+    log "provenance: $PROVENANCE_TXT"
+    log "  superproject : $(git_sha_of "$WS")"
+    log "  runner sha256: $(sha256_of "$SCRIPT_PATH")"
+}
+
+# ------------------------------------------------------------------------------------
 # One level, end to end.  The order is the whole argument of this script:
 #   resolve the level's own inputs -> confirm the tree is instrumented -> ZERO the
 #   counters -> run the suite -> confirm the suite produced fresh counters and its own
@@ -3087,6 +3340,10 @@ run_level() {
     preflight "$level"
     # First filesystem write of the run, and only now that preflight has passed.
     create_level_artifact_dir "$level"
+    # Written BEFORE the suite runs, so that a run which dies mid-suite still leaves behind the
+    # revisions and toolchain it was measuring -- an aborted run with no manifest is the case
+    # that is hardest to diagnose later.  Same position as the sibling source-plugin runner.
+    write_provenance "$level"
     resolve_lcov_config "$level"
     # Before the FIRST lcov invocation of the level -- which is the counter zeroing below,
     # not the capture.  main() has already done this for the run; it is repeated here (and is
