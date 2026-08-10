@@ -148,6 +148,7 @@ import json
 # resulting single "imported but unused" lint note is accepted convention here rather than an
 # oversight. Every other symbol has a call site below.
 from utils import (
+    read_fixture_text,
     send_curl_command,
     send_vcomponent_command,
     sanitise_for_log,
@@ -236,8 +237,10 @@ def _payload_operands(yaml_name):
     """
     path = os.path.join(HDMICEC_CMD_BASE, yaml_name)
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
+        # utils.read_fixture_text opens with O_NOFOLLOW|O_CLOEXEC and fstats the descriptor, so a
+        # symbolic link or a FIFO standing where the fixture should be is refused rather than
+        # followed or blocked on.  Every refusal is an OSError, which the handler below reports.
+        text = read_fixture_text(path)
     except OSError as exc:
         return None, f"cannot read {yaml_name}: {exc}"
     match = _PAYLOAD_PATTERN.search(text)

@@ -24,10 +24,17 @@
  *          involved, through the single hardened helper _run_curl(). A request is therefore
  *          DATA - a JsonRpcRequest of method, params, id and timeout - never a command
  *          string, which is why HdmiCECSink_Curl.py publishes structured requests rather
- *          than assembled curl lines. The endpoints are validated before use, the option
- *          terminator "--" precedes every URL, every invocation is bounded in time, and a
- *          non-zero curl exit status is always reported as a failure rather than
- *          reinterpreted as a success.
+ *          than assembled curl lines. The endpoints are validated before use - once at import
+ *          time and again in each of the three transport helpers (_jsonrpc_argv,
+ *          send_curl_command via _with_validated_endpoint_and_terminator, and
+ *          send_vcomponent_command) - the option terminator "--" precedes the URL in every
+ *          argument list that is executed: the command definitions in HdmiCECSink_Curl.py carry
+ *          it, _with_validated_endpoint_and_terminator places it in every argv send_curl_command
+ *          dispatches, and _with_option_terminator inserts it in _run_curl for any argv that
+ *          still lacks one. Both insertions are idempotent, so an argv that already carries a
+ *          bare terminator is executed with its tokens untouched. Every invocation is bounded in
+ *          time and in bytes, and a non-zero curl exit status is always reported as a failure
+ *          rather than reinterpreted as a success.
  *
  * @precondition
  *  - A device under test - physical hardware or a QEMU target - is hosting the
@@ -38,7 +45,7 @@
  *    authored for device-level execution.
  *
  * @dependencies
- *  - Standard Python libraries: os, json, selectors, shlex, stat, subprocess, time, re,
+ *  - Standard Python libraries: os, errno, json, selectors, shlex, stat, subprocess, time, re,
  *    collections, pathlib, urllib.parse
  *
  * @expected_result
@@ -56,6 +63,7 @@
 """
 
 import os
+import errno
 import json
 import selectors
 import shlex
@@ -201,8 +209,11 @@ HDMICEC_CMD_BASE = os.environ.get("HDMICEC_CMD_BASE") or _pick_existing_dir(
 # an endpoint such as "--config=/tmp/attacker.curlrc" would make curl load a caller-chosen
 # configuration and retarget the request; and an endpoint carrying whitespace or shell
 # metacharacters is never a legitimate URL. Both are refused here, before any request is
-# built, and every argument list additionally places the "--" option terminator immediately
-# before the URL so that no endpoint can ever be interpreted as an option.
+# built. A second, positional layer sits behind that one: the "--" option terminator is placed
+# immediately before the URL in every argument list this suite executes - the command definitions
+# in HdmiCECSink_Curl.py and the lists built below carry it, and _with_option_terminator() inserts
+# it in _run_curl for any argv that arrives without one - so an endpoint that somehow reached an
+# argv unvalidated still cannot be interpreted as an option.
 _ALLOWED_URL_SCHEMES = ("http", "https")
 
 # Characters that cannot appear in a legitimate absolute URL (they must be percent-encoded).
@@ -220,7 +231,11 @@ def _validate_endpoint(url, label):
     credentials, no leading dash, and no character that could split the argument or reach a
     shell. Called once per endpoint at import time so a hostile or malformed override fails
     immediately and loudly, and again inside every transport helper so that a value replaced
-    at run time cannot bypass the check.
+    at run time cannot bypass the check. Those helpers are exactly three, and each calls this
+    function on the endpoint it is about to dispatch: _jsonrpc_argv (send_jsonrpc_command),
+    _with_validated_endpoint_and_terminator (send_curl_command, and therefore every
+    HdmiCECSink_Curl.py command definition, send_jsonrpc_envelope and require_ack) and
+    send_vcomponent_command's _post_payload.
     Args:
         url: Candidate endpoint URL
         label: Name of the environment variable the value came from, used in the message
@@ -308,14 +323,20 @@ def _validate_endpoint(url, label):
 # here at import rather than by every request the suite would otherwise have gone on to make.
 # The range rule is therefore one rule with one meaning, whichever key expresses the endpoint.
 #
-# Two shapes are accepted that look odd and are deliberately allowed, so that the accepted set
-# is exactly what the README documents and no more:
-#   * a zero-padded port such as "007" - decimal, inside the range, and what the operator typed;
-#   * a host containing a hyphen anywhere, including first, such as "-evil". The hyphen is in
-#     the documented host charset, and a host can never be read by curl as an option because
-#     the value that reaches argv is the composed URL, which always begins "http". The
-#     leading-"-" prohibition applies to a whole endpoint override, and _validate_endpoint
-#     enforces it there.
+# Two shapes are ACCEPTED - not refused - that look odd, and they are allowed deliberately so
+# that the accepted set is exactly what the README documents and no more.  Both are stated as
+# acceptances rather than as rules, because reading either of them as a rejection would mean
+# believing in a guard that does not exist here:
+#   * a zero-padded port such as "007" IS ACCEPTED - decimal, inside the range, and what the
+#     operator typed;
+#   * a TARGET_HOST containing a hyphen anywhere, INCLUDING AS ITS FIRST CHARACTER, such as
+#     "-evil" or "--proxy", IS ACCEPTED.  The hyphen is in the documented host charset, and such
+#     a host cannot be read by curl as an option because the value that reaches argv is never the
+#     host: it is the COMPOSED URL, which always begins "http" - "http://-evil:9998/jsonrpc" is a
+#     URL to curl, not an option - and the transport additionally places the "--" option
+#     terminator immediately before it (see _with_validated_endpoint_and_terminator).  The
+#     leading-"-" PROHIBITION applies to a whole endpoint override, not to a host, and
+#     _validate_endpoint is what enforces it there.
 #
 # The transport is argv-based (see send_curl_command and _run_curl: no shell is ever
 # involved), so this is fail-closed input hygiene rather than the primary injection control -
@@ -921,6 +942,51 @@ def _hardened_curl_argv(argv):
     return [argv[0]] + prefix + argv[1:]
 
 
+def _with_option_terminator(argv):
+    '''Return argv with "--" immediately before its trailing URL, when that is what is missing.
+
+    curl reads any argument beginning with "-" as an OPTION, so a URL is only GUARANTEED to be
+    read as an operand when the "--" terminator precedes it.  Two independent layers are wanted
+    rather than one: _validate_endpoint refuses an endpoint that begins with "-" - and one
+    carrying whitespace, a shell metacharacter, embedded credentials or a non-http scheme -
+    before any request is built, and this function makes the guarantee POSITIONAL as well, so a
+    value that reached an argv without passing that validation still cannot be read as an option.
+
+    This is where the guarantee is established for EVERY invocation rather than per argv builder.
+    utils' own lists (_jsonrpc_argv, send_vcomponent_command) and the 33 command definitions in
+    HdmiCECSink_Curl.py each carry their own "--"; this function is what makes an argv assembled
+    anywhere else - a hand-built list, a command copied from a run log, a definition added later
+    that forgets the terminator - carry one too, because _run_curl applies it to everything it
+    executes.
+
+    It DECLINES to insert, returning the argv untouched, in exactly the three cases where
+    inserting would change what curl is being asked to do:
+      * the argv already carries a bare "--".  The caller placed its own terminator, and curl
+        reads a second one as a URL.
+      * the final token is not an http(s) URL.  There is no trailing endpoint to protect, and
+        this function does not guess where the operand is.
+      * the token before the final one begins with "-".  The URL-shaped token may be that
+        option's VALUE ("curl -d http://x" posts a body, it does not name an endpoint), and
+        separating an option from its value would corrupt the request rather than harden it.
+    Idempotent: applying it to its own output is a no-op, because the first application leaves a
+    bare "--" behind.
+    Args:
+        argv: A curl argument list, normally already hardened by _hardened_curl_argv
+    Returns:
+        argv with "--" inserted immediately before its final token, or argv unchanged when one of
+        the three cases above applies
+    '''
+    argv = [str(token) for token in argv]
+    if len(argv) < 2 or "--" in argv:
+        return argv
+    url = argv[-1]
+    if not url.lower().startswith(("http://", "https://")):
+        return argv
+    if argv[-2].startswith("-"):
+        return argv
+    return argv[:-1] + ["--", url]
+
+
 def _run_curl(argv, timeout, input_bytes=None):
     '''Run curl as an argument list with no shell, bounded in time AND in bytes.
 
@@ -932,13 +998,20 @@ def _run_curl(argv, timeout, input_bytes=None):
     invocation gets "-q" as its first parameter, "--noproxy '*'", and a minimal explicit
     environment.  See the block above this function for what each of those excludes and why.
 
+    And it is where the "--" option terminator is guaranteed rather than assumed.  Every argv
+    this suite hands over already carries one, but "every caller remembered" is not a property
+    anything checks, so _with_option_terminator inserts it here for any argv that does not - which
+    makes "the URL is read as an operand, never as an option" true of whatever is executed rather
+    than only of the lists this suite happens to ship today.
+
     The response is read through _pump_child, which stops at _MAX_RESPONSE_BYTES and kills the
     child rather than accumulating whatever an endpoint chooses to send.  An overflow is
     reported as a FAILURE with its own diagnostic: a truncated body is not an answer, and
     handing back the first megabyte of a stream as though it were a response would let a
     hostile endpoint decide what this suite believes.
     Args:
-        argv: Complete argument list, already carrying "--" before its URL where applicable
+        argv: Complete argument list.  "--" before its URL is ensured here rather than required
+              from the caller, and an argv that already carries one is left exactly as it is
         timeout: curl --max-time budget in seconds, also used to bound the read loop
         input_bytes: Optional request body delivered on curl's stdin
     Returns:
@@ -951,6 +1024,9 @@ def _run_curl(argv, timeout, input_bytes=None):
         argv = _hardened_curl_argv(argv)
     except ValueError as exc:
         return False, None, "", f"curl could not be executed: {exc}"
+    # After the hardening prefix, so "-q" and "--noproxy '*'" stay in front of the terminator
+    # where curl still reads them as options.
+    argv = _with_option_terminator(argv)
     try:
         proc = subprocess.Popen(
             argv,
@@ -1449,6 +1525,53 @@ def _with_http_status_write_out(argv):
     return [argv[0], "-w", _HTTP_CODE_WRITE_OUT] + list(argv[1:])
 
 
+def _with_validated_endpoint_and_terminator(argv):
+    '''Re-validate the endpoint an argv carries and put "--" immediately before it.
+
+    THE TWO INVARIANTS THIS FUNCTION MAKES TRUE FOR THE COMMAND-DEFINITION PATH.  _jsonrpc_argv
+    and send_vcomponent_command both build their own argv and both already do these two things.
+    The third transport path - send_curl_command, which dispatches the constants published by
+    HdmiCECSink_Curl.py - did neither: it split or copied the command and handed it straight to
+    curl.  So the module header's claim that "the option terminator '--' precedes every URL", and
+    _validate_endpoint's claim that it runs "again inside every transport helper", were true of
+    two paths out of three.  Both are true of all three now, and they are applied HERE rather
+    than restated in 30 command constants so a new constant, or a hand-written argv from a
+    caller, inherits them without having to remember anything.
+
+    WHY THE LAST ELEMENT IS THE ENDPOINT.  That is this suite's published command contract -
+    HdmiCECSink_Curl.py states it as a pass criterion ("one argument per list element and the
+    endpoint last") and every one of its 30 definitions ends with WPEFRAMEWORK_JSONRPC_URL.  It
+    is also checked rather than assumed: the element is passed through _validate_endpoint, so an
+    argv whose last element is not a plain http/https endpoint raises ValueError and the caller
+    reports a failure instead of executing something unexpected.
+
+    WHAT "--" BUYS ON TOP OF THAT VALIDATION.  Validation already refuses a value beginning with
+    "-", so the terminator is a second, independent measure rather than the only one: it means
+    the endpoint is positional BY CONSTRUCTION, so no future edit to the flags in front of it can
+    turn it into the argument of a preceding option, and nothing curl gains in a later version can
+    reinterpret it as one.
+
+    Idempotent: an argv that already carries a bare "--" is returned with its endpoint validated
+    and its tokens untouched, so passing a command through here twice changes nothing.
+    Args:
+        argv: Complete argument list, endpoint last
+    Returns:
+        A new argv list with "--" immediately before the endpoint.
+    Raises:
+        ValueError: when the argv is too short to carry an endpoint, or its last element is not
+                    an endpoint this module accepts.
+    '''
+    argv = [str(token) for token in argv]
+    if len(argv) < 2:
+        raise ValueError(
+            "curl command carries no endpoint to dispatch: " + " ".join(argv) or "empty"
+        )
+    _validate_endpoint(argv[-1], "the endpoint in this curl command")
+    if "--" in argv[:-1]:
+        return argv
+    return argv[:-1] + ["--", argv[-1]]
+
+
 def send_curl_command(curl_command, timeout=None):
     '''Run a curl command and return its JSON-RPC response line as a string.
 
@@ -1533,6 +1656,13 @@ def send_curl_command(curl_command, timeout=None):
             raise ValueError("empty curl command")
 
         expected_id = _request_id_from_argv(argv)
+        # The endpoint is re-validated and made positional HERE, on the same terms the other two
+        # transport helpers already applied to their own argv.  Both are applied before -w and
+        # before _run_curl's "-q"/"--noproxy" prefix, all of which insert immediately after the
+        # binary, so the terminator stays immediately in front of the endpoint whatever else is
+        # added in front of it.  A ValueError from either lands in the handler below, which
+        # already documents "an endpoint this module refuses" as one of its cases.
+        argv = _with_validated_endpoint_and_terminator(argv)
         argv = _with_http_status_write_out(argv)
 
         # Bounded in time AND in bytes by _run_curl, which reads incrementally and kills the
@@ -1731,6 +1861,10 @@ def _read_payload(path):
 
       * O_NOFOLLOW makes the open itself fail with ELOOP if the final component is a symbolic
         link, so a link swapped in after the name checks is refused rather than followed.
+      * O_NONBLOCK stops the open itself from blocking on a named pipe: a FIFO opened read-only
+        without it waits in open() until a writer appears, so a FIFO swapped in after the name
+        checks would hang the suite BEFORE the fstat below could refuse it.  With it, the open
+        returns and the S_ISREG check does the refusing.  On a regular file it changes nothing.
       * O_CLOEXEC keeps the descriptor out of the curl this module is about to spawn; the
         payload is delivered on curl's stdin, so curl has no business holding the file too.
       * fstat on the open descriptor - not stat on the path - confirms it is a regular file and
@@ -1743,7 +1877,7 @@ def _read_payload(path):
     a (0, diagnostic) result rather than a post.
     '''
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as exc:
         # ELOOP here is the interesting one: it means a symbolic link now stands at a path this
         # module had already accepted as a regular file.
@@ -1781,6 +1915,81 @@ def _read_payload(path):
         os.close(fd)
 
     return b"".join(chunks)
+
+
+def read_fixture_text(path, max_bytes=_VCOMPONENT_MAX_PAYLOAD_BYTES):
+    '''Read a vComponent fixture as text through ONE descriptor opened with O_NOFOLLOW.
+
+    WHY THIS EXISTS ALONGSIDE _read_payload.  _read_payload is for a document about to be POSTED
+    to the vComponent endpoint, so it also insists the path resolve inside an approved root.
+    Several places instead read a fixture only to DERIVE AN EXPECTATION from it - the seed
+    payload verifier and the topology cross-check in Init_Devicelist_Populate, and the power-status
+    byte TCID24 asserts on - and those used a plain open(), which follows a symbolic link at the
+    final component.  Nothing is posted and no trust boundary is crossed there (the paths are ones
+    the suite itself wrote), so this was hardening rather than a hole; but the module states a
+    posture of opening fixtures with O_NOFOLLOW and validating the descriptor, and a read that
+    quietly does otherwise makes that statement false. One helper, used by all four call sites,
+    keeps the posture and the code in step.
+
+    The guarantees, in the same order _read_payload establishes them:
+      * O_NOFOLLOW makes the open itself fail with ELOOP when the final component is a symbolic
+        link, so a link swapped in for a fixture is refused rather than followed;
+      * O_NONBLOCK is what makes the S_ISREG check below reachable AT ALL for a named pipe:
+        opening a FIFO read-only WITHOUT it blocks in open() until a writer appears, so a FIFO
+        planted where a fixture belongs would hang this suite for ever before any check ran -
+        measured, not theorised (an earlier draft of this helper hung on exactly that).  On a
+        regular file it has no effect on the reads below;
+      * O_CLOEXEC keeps the descriptor out of any child this suite spawns;
+      * fstat on the OPEN DESCRIPTOR - not stat on the path - confirms it is a regular file, so a
+        FIFO or a directory standing at the path is refused rather than read;
+      * the read is bounded and re-checked as it goes, because st_size is a snapshot a concurrent
+        writer can grow underneath the loop.
+
+    Every refusal is raised as an OSError, which is exactly what a plain open() would have raised
+    for an unreadable path - so the existing `except OSError` at each call site reports it with
+    the message it already had, and no call site had to change its error handling.
+    Args:
+        path: Absolute path of the fixture to read
+        max_bytes: Ceiling on the bytes read, defaulting to the vComponent payload cap
+    Returns:
+        The file's contents decoded as UTF-8 text.
+    Raises:
+        OSError: when the path cannot be opened safely (ELOOP for a symlink), is not a regular
+                 file, or exceeds the ceiling.
+        UnicodeDecodeError: when the bytes are not valid UTF-8, as a text-mode open() would.
+    '''
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(
+                errno.EINVAL,
+                f"not a regular file (mode {info.st_mode:o}); refusing to read it as a fixture",
+                path,
+            )
+        if info.st_size > max_bytes:
+            raise OSError(
+                errno.EFBIG,
+                f"{info.st_size} bytes, larger than the {max_bytes} byte fixture ceiling",
+                path,
+            )
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError(
+                    errno.EFBIG,
+                    f"grew past the {max_bytes} byte fixture ceiling while being read",
+                    path,
+                )
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
 
 
 def send_vcomponent_command(yaml_file_path, timeout=10):

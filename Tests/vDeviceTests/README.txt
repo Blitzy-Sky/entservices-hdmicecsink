@@ -249,9 +249,11 @@ Static validation applied to the suite:
 - A suite-manager registration check of the tests list in SuitManager.py against the test
   case modules on disk under Testcases/, applied in both directions, so that neither a
   registered module missing from disk nor an unregistered module on disk goes unnoticed.
-- SuitManager.load_test_cases(), which imports every registered module, binds its run_test and
-  refuses a non-callable cleanup - so a module that imports but publishes no entry point is a
-  startup error rather than a silent skip - together with resolve_dependencies().
+- SuitManager.load_test_cases(), which refuses a duplicate registration before importing
+  anything - order is load-bearing here, and a case registered twice would run twice while
+  restoring once - then imports every registered module, binds its run_test and refuses a
+  non-callable cleanup, so a module that imports but publishes no entry point is a startup error
+  rather than a silent skip. Run together with resolve_dependencies().
 - A symbol-resolution sweep: every HdmiCECSink_Curl attribute and every name imported from
   utils by a test case is checked to exist in the module it is taken from. Python resolves a
   module attribute only when it is used, so an unresolvable name would otherwise survive import

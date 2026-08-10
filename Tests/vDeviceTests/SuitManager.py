@@ -203,16 +203,26 @@ SUITES = {
 # handled in two different ways, only one of which is a restoration:
 #   * RESTORED AT THE SOURCE. TCID28 and TCID29 capture the vendor identifier and the OSD name on
 #     entry and put them back in their cleanup() hooks; TCID31 restores the enabled flag the same
-#     way; TCID17 and TCID19 restore the active source and the route they arranged; TCID21 takes
-#     ARC back down. Those six modules are the ones that publish a cleanup(), and their residuals
-#     therefore do not reach a later case at all.
+#     way; TCID17 puts the active source back where it found it and TCID19 does the same for the
+#     route; TCID18 reproduces whichever of the three entry states it captured for the active
+#     source, confirming each by re-reading it; TCID21 takes ARC back down; TCID27 detaches the
+#     peer it attached and confirms the emulated topology is back; TCID33 re-declares the topology
+#     its sweep walked and confirms the plugin still answers. The set of modules that publish a
+#     cleanup() is exactly the set of RESTORES_ITSELF entries in RESTORATION_CONTRACT below, and
+#     this list is that set - not an independent count that could fall behind it. The identity is
+#     held by enforce_restoration_contract(), which refuses a cleanup() the registry does not
+#     record as RESTORES_ITSELF and refuses a RESTORES_ITSELF entry that publishes no callable
+#     cleanup(), so a hook added or removed without updating the registry is a start-up failure
+#     rather than a stale sentence here. Their residuals do not reach a later case at all.
 #   * DECLARED, NOT RESTORED, because no inverse operation exists to call.
-#     TCID15_Send_Standby_Message broadcasts <Standby> and the interface publishes no wake;
-#     TCID18_Set_Active_Source_Flow deliberately leaves the television holding the active source,
-#     which TCID19 then overwrites as its own first act; TCID33 leaves the topology as its sweep
-#     left it and runs last so nothing inherits it. Each of those modules names its residual in its
-#     own documentation. They are not edges in this map because the later case does not REQUIRE the
-#     residual - it re-establishes what it needs - and an edge would claim a dependency that the
+#     TCID15_Send_Standby_Message broadcasts <Standby> and the sink's command surface publishes no
+#     wake to undo it, which that module states in its own documentation rather than leaving to be
+#     inferred. It is the only case in this position: every other module that leaves a residual
+#     either restores it in its own hook (the bullet above) or is named in
+#     UNCLASSIFIED_MUTATING_CASES below, where the boundary of what has been established is
+#     declared and enforced. TCID15 is not an edge in this map because the later cases do not
+#     REQUIRE its residual - each re-establishes what it needs, TCID25 by re-issuing the two
+#     view-on documents in its own finally clause - and an edge would claim a dependency that the
 #     consumer disclaims.
 #
 # A producer must be registered EARLIER than its consumer in "tests"; resolve_dependencies()
@@ -286,6 +296,10 @@ def load_test_cases(suite_name):
         execution order.
     Raises:
         KeyError: suite_name is not a registered suite.
+        ValueError: the suite registers the same module more than once. Checked before anything
+            is imported, because a duplicate is invisible everywhere else: importlib returns the
+            cached module, enforce_restoration_contract() compares SETS and so cannot see a
+            repeat, and the runner would simply run the case twice.
         ImportError: a registered module is missing from the suite's Testcases/ directory or
             fails while being imported. This is deliberate - a silently skipped test case
             would misreport the suite as complete.
@@ -297,6 +311,25 @@ def load_test_cases(suite_name):
     suite_config = SUITES[suite_name]
     module_dir = str(suite_config["module_dir"])
 
+    # A DUPLICATE REGISTRATION IS REFUSED HERE, BEFORE ANY MODULE IS IMPORTED.
+    #
+    # Order is load-bearing in this suite - TCID12 reads back what TCID11 wrote, TCID21 restores
+    # what TCID20 left up, TCID31 restores what TCID30 disabled - so a case registered twice is
+    # not a harmless repetition. Its run_test() would execute at two positions, and cleanup() is
+    # called once per registration, so a mutating case would restore state that a later copy of
+    # itself then disturbs again, and the suite summary would report a total that does not match
+    # the registered set. Nothing else in this file can see it: importlib hands back the cached
+    # module the second time, and enforce_restoration_contract() reasons over sets.
+    registered = list(suite_config["tests"])
+    duplicated = sorted({name for name in registered if registered.count(name) > 1})
+    if duplicated:
+        raise ValueError(
+            f"suite {suite_name!r} registers duplicate test case(s), each appearing more than "
+            "once in its \"tests\" list: " + ", ".join(duplicated)
+            + " - remove the duplicate, because order is load-bearing here and each registration "
+            "gets its own run_test() call and its own cleanup() call"
+        )
+
     # Putting the Testcases/ directory on sys.path is what lets the modules be imported by
     # bare name, which is why this tree needs no __init__.py and is not a package. Guarding
     # the insert keeps sys.path free of duplicates when a caller loads a suite more than once.
@@ -305,7 +338,7 @@ def load_test_cases(suite_name):
 
     test_cases = []
     modules = {}
-    for module_name in suite_config["tests"]:
+    for module_name in registered:
         module = importlib.import_module(module_name)
         modules[module_name] = module
         cleanup_fn = getattr(module, "cleanup", None)
@@ -359,8 +392,11 @@ RESTORES_ITSELF = "__self__"
 READ_ONLY = "__read_only__"
 
 RESTORATION_CONTRACT = {
-    # Read-only probes: no setter, no vComponent post. Verified by inspection of every call site
-    # and re-checked by the guards below.
+    # Read-only probes: no setter, no vComponent post. That property was established by inspection
+    # of every call site in these ten modules, and inspection is all it rests on - what the guards
+    # below re-check is its COMPLEMENT, a READ_ONLY module that publishes a cleanup() or names a
+    # restorer, either of which contradicts the classification. A setter added to one of these
+    # modules later would not be caught at start-up, so it has to be caught in review.
     "TCID01_Get_Enabled_Status": READ_ONLY,
     "TCID02_Get_Devicelist": READ_ONLY,
     "TCID03_Get_OSD_Name": READ_ONLY,

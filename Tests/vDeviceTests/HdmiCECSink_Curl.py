@@ -14,13 +14,23 @@
  *          execution and does not start or emulate their required services.
  *
  *          The constants are INERT DATA, never shell input. utils.send_curl_command
- *          splits whichever constant it is given into an argv list and executes it with
- *          subprocess.run and no shell, so the WPEFRAMEWORK_JSONRPC_URL appended below -
+ *          takes whichever constant it is given as an argv list and executes it in a
+ *          bounded subprocess with no shell, so the WPEFRAMEWORK_JSONRPC_URL appended below -
  *          which comes from the environment - is passed to curl as a single argument and
  *          can never be interpreted as shell syntax. utils.py additionally rejects any
  *          endpoint override carrying whitespace or a shell metacharacter before
  *          publishing it. Do not reintroduce os.popen, os.system or shell=True for these
  *          strings, and do not build a command line from them by concatenation.
+ *
+ *          THE "--" BEFORE EVERY URL IS LOAD-BEARING, NOT DECORATION. curl reads any
+ *          argument beginning with "-" as an OPTION, so an endpoint is only guaranteed to
+ *          be read as an operand when the option terminator precedes it. Every constant
+ *          below therefore carries "--" as its second-to-last element, immediately before
+ *          WPEFRAMEWORK_JSONRPC_URL. utils._run_curl inserts the same terminator into any
+ *          argv that reaches it without one, so the guarantee holds for the whole suite
+ *          rather than only for the lists in this file - but keep it here as well, because
+ *          a definition that carries its own terminator states the intent where the reader
+ *          of the definition can see it. When adding a constant, place "--" last but one.
  *
  * @precondition
  *  - utils.py resolves WPEFRAMEWORK_JSONRPC_URL to a reachable WPEFramework endpoint.
@@ -41,7 +51,8 @@
  *
  * @pass_criteria
  *  - Each constant preserves its specified method, payload, timeout, and shared URL,
- *    with one argument per list element and the endpoint last.
+ *    with one argument per list element, the "--" option terminator last but one, and
+ *    the endpoint last.
  *
  * @failure_criteria
  *  - A definition names the wrong method, carries the wrong payload, or its consuming test
@@ -58,6 +69,7 @@ get_active_route = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.getActiveRoute"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -68,6 +80,7 @@ get_active_source = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.getActiveSource"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -78,6 +91,7 @@ get_audio_device_connected_status = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.getAudioDeviceConnectedStatus"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -88,6 +102,7 @@ get_device_list = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.getDeviceList"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -98,6 +113,7 @@ get_enabled = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.getEnabled"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -108,6 +124,7 @@ get_osd_name = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.getOSDName"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -118,6 +135,7 @@ get_vendor_id = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.getVendorId"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -163,6 +181,7 @@ print_device_list = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.printDeviceList"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -173,6 +192,7 @@ request_active_source = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.requestActiveSource"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -183,6 +203,7 @@ request_short_audio_descriptor = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.requestShortAudioDescriptor"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -193,6 +214,7 @@ request_audio_device_power_status = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.requestAudioDevicePowerStatus"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -203,6 +225,7 @@ send_audio_device_power_on_message = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.sendAudioDevicePowerOnMessage"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -213,6 +236,7 @@ send_get_audio_status_message = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.sendGetAudioStatusMessage"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -223,6 +247,7 @@ send_standby_message = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.sendStandbyMessage"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -233,6 +258,7 @@ set_active_source = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setActiveSource"}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -280,6 +306,7 @@ send_key_press_event = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.sendKeyPressEvent","params":{"logicalAddress":5,"keyCode":65}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -290,6 +317,7 @@ send_user_control_pressed = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.sendUserControlPressed","params":{"logicalAddress":5,"keyCode":65}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -300,6 +328,7 @@ send_user_control_released = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.sendUserControlReleased","params":{"logicalAddress":5}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -310,6 +339,7 @@ set_active_path = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setActivePath","params":{"activePath":"1.0.0.0"}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -320,6 +350,7 @@ set_enabled_true = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setEnabled","params":{"enabled":true}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -330,6 +361,7 @@ set_enabled_false = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setEnabled","params":{"enabled":false}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -340,6 +372,7 @@ set_menu_language = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setMenuLanguage","params":{"language":"eng"}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -367,6 +400,7 @@ set_osd_name = [
     "-d",
     '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setOSDName","params":'
     f'{{"name":"{SET_OSD_NAME_VALUE}"}}}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -416,6 +450,7 @@ def _set_routing_change_request(old_port, new_port):
         "-d",
         '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setRoutingChange","params":'
         f'{{"oldPort":"{old_port}","newPort":"{new_port}"}}}}',
+        "--",
         WPEFRAMEWORK_JSONRPC_URL,
     ]
 
@@ -443,6 +478,7 @@ setup_arc_routing_true = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setupARCRouting","params":{"enabled":true}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -453,6 +489,7 @@ setup_arc_routing_false = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setupARCRouting","params":{"enabled":false}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -481,6 +518,7 @@ set_vendor_id = [
     "-d",
     '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setVendorId","params":'
     f'{{"vendorid":"{SET_VENDOR_ID_VALUE}"}}}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -491,6 +529,7 @@ set_latency_info = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setLatencyInfo","params":{"videoLatency":"2","lowLatencyMode":"1","audioOutputCompensated":"1","audioOutputDelay":"20"}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -501,6 +540,7 @@ set_vendor_id_invalid = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setVendorId","params":{"vllendorid":"0x0019FB"}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -511,6 +551,7 @@ set_osd_name_invalid = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setOSDName","params":{"nnamme":"Sky TV"}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]
 
@@ -521,5 +562,6 @@ setup_arc_routing_invalid = [
     "--header", "Content-Type: application/json",
     "--request", "POST",
     "-d", '{"jsonrpc":"2.0","id":42,"method":"org.rdk.HdmiCecSink.setupARCRouting","params":{"ennabled":true}}',
+    "--",
     WPEFRAMEWORK_JSONRPC_URL,
 ]

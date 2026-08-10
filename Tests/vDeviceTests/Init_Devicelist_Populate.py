@@ -86,6 +86,7 @@ import time
 
 from utils import (
     await_plugin_ready,
+    read_fixture_text,
     send_curl_command,
     send_vcomponent_command,
     HDMICEC_CMD_BASE,
@@ -804,8 +805,11 @@ def verify_seed_payload_consistency():
     def header_and_operands(yaml_name):
         path = os.path.join(HDMICEC_CMD_BASE, yaml_name)
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                text = handle.read()
+            # utils.read_fixture_text opens with O_NOFOLLOW|O_CLOEXEC and fstats the descriptor,
+            # so a symbolic link or a FIFO standing where a fixture should be is refused rather
+            # than followed or blocked on.  It raises OSError for every refusal, which is what
+            # the handler below already reports.
+            text = read_fixture_text(path)
         except OSError as exc:
             return None, None, f"cannot read {yaml_name}: {exc}"
         match = header_pattern.search(text)
@@ -953,8 +957,8 @@ def verify_topology_consistency():
         _name, _network_type, expected_type_byte, expected_address = EXPECTED_TOPOLOGY[la]
         path = os.path.join(HDMICEC_CMD_BASE, rpa_yaml)
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                text = handle.read()
+            # Same hardened read as above: O_NOFOLLOW plus an fstat on the open descriptor.
+            text = read_fixture_text(path)
         except OSError as exc:
             problems.append(f"LA={la} ({expected_name}): cannot read {rpa_yaml}: {exc}")
             continue
@@ -1000,11 +1004,11 @@ def verify_topology_consistency():
     # in prose cannot be mistaken for a declared one.
     config_path = os.path.join(HDMICEC_CMD_BASE, TOPOLOGY_CONFIG_YAML)
     try:
-        with open(config_path, "r", encoding="utf-8") as handle:
-            config_lines = [
-                line for line in handle.read().splitlines()
-                if not line.lstrip().startswith("#")
-            ]
+        # Same hardened read as above: O_NOFOLLOW plus an fstat on the open descriptor.
+        config_lines = [
+            line for line in read_fixture_text(config_path).splitlines()
+            if not line.lstrip().startswith("#")
+        ]
     except OSError as exc:
         problems.append(f"cannot read {TOPOLOGY_CONFIG_YAML}: {exc}")
         config_lines = []
