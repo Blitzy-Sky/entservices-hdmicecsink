@@ -7942,3 +7942,217 @@ TEST_F(HdmiCecSink_L2Test, PluginRefusesToActivateUnderANonSinkProfile)
     EXPECT_EQ(Core::ERROR_OPENING_FAILED, absentStatus)
         << "an absent device.properties must fail activation; status was " << absentStatus;
 }
+
+/**
+ * @brief The activated plugin answers QueryInterface for PluginHost::IPlugin and reports its
+ *        Information() string over COM-RPC.
+ *
+ * COVERAGE_GAPS.md traceability: gap-plugin-sink-information (HdmiCecSink::Information,
+ * entservices-hdmicecsink/plugin/HdmiCecSink.cpp:166-169).
+ *
+ * WHY THIS CASE EXISTS AT L2 AT ALL, since nothing in the host ever calls the method.
+ * PluginHost::IPlugin::Information() is declared pure virtual at Thunder/Source/plugins/IPlugin.h:97
+ * and is called NOWHERE in Thunder R4.4.1 - a grep of Thunder/Source finds only the Controller's own
+ * override (Controller.cpp:176).  So no amount of activating, deactivating or driving the plugin
+ * reaches it, and the two instrumented lines of this plugin's override were the whole of the
+ * difference between this file's L2 figure and the 80% bar: 46/59 = 78.0% without them, 48/59 =
+ * 81.4% with them.
+ *
+ * It is reachable, though, and by a route that is ordinary rather than contrived.  The plugin
+ * publishes INTERFACE_ENTRY(PluginHost::IPlugin) (HdmiCecSink.h:257-261);
+ * Server::Service::QueryInterface forwards any id that is not IUnknown or IShell to the plugin
+ * handler (Thunder/Source/WPEFramework/PluginServer.cpp:277-301); and Thunder's generated
+ * ProxyStubs_Plugin.cpp marshals Information() across COM-RPC.  The fixture already holds a
+ * PluginHost::IShell for this callsign, acquired the same way every COM-RPC case in this file
+ * acquires its interface, so asking that shell for IPlugin is one QueryInterface away.  What the
+ * case therefore asserts is a real contract of the running plugin - that its IPlugin facet is
+ * reachable over COM-RPC and describes itself - and it happens to be the only route production
+ * offers to those two lines.
+ *
+ * NOT asserted: the literal sentence.  The text is prose that a maintainer may legitimately reword
+ * (it currently carries a "PLugin" typo, which is production's to fix, not a test's to enshrine), so
+ * the assertions are the invariants that must hold whatever the wording: the call succeeds, the
+ * string is not empty, and it names the plugin it describes.  The string itself is logged so a
+ * reader of the run can see exactly what was returned.
+ */
+TEST_F(HdmiCecSink_L2Test, PluginShellExposesIPluginAndReportsItsInformationString)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_controller_cecSink);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    PluginHost::IPlugin* plugin = m_controller_cecSink->QueryInterface<PluginHost::IPlugin>();
+    ASSERT_NE(nullptr, plugin)
+        << "the activated org.rdk.HdmiCecSink shell did not answer QueryInterface for "
+           "PluginHost::IPlugin.  The plugin declares INTERFACE_ENTRY(PluginHost::IPlugin), so "
+           "either the interface map no longer publishes it or Thunder's IPlugin proxy-stub is "
+           "not installed - both of which would also break anything else that asks a plugin to "
+           "describe itself.";
+    // Bound to a scope so a failing expectation below cannot leak the reference: the far end holds
+    // a count for it, and a leaked count keeps the plugin alive past the deactivation that the
+    // profile-guard case performs later in this suite.
+    ScopedCleanup releasePlugin([&plugin]() {
+        if (plugin != nullptr) {
+            plugin->Release();
+            plugin = nullptr;
+        }
+    });
+
+    const string information = plugin->Information();
+    TEST_LOG("IPlugin::Information() returned: %s", information.c_str());
+    EXPECT_FALSE(information.empty())
+        << "IPlugin::Information() returned an empty string; the plugin describes itself to "
+           "anything that asks, so an empty description is a defect rather than a style choice.";
+    EXPECT_NE(string::npos, information.find(_T("HdmiCecSink")))
+        << "IPlugin::Information() does not name the plugin it describes; it returned: "
+        << information;
+}
+
+/**
+ * @brief An <Active Source> whose first physical-address byte matches an HDMI port drives
+ *        getActiveRoute's port walk into HdmiPortMap::getRoute, which still resolves no route.
+ *
+ * COVERAGE_GAPS.md traceability: gap-plugin-sink-portmap (HdmiCecSinkImplementation.h:351 getRoute)
+ * and gap-plugin-sink-getactiveroute (HdmiCecSinkImplementation.cpp:1958-1985).
+ *
+ * ADJACENT TO GetActiveRoute_COMRPC AND GetActiveRoute_JSONRPC, NOT A REWRITE OF EITHER.  Both of
+ * those pass and are untouched.  They call the accessor while no device is the active source, so
+ * GetActiveRoute takes its `available = false` arm at cpp:1532-1535 and getActiveRoute is never
+ * entered at all.  The four port-chain cases further up this file do reach getActiveRoute, but their
+ * announcements carry realistic addresses (1.0.0.0 packs to 0x10, 1.1.0.0 to 0x11), and the port walk
+ * at cpp:1979 compares that FIRST BYTE against m_portID + 1 - so it matches no port and
+ * HdmiPortMap::getRoute is never called from L2 by any of them.  Measured immediately before this
+ * case: HdmiCecSinkImplementation.h stood at 121/171 lines at L2 with :351, :353, :355 and :385 -
+ * getRoute's signature, its LOGINFO, its m_logicalAddr guard and its close - all unhit.
+ *
+ * WHY THE OPERAND IS 0x01, 0x02 AND NOT A DOTTED QUAD.  This is deliberate and it is the point of the
+ * case rather than a shortcut.  The shared CEC mock
+ * (entservices-testframework/Tests/mocks/HdmiCec.h) stores a frame-parsed PhysicalAddress as the RAW
+ * WIRE BYTES and returns getByteValue(index) = str[index], where ccec's real PhysicalAddress
+ * (hdmicec/ccec/include/ccec/Operands.hpp) returns the DIGIT at that index.  Production asks for
+ * digit 0 and the mock hands back byte 0.  The only operand that satisfies the port comparison under
+ * the mock's arithmetic is therefore one whose first byte IS 1, 2 or 3, and 0x01 0x02 is that operand
+ * for port 0.  It is a legal frame - the mock parses ActiveSource from operand offset 2
+ * (HdmiCec.h:880), unlike ReportPhysicalAddress which parses from offset 0 - and it is the ONLY frame
+ * shape that reaches the port walk's inner call at this level.  Choosing it exercises production's
+ * port walk; choosing a realistic address exercises the early exit that two other cases already
+ * cover.
+ *
+ * WHAT STILL CANNOT BE ASSERTED, and why that is not this case's failure.  getRoute's body is guarded
+ * on m_logicalAddr != UNREGISTERED (header:355), and a port can only learn its logical address
+ * through addChild's `physical_addr == m_physicalAddr` arm (header:320) - a two-byte frame-parsed
+ * address compared against a four-byte digit-built one, which can never be equal.  That is the
+ * BLOCKED analysis set out in full above the port-chain cases, together with the exact
+ * entservices-testframework change it would take to lift it.  So the route legitimately does not
+ * resolve, and the assertions below are the invariants that hold when it does not: both transports
+ * report success, no availability, no length and an empty route, and they agree with each other.
+ * The sink L1 suite covers getRoute's body directly, where both sides of that comparison are
+ * digit-built.
+ *
+ * ISOLATION.  m_currentActiveSource and deviceList[4].m_physicalAddr are process-global plugin state
+ * that outlives the test, so the case hands them back: it re-announces the same device at the
+ * realistic 1.0.0.0 the rest of this suite uses and confirms the read-back before returning.
+ */
+TEST_F(HdmiCecSink_L2Test, ActiveSourceWithPortMatchingAddressByteDrivesThePortMapRouteWalk)
+{
+    ASSERT_EQ(Core::ERROR_NONE, CreateHdmiCecSinkInterfaceObject());
+    ASSERT_NE(nullptr, m_controller_cecSink);
+    ASSERT_NE(nullptr, m_cecSinkPlugin);
+    ScopedCleanup releaseInterfaces([this]() {
+        if (m_cecSinkPlugin != nullptr) {
+            m_cecSinkPlugin->Release();
+            m_cecSinkPlugin = nullptr;
+        }
+        if (m_controller_cecSink != nullptr) {
+            m_controller_cecSink->Release();
+            m_controller_cecSink = nullptr;
+        }
+    });
+
+    ASSERT_TRUE(EnableCecAndAwaitFrameListener())
+        << "CEC could not be enabled, so no FrameListener was captured and nothing could be injected.";
+    ASSERT_FALSE(listeners.empty()) << "No FrameListener was captured.";
+
+    // Frame dispatch is synchronous on the calling thread: HdmiCecSinkFrameListener::notify runs
+    // MessageDecoder::decode inline and neither handler defers, so the state is in place by the time
+    // notify() returns and there is nothing to wait for.
+    const auto inject = [this](const std::vector<uint8_t>& bytes) {
+        CECFrame frame(bytes.data(), static_cast<size_t>(bytes.size()));
+        for (auto* listener : listeners) {
+            if (listener) {
+                EXPECT_NO_THROW(listener->notify(frame));
+            }
+        }
+    };
+
+    constexpr uint8_t kPlaybackDevice = 4;
+
+    // Restore first, register the restoration second: the re-announcement has to happen even if an
+    // assertion below fails, or every later case inherits the port-matching address.
+    ScopedCleanup restoreRealisticAddress([&inject, kPlaybackDevice]() {
+        inject(BroadcastFrameBytes(kPlaybackDevice, 0x82, { 0x10, 0x00 }));
+    });
+
+    // <Active Source> from the playback device, physical-address operand 0x01 0x02.  addDevice()
+    // registers it, updateActiveSource() records it as current and stores the operand as its
+    // physical address - which is what getActiveRoute reads back at cpp:1979.
+    inject(BroadcastFrameBytes(kPlaybackDevice, 0x82, { 0x01, 0x02 }));
+
+    {
+        JsonObject params, result;
+        ASSERT_EQ(Core::ERROR_NONE,
+            InvokeServiceMethod("org.rdk.HdmiCecSink", "getActiveSource", params, result));
+        ASSERT_TRUE(result.HasLabel("success") && result["success"].Boolean())
+            << "getActiveSource reported failure, so the announcement did not land and the route "
+               "query below would not be testing the port walk";
+        ASSERT_TRUE(result.HasLabel("available") && result["available"].Boolean())
+            << "no active source is recorded, so getActiveRoute would take its early-exit arm "
+               "instead of walking the ports";
+        ASSERT_TRUE(result.HasLabel("logicalAddress"));
+        EXPECT_EQ(static_cast<int>(kPlaybackDevice), static_cast<int>(result["logicalAddress"].Number()))
+            << "the active source is not the device this case announced";
+    }
+
+    // COM-RPC first, then the JSON-RPC wrapper over the same state: they are separate code paths and
+    // only comparing them catches one drifting from the other.
+    bool comAvailable = true;
+    bool comSuccess = false;
+    uint8_t comLength = 0xFF;
+    string comRoute = _T("unset");
+    Exchange::IHdmiCecSink::IHdmiCecSinkActivePathIterator* comPaths = nullptr;
+    EXPECT_EQ(Core::ERROR_NONE,
+        m_cecSinkPlugin->GetActiveRoute(comAvailable, comLength, comPaths, comRoute, comSuccess));
+    if (comPaths != nullptr) {
+        comPaths->Release();
+        comPaths = nullptr;
+    }
+    EXPECT_TRUE(comSuccess) << "GetActiveRoute reported failure over COM-RPC";
+    EXPECT_FALSE(comAvailable)
+        << "a route was reported as available; the port map cannot claim a port at L2 (see the "
+           "BLOCKED analysis above the port-chain cases), so this would mean the two "
+           "PhysicalAddress representations in the shared mock have been reconciled and this "
+           "case's expectations are now the weaker ones";
+    EXPECT_EQ(0, static_cast<int>(comLength)) << "no route resolved, so its length must be zero";
+    EXPECT_TRUE(comRoute.empty()) << "no route resolved, so the route string must be empty; got: " << comRoute;
+
+    {
+        JsonObject params, result;
+        EXPECT_EQ(Core::ERROR_NONE,
+            InvokeServiceMethod("org.rdk.HdmiCecSink", "getActiveRoute", params, result));
+        EXPECT_TRUE(result.HasLabel("success") && result["success"].Boolean())
+            << "getActiveRoute reported failure over JSON-RPC";
+        const bool jsonAvailable = result.HasLabel("available") && result["available"].Boolean();
+        EXPECT_EQ(comAvailable, jsonAvailable) << "availability differs across transports";
+        const string jsonRoute = result.HasLabel("ActiveRoute") ? result["ActiveRoute"].String() : string();
+        EXPECT_EQ(comRoute, jsonRoute) << "the route string differs across transports";
+    }
+}

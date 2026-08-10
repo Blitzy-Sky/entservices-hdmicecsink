@@ -43,8 +43,10 @@
  *          version would need a getCecVersion declaration on Exchange::IHdmiCecSink so
  *          ThunderTools generates the binding, plus a plugin implementation so Register()
  *          publishes it. Both are production changes, which AAP Directive 6 requires be reported
- *          instead. The sink L1 suite's DISABLED_getCecVersion has the same cause and stays
- *          disabled; this module neither repairs it nor claims to.
+ *          instead. The sink L1 suite's HdmiCecSinkInitializedEventDsTest.getCecVersion has the
+ *          same cause: it is enabled and passing, but it asserts the dispatcher's REFUSAL of the
+ *          name rather than a read-back, for exactly the reason above. This module neither
+ *          repairs that blocker nor claims to.
  *
  * @precondition
  *  - The org.rdk.HdmiCecSink plugin is active and reachable over the JSON-RPC endpoint.

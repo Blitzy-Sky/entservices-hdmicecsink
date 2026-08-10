@@ -319,9 +319,14 @@
 #      instrumented line comes from the module-declaration macro and is reachable only
 #      through a real Thunder plugin load that the in-process L1 model never performs -- and
 #      which is hit at L2, measured at 1/1, so the waiver is scoped to L1 alone; and
-#      plugin/HdmiCecSink.cpp at L2 (L2_GATE_EXEMPT), whose thirteen remaining lines are
-#      unreachable from the L2 execution model and are all covered by this repository's own
-#      L1 suite.  Both keep their real figures and stay in the denominator.
+#      plugin/HdmiCecSinkImplementation.h at L2 (L2_GATE_EXEMPT), whose 46 remaining lines
+#      are the HdmiPortMap bodies and the two notification-sink lifecycles that no L2 test
+#      can reach through the shared out-of-scope CEC mock, enumerated line by line at that
+#      array, and all of which this repository's own L1 suite covers -- it measures the same
+#      header at 100.0% (172/172).  Both keep their real figures and stay in the denominator.
+#      plugin/HdmiCecSink.cpp was L2_GATE_EXEMPT until the QA-remediation pass; the COM-RPC
+#      IPlugin/Information() case added there lifted it from 46/59 to 48/59 = 81.4%, so its
+#      waiver was REMOVED and it is gated normally now, with an L2 floor at that 81.4%.
 #  A red suite under a green coverage number is worthless, so a non-zero exit from a test
 #  binary fails this script immediately -- the test invocation is never `|| true`'d.  Nor is
 #  a zero exit taken on trust.  The observed false pass that motivated this: in a tree built
@@ -345,22 +350,28 @@
 #          HdmiCecSink.h 99.2% (127/128), HdmiCecSinkImplementation.cpp 84.0% (1487/1771),
 #          HdmiCecSinkImplementation.h 100.0% (172/172); plugin/Module.cpp exempt at 0/1.
 #          `l1` exits 0.
-#      L2: 130 tests green across two shards, aggregate 81.2% (1730/2130).
-#          HdmiCecSink.h 93.8% (120/128), HdmiCecSinkImplementation.cpp 81.4% (1442/1771),
-#          Module.cpp 100.0% (1/1); plugin/HdmiCecSink.cpp exempt at its 78.0% (46/59) ceiling
-#          and plugin/HdmiCecSinkImplementation.h exempt at 70.8% (121/171) for the reason given
-#          with the L2 floors below.  `l2` exits 0.
+#      L2: 132 tests green across two shards (66 + 66), aggregate 81.5% (1737/2130), functions
+#          88.3% (203/230), branches 43.9% (1341/3053).  HdmiCecSink.cpp 81.4% (48/59) -- GATED,
+#          not exempt, since the QA-remediation pass took it over the bar -- HdmiCecSink.h 93.8%
+#          (120/128), HdmiCecSinkImplementation.cpp 81.5% (1443/1771), Module.cpp 100.0% (1/1);
+#          plugin/HdmiCecSinkImplementation.h is the ONE remaining L2 waiver, at 73.1% (125/171)
+#          for the reason enumerated with the L2 floors below.  `l2` exits 0.
+#          The figures immediately before that pass, for comparison: 130 tests green, aggregate
+#          81.2% (1730/2130), HdmiCecSink.cpp 78.0% (46/59), HdmiCecSinkImplementation.cpp 81.4%
+#          (1442/1771), HdmiCecSinkImplementation.h 70.8% (121/171).
 #      Both levels' filtered traces hold exactly the FIVE production files above and nothing
 #      else, which is what the exclusion globs are for; the cross-level best-single-level verdict each run
 #      prints shows every exempt target clearing the bar at the other level.
 #  Separately from those dated figures, and checkable right now rather than measured:
-#  HdmiCecSink_L2Test.cpp holds 130 TEST_F cases and `grep -c DISABLED_` over it returns ZERO,
-#  so all 130 are eligible to run.  The four route and port-map cases that were disabled at an
+#  HdmiCecSink_L2Test.cpp holds 132 TEST_F cases and `grep -c DISABLED_` over it returns ZERO,
+#  so all 132 are eligible to run.  The four route and port-map cases that were disabled at an
 #  intermediate commit are ENABLED in this tree and pass; the one assertion the shared,
 #  out-of-scope CEC mock cannot satisfy sits behind a runtime availability check inside each of
-#  them, so nothing is bought by disabling anything.  130 is the CURRENT eligible count, and the L2
-#  row above was re-captured on that same 130-case tree -- the two added negative cases moved no
-#  figure in it -- so read those numbers as today's and re-run `l2` if the tree has moved on again.
+#  them, so nothing is bought by disabling anything.  132 is the CURRENT eligible count, up from
+#  130: the QA-remediation pass added PluginShellExposesIPluginAndReportsItsInformationString and
+#  ActiveSourceWithPortMatchingAddressByteDrivesThePortMapRouteWalk, and the L2 row above was
+#  re-captured on that 132-case tree -- so read those numbers as today's and re-run `l2` if the tree
+#  has moved on again.
 #  The L2 floors block says what the mock still blocks, and why.
 #  RECORDED RATHER THAN SILENTLY APPLIED: an earlier revision of this comment asserted four
 #  DISABLED_-prefixed cases and "124 eligible".  The four names it gave are not in the file and the
@@ -723,55 +734,78 @@ readonly L2_EXCLUDES=(
 #   declaration (production source).  The list is level-aware because the L2 suite does
 #   drive an in-process host and therefore can reach it.
 #
-#   plugin/HdmiCecSink.cpp at L2 -- the plugin SHELL has a hard L2 ceiling of 46/59 = 78.0%,
-#   below the bar and not raisable by any test.  All thirteen remaining lines are covered by
-#   this repository's own L1 suite (which measures this file at 56/59 = 94.9%), so the file is
-#   not under-tested: it is the L2 execution model that cannot reach them.  Enumerated:
-#     * Information() -- 2 lines.  PluginHost::IPlugin::Information() is declared pure virtual
-#       at Thunder/Source/plugins/IPlugin.h:97 and is called NOWHERE in Thunder R4.4.1; a grep
-#       of Thunder/Source finds only the Controller's own override.
-#     * the Root<> failure arm -- 3 lines.  A live Thunder host resolves
-#       _service->Root<Exchange::IHdmiCecSink>() against an installed, loadable implementation
-#       library; there is no L2 seam that makes it return null, and manufacturing one would be
-#       a production change.
-#     * the out-of-process teardown block -- 7 lines (RemoteConnection / Terminate / its catch /
-#       Release).  At L2 the implementation runs IN-PROCESS, so _connectionId is 0 and
-#       _service->RemoteConnection(0) is null; the block is dead by construction.
-#     * Deactivated()'s id-match Submit -- 1 line.  Thunder allocates connection ids from 1 and
-#       _connectionId is 0 in-process, so connection->Id() == _connectionId never holds.
-#   Reaching any of these at L2 would need an out-of-process plugin host or a change to Thunder
-#   or to the plugin -- production code, out of scope.  No exclusion glob is used and
-#   COVERAGE_MIN is not lowered; the file keeps its real 78.0% and stays in the denominator.
+#   plugin/HdmiCecSink.cpp at L2 -- NO LONGER EXEMPT, and the entry was removed rather than
+#   left in place with a comment: the file now MEASURES 48/59 = 81.4% at L2 and is gated like
+#   any other target.  It sat at 46/59 = 78.0% for as long as its last reachable pair of lines
+#   had no test.  Those two are Information() (HdmiCecSink.cpp:166-169), and the reason they
+#   went untested is that Thunder never calls the method: PluginHost::IPlugin::Information() is
+#   pure virtual at Thunder/Source/plugins/IPlugin.h:97 and is called NOWHERE in Thunder
+#   R4.4.1 -- a grep of Thunder/Source finds only the Controller's own override.  It is
+#   nevertheless REACHABLE from L2, because the plugin publishes
+#   INTERFACE_ENTRY(PluginHost::IPlugin) (HdmiCecSink.h:257-261),
+#   Server::Service::QueryInterface forwards any non-IUnknown/IShell id to the plugin handler
+#   (Thunder/Source/WPEFramework/PluginServer.cpp:277-301) and Thunder's generated
+#   ProxyStubs_Plugin.cpp marshals the call.  HdmiCecSink_L2Test
+#   .PluginShellExposesIPluginAndReportsItsInformationString asks the fixture's existing
+#   COM-RPC shell for that facet and reads the description back, which took the file over the
+#   bar with no waiver and no production change.  Its remaining eleven uncovered lines are
+#   enumerated in this script's closing "below the bar" report and in
+#   COVERAGE_TRACEABILITY_REPORT.md section 5.2: seven are the out-of-process teardown block,
+#   dead by construction because the implementation resolves IN-PROCESS so _connectionId stays
+#   0 and _service->RemoteConnection(0) is null; three are the Root<> failure arm, which a live
+#   host cannot be made to take without a production or framework change; and one is
+#   Deactivated()'s id-match Submit, which cannot hold because Thunder allocates connection ids
+#   from 1.  Those eleven do not need a waiver: the file clears the bar without them.
 #
-#   plugin/HdmiCecSinkImplementation.h at L2 -- measures 121/171 = 70.8%.  The shortfall is
-#   entirely HdmiPortMap (addChild, removeChild, getRoute, update(LogicalAddress)), and no L2
-#   test can reach it, for two independently measured reasons that both live in
-#   entservices-testframework/Tests/mocks/HdmiCec.h -- a shared dependency this project does not
-#   modify:
-#     * That mock's PhysicalAddress::getByteValue(index) returns the RAW WIRE BYTE str[index],
-#       where ccec's real PhysicalAddress (hdmicec/ccec/include/ccec/Operands.hpp) returns a
-#       NIBBLE -- case 0 is (str[0] & 0xF0) >> 4.  HdmiCecSinkImplementation.cpp:1951 (addChild)
-#       and :1979 (getRoute) both require getByteValue(0) == hdmiInputs[i].m_portID + 1, i.e. a
-#       value in 1..3, but an announced 1.1.0.0 yields 17 and a 2.0.0.0 yields 32.
-#     * A port can never be CLAIMED even with a hand-picked operand.  The only write to
-#       HdmiPortMap::m_logicalAddr is update(const LogicalAddress&) at
-#       HdmiCecSinkImplementation.h:291, reached solely from addChild's
-#       "physical_addr == m_physicalAddr" arm at :322.  A port's own address comes from the
-#       four-argument constructor, which in that mock stores FOUR bytes, while a frame-derived
-#       address stores TWO, and the mock's operator== is an exact vector compare.
-#     Measured confirmation: across a full 120-case L2 run, addChild logged ZERO invocations.
+#   plugin/HdmiCecSinkImplementation.h at L2 -- measures 125/171 = 73.1%, up from 121/171 =
+#   70.8% once HdmiCecSink_L2Test.ActiveSourceWithPortMatchingAddressByteDrivesThePortMapRouteWalk
+#   reached HdmiPortMap::getRoute's signature, its LOGINFO, its m_logicalAddr guard and its close
+#   (header:351, :353, :355, :385).  The 46 lines that remain are HdmiPortMap's BODIES --
+#   addChild's two arms, removeChild, getRoute's route walk and update(const LogicalAddress&) --
+#   plus the UserSettings notification callbacks, and the ceiling is ARITHMETIC rather than a
+#   matter of writing better tests.  Every reason lives in
+#   entservices-testframework/Tests/mocks/HdmiCec.h, a shared dependency AAP section 0.10.2 puts
+#   out of scope for edits:
+#     * addChild is never CALLED at L2.  updateDeviceChain (HdmiCecSinkImplementation.cpp:1950)
+#       forwards to it only when phy_addr.getByteValue(0) == hdmiInputs[i].m_portID + 1, i.e. 1,
+#       2 or 3.  That address comes from ReportPhysicalAddress(const CECFrame&, int startPos = 0)
+#       (HdmiCec.h:1067), which parses from offset ZERO -- the frame's HEADER byte and opcode,
+#       not its operands -- and process(ReportPhysicalAddress) returns early unless the header's
+#       destination nibble is BROADCAST (impl.cpp:346-352).  Every legal header is therefore
+#       0x0F, 0x1F, ... 0xFF: 15, 31, ... 255, and never 1, 2 or 3.  Measured in this tree, the
+#       implementation logs "addr = 79, portID = 0" and "addr = 143, portID = 0" for
+#       announcements from logical addresses 4 and 8 -- the header byte, exactly as above.
+#     * A port can never be CLAIMED, so every body guarded on m_logicalAddr != UNREGISTERED
+#       stays dead even where the enclosing function IS entered.  The only write that CLAIMS one
+#       is update(const LogicalAddress&) at header:291 as called from addChild's
+#       "physical_addr == m_physicalAddr" arm at header:320; removeDevice calls the same setter at
+#       cpp:2495 but passes UNREGISTERED, so it releases rather than claims.  A port's own
+#       address comes from the four-argument constructor, which in that mock push_back()s FOUR
+#       separate digits (HdmiCec.h:399-405), while any frame-derived address holds at most TWO
+#       (MAX_LEN == 2), and CECBytes::operator== is an exact vector compare (HdmiCec.h:237-240).
+#       Two bytes can never equal four.
+#     * getByteValue(index) returns the RAW BYTE str[index] where ccec's real PhysicalAddress
+#       (hdmicec/ccec/include/ccec/Operands.hpp) returns the DIGIT at that index, which is what
+#       production is written against.  ActiveSource DOES parse from operand offset 2
+#       (HdmiCec.h:880), so an <Active Source> carrying operand 0x01 0x02 is the one frame shape
+#       whose first byte satisfies the port comparison; that is exactly what the new case
+#       injects, and it is why getRoute is now entered at all.
+#     * The UserSettings notification callbacks (header:637, :639, :640, :642, :643) need an
+#       Exchange::IUserSettings implementation, and the L2 host has none -- "Configure: Failed to
+#       get UserSettings interface" appears on every activation in the host log.
 #   All of it IS covered by this repository's own L1 suite, which measures this file at
-#   171/171 = 100.0% by constructing HdmiPortMap directly instead of decoding frames.  Raising
-#   the L2 figure needs two changes to that out-of-scope mock -- initialise AbortReason::impl to
-#   nullptr, and pack PhysicalAddress as two nibble-packed bytes -- so it is reported here, not
-#   worked around.  No exclusion glob is used and COVERAGE_MIN is not lowered; the file keeps its
-#   real 70.8% and stays in the denominator.
+#   171/171 = 100.0% by constructing HdmiPortMap directly, where both sides of every comparison
+#   are digit-built and the guards hold.  RAISING THE L2 FIGURE NEEDS TWO EDITS TO THAT
+#   OUT-OF-SCOPE MOCK, reported here and not made (Directive 6's escape clause): pack
+#   PhysicalAddress(byte0..byte3) into two nibble-packed bytes and return digit `index` from
+#   getByteValue, so the class has ONE representation; and parse ReportPhysicalAddress from
+#   operand offset 2.  No exclusion glob is used and COVERAGE_MIN is not lowered; the file keeps
+#   its real 73.1% and stays in the denominator.
 # ------------------------------------------------------------------------------------
 readonly L1_GATE_EXEMPT=(
     'plugin/Module.cpp'
 )
 readonly L2_GATE_EXEMPT=(
-    'plugin/HdmiCecSink.cpp'
     'plugin/HdmiCecSinkImplementation.h'
 )
 
@@ -785,13 +819,15 @@ readonly L2_GATE_EXEMPT=(
 # Format: <path relative to the repository>=<recorded baseline line coverage percentage>
 #
 # LEVEL-SCOPED, and for a measured reason: the two levels reach genuinely different code, so
-# the SAME sources give HdmiCecSinkImplementation.h 100.0% under L1 and 70.8% under L2 -- the
-# reason is in the exemption block above, no L2 test can reach HdmiPortMap through the shared
-# mock -- and HdmiCecSink.h 99.2% under L1 and 93.8% under L2.  Applying an L1 baseline to an L2
-# trace would report a "regression" that never happened, so each level's floors come from a trace
-# measured at that level and are never carried across.  An earlier revision of this comment
-# quoted 92.4% and 97.7% for those two L2 figures; neither matches any capture, and the 92.4%
-# additionally contradicted the 70.8% the exemption block states a few lines above.  Read the live
+# the SAME sources give HdmiCecSinkImplementation.h 100.0% under L1 and 73.1% under L2 -- the
+# reason is in the exemption block above, no L2 test can reach HdmiPortMap's claimed-port bodies
+# through the shared mock -- and HdmiCecSink.h 99.2% under L1 and 93.8% under L2.  Applying an L1
+# baseline to an L2 trace would report a "regression" that never happened, so each level's floors
+# come from a trace measured at that level and are never carried across.  An earlier revision of
+# this comment quoted 92.4% and 97.7% for those two L2 figures; neither matches any capture, and
+# the 92.4% additionally contradicted the figure the exemption block states a few lines above.  A
+# later revision quoted 70.8%, which was correct until the QA-remediation pass added the port-map
+# route case and moved it to 73.1%.  Read the live
 # figures off the per-file table this run prints -- this comment exists to explain the
 # level-scoping, not to be a second source of truth for the numbers.
 #
@@ -814,7 +850,7 @@ readonly L2_GATE_EXEMPT=(
 # cases are ENABLED in this tree and pass -- ActiveRouteIsResolvedThroughTheRegisteredPortChain,
 # ActiveRouteResolvesADeeperDeviceChain, ActiveRouteForADeviceDirectlyOnAPort and
 # DeviceRemovalUnregistersTheChildFromThePortMap all carry no DISABLED_ prefix, and
-# `grep -c DISABLED_` over HdmiCecSink_L2Test.cpp returns ZERO, so all 130 TEST_F cases are
+# `grep -c DISABLED_` over HdmiCecSink_L2Test.cpp returns ZERO, so all 132 TEST_F cases are
 # eligible to run.  Each of the four asserts unconditionally everything that IS observable -- that
 # COM-RPC and JSON-RPC agree about whether a route is available, and that an unavailable route
 # reports zero length and an empty description rather than stale state -- and puts only the
@@ -824,15 +860,16 @@ readonly L2_GATE_EXEMPT=(
 # returns early on and from which the uninitialised member is therefore never reached.
 #
 # MEASURED ELIGIBILITY, and a withdrawn claim recorded rather than quietly replaced: the file holds
-# 130 TEST_F cases and ZERO carry a DISABLED_ prefix (`grep -c DISABLED_` on it returns 0), so 130
-# are eligible and 130 execute -- confirmed by the shard results this run writes.  An earlier
+# 132 TEST_F cases and ZERO carry a DISABLED_ prefix (`grep -c DISABLED_` on it returns 0), so 132
+# are eligible and 132 execute -- confirmed by the shard results this run writes.  An earlier
 # revision of this comment named four DISABLED_-prefixed cases that do not exist in the file and
 # derived "124 eligible" from them; both the names and the arithmetic were wrong.
 #
 # plugin/HdmiCecSinkImplementation.h is L2_GATE_EXEMPT because of the MOCK DEFECT ITSELF, not
-# because anything is disabled: with getByteValue returning wire bytes where ccec returns nibbles,
-# addChild's port-match guard can never hold, so no L2 test of any kind can claim a port and reach
-# the port-map bodies through the production frame path.  It is given no L2 floor for the same
+# because anything is disabled: ReportPhysicalAddress is parsed from the frame's header byte and a
+# port's own address is built from four digits where a frame's holds two, so no L2 test of any kind
+# can make updateDeviceChain call addChild or make a port claim its logical address, and the
+# port-map bodies stay unreachable through the production frame path.  It is given no L2 floor for the same
 # reason -- a floor on a verdict this level cannot influence would be a second, contradictory
 # judgement on the same file.  That coverage is NOT lost overall: every affected path is covered
 # by this repository's own L1 suite, which constructs HdmiPortMap in-test so both sides of every
@@ -840,8 +877,10 @@ readonly L2_GATE_EXEMPT=(
 # measures plugin/HdmiCecSinkImplementation.h at 100.0%.
 # Nothing was excluded and COVERAGE_MIN was not lowered to reach the L2 figures below.
 #   The file each level EXEMPTS is deliberately given no floor for that level:
-#   plugin/Module.cpp has none at L1 and plugin/HdmiCecSink.cpp none at L2, because a floor on
-#   a waived verdict would be a second, contradictory judgement on the same file.
+#   plugin/Module.cpp has none at L1 and plugin/HdmiCecSinkImplementation.h none at L2, because a
+#   floor on a waived verdict would be a second, contradictory judgement on the same file.
+#   plugin/HdmiCecSink.cpp DID have no L2 floor while it was exempt; it is gated now, so it has
+#   one, measured at the 48/59 = 81.4% the capture that removed its waiver reported.
 # ------------------------------------------------------------------------------------
 readonly L1_COVERAGE_FLOORS=(
     'plugin/HdmiCecSink.cpp=94.9'
@@ -850,6 +889,7 @@ readonly L1_COVERAGE_FLOORS=(
     'plugin/HdmiCecSinkImplementation.h=100.0'
 )
 readonly L2_COVERAGE_FLOORS=(
+    'plugin/HdmiCecSink.cpp=81.4'
     'plugin/HdmiCecSink.h=93.8'
     'plugin/HdmiCecSinkImplementation.cpp=80.0'
     'plugin/Module.cpp=100.0'
@@ -1872,28 +1912,219 @@ cleanup_stage_dir() {
     return 0
 }
 
-# ONE cleanup handler, servicing both side effects this script has, installed once.
+# ------------------------------------------------------------------------------------
+# CANCELLATION.  A run that cannot be stopped is a run CI cannot cancel, and this one starts a
+# Thunder host: an uncancellable run leaves a listener on the JSON-RPC port and a bound COM-RPC
+# socket behind, and the next run then measures somebody else's host -- or refuses to start.
+#
+# Bash runs a trap only BETWEEN commands.  The suite used to be launched as a FOREGROUND child
+# -- `( cd …; timeout … "$binary_path" )` -- so while this shell sat inside that command an
+# external SIGTERM was recorded and then withheld from the handler until the child finished on
+# its own.  For the length of a whole L2 suite the runner therefore ignored its own
+# cancellation, and nothing forwarded the signal to the suite binary, to the `sh -c` that
+# entservices-testframework's L2 controller uses to start WPEFramework
+# (Tests/L2Tests/L2testController.cpp:91), or to that host.
+#
+# So the suite is launched in the BACKGROUND and in its OWN PROCESS GROUP -- `set -m` makes a
+# background job a process-group leader -- and this shell waits on it.  `wait` is interruptible,
+# so a signal reaches the handler at once; the handler then signals the whole GROUP, which is
+# `timeout`, the suite binary, the controller's `sh -c` and WPEFramework, all of which stay in
+# that group because `timeout --foreground` deliberately does not create one of its own.  A
+# bounded grace period follows, then the group is killed outright, any host that changed its own
+# group or session is terminated by exact pid, and only then is the COM-RPC socket handed back.
+SUITE_PGID=''                  # process group of the running suite; empty when none is running
+SUITE_PGID_GRACE=''            # grace period for THAT group: a nested level needs more than a suite
+SUITE_SIGNAL=''                # name of the signal that cancelled this run, if any
+SUITE_HOST_EXE=''              # resolved WPEFramework this level's suite starts (L2 only)
+SUITE_HOST_PIDS_BEFORE=' '     # hosts already running before the suite started: not ours to kill
+SUITE_SOCKET_PREEXISTING=''    # the COM-RPC socket was already there: not ours to remove
+# How long a signalled process group is given to exit before it is killed outright.  Bounded
+# because the point of the exercise is that a cancellation completes.
+SUITE_STOP_GRACE_SECONDS="${SUITE_STOP_GRACE_SECONDS:-10}"
+readonly SUITE_STOP_GRACE_SECONDS
+# The path the in-process host binds and the framework's own client connects to
+# (entservices-testframework/Tests/L2Tests/L2testController.cpp:149, hard-coded there).  It is
+# host-global, which is why this script only ever removes one it did not find already present.
+readonly COMRPC_SOCKET='/tmp/communicator'
+
+# Every pid whose /proc/<pid>/exe resolves EXACTLY to $1.
+#
+# Matching the resolved executable rather than a command-line pattern is deliberate and is not a
+# style preference: this function's output is used to send signals, and `pkill -f WPEFramework`
+# would match any process that merely mentions the name -- an editor, a log tail, another
+# runner's shell, or the harness that started this script.  An exact /proc/<pid>/exe comparison
+# cannot.
+host_pids_for_exe() { # $1 = absolute, resolved executable path
+    local exe="$1" entry link
+    [ -n "$exe" ] || return 0
+    for entry in /proc/[0-9]*; do
+        link="$(readlink -- "$entry/exe" 2>/dev/null)" || continue
+        [ "$link" = "$exe" ] || continue
+        printf '%s\n' "${entry#/proc/}"
+    done
+    return 0
+}
+
+# Wait up to $2 seconds for kill-target $1 (a pid, or -pgid) to disappear.  0 when it is gone.
+await_process_exit() { # $1 = kill target  $2 = seconds
+    local target="$1" seconds="$2" waited=0
+    while kill -0 -- "$target" 2>/dev/null; do
+        [ "$waited" -lt "$seconds" ] || return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+# Forward $1 to the suite's process group, then make sure it is actually gone.  Idempotent, so
+# the signal handler and the EXIT handler can both call it.
+stop_suite_group() { # $1 = signal name to forward
+    local signal="${1:-TERM}" grace="${SUITE_PGID_GRACE:-$SUITE_STOP_GRACE_SECONDS}"
+    [ -n "$SUITE_PGID" ] || return 0
+    if ! kill -0 -- "-$SUITE_PGID" 2>/dev/null; then
+        SUITE_PGID=''
+        return 0
+    fi
+    warn "forwarding SIG$signal to the suite process group $SUITE_PGID"
+    kill -"$signal" -- "-$SUITE_PGID" 2>/dev/null || true
+    if ! await_process_exit "-$SUITE_PGID" "$grace"; then
+        warn "the suite process group $SUITE_PGID ignored SIG$signal for"
+        warn "    ${grace}s (SUITE_STOP_GRACE_SECONDS); killing it outright."
+        kill -KILL -- "-$SUITE_PGID" 2>/dev/null || true
+        await_process_exit "-$SUITE_PGID" 5 \
+            || warn "process group $SUITE_PGID survived SIGKILL; report this, it should not happen."
+    fi
+    SUITE_PGID=''
+    return 0
+}
+
+# Terminate any Thunder host THIS run started and then hand the COM-RPC socket back.
+#
+# The group kill above already reaches a host that stayed in the group, which is the normal case
+# for a `-f` (foreground) host.  This is the second stage, for the case observed under an
+# external cancellation: a host that has changed its own process group or session, or has been
+# reparented once its ancestors died, and therefore no longer receives a group signal at all.
+# Only pids that appeared AFTER the suite was launched are touched -- a host that was already
+# running belongs to somebody else -- and the socket is only removed when this run is the party
+# that created it and no host of ours is left holding it.
+reap_suite_host() {
+    [ -n "$SUITE_HOST_EXE" ] || return 0
+    local pid ours=''
+    for pid in $(host_pids_for_exe "$SUITE_HOST_EXE"); do
+        case "$SUITE_HOST_PIDS_BEFORE" in *" $pid "*) continue ;; esac
+        ours="$ours $pid"
+    done
+    if [ -n "$ours" ]; then
+        warn "terminating the Thunder host(s) this run started:$ours"
+        for pid in $ours; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        for pid in $ours; do
+            await_process_exit "$pid" "$SUITE_STOP_GRACE_SECONDS" || {
+                warn "host pid $pid ignored SIGTERM; killing it"
+                kill -KILL "$pid" 2>/dev/null || true
+                await_process_exit "$pid" 5 || warn "host pid $pid survived SIGKILL"
+            }
+        done
+    fi
+    # Re-derived rather than assumed: the socket is only ours to remove once nothing of ours is
+    # still listening on it.
+    local still
+    still="$(host_pids_for_exe "$SUITE_HOST_EXE" | tr '\n' ' ')"
+    for pid in $still; do
+        case "$SUITE_HOST_PIDS_BEFORE" in *" $pid "*) continue ;; esac
+        warn "leaving $COMRPC_SOCKET in place: host pid $pid is still running"
+        return 0
+    done
+    if [ -n "$SUITE_SOCKET_PREEXISTING" ]; then
+        return 0
+    fi
+    if [ -S "$COMRPC_SOCKET" ]; then
+        rm -f -- "$COMRPC_SOCKET" \
+            && log "removed the COM-RPC socket this run created: $COMRPC_SOCKET"
+    elif [ -e "$COMRPC_SOCKET" ]; then
+        warn "$COMRPC_SOCKET exists but is not a socket, so it is left exactly as found."
+    fi
+    SUITE_HOST_EXE=''
+    return 0
+}
+
+# Record, before the suite is launched, what already existed -- so the cleanup above can tell
+# what this run is responsible for.  L2 only: the L1 suite starts no host and binds no socket.
+note_pre_run_host_state() { # $1 = level
+    SUITE_HOST_EXE=''
+    SUITE_HOST_PIDS_BEFORE=' '
+    SUITE_SOCKET_PREEXISTING=''
+    [ "$1" = 'l2' ] || return 0
+    local exe="$LEVEL_INSTALL_DIR/usr/bin/WPEFramework"
+    # The install tree ships WPEFramework as a symlink to a versioned binary and /proc/<pid>/exe
+    # reports the RESOLVED target, so the comparison has to be made against the resolved path or
+    # it never matches anything.
+    SUITE_HOST_EXE="$(readlink -f -- "$exe" 2>/dev/null || printf '%s' "$exe")"
+    SUITE_HOST_PIDS_BEFORE=" $(host_pids_for_exe "$SUITE_HOST_EXE" | tr '\n' ' ')"
+    [ -e "$COMRPC_SOCKET" ] && SUITE_SOCKET_PREEXISTING=1
+    return 0
+}
+
+# Run the suite bounded, cancellable, and in its own process group.  Arguments: the working
+# directory, then the command line.  Returns the command's exit status, exactly as the
+# foreground form did, so every status-based diagnosis around the call site is unchanged.
+run_suite_process() { # $1 = working directory  $2… = command line
+    local run_dir="$1"; shift
+    local rc=0
+    # Job control for exactly this launch: it is what gives the background job a process group
+    # of its own, and therefore what makes one kill reach the suite and everything it starts.
+    set -m
+    ( cd -- "$run_dir" || exit 1; exec "$@" ) &
+    SUITE_PGID=$!
+    SUITE_PGID_GRACE="$SUITE_STOP_GRACE_SECONDS"
+    set +m
+    # `|| rc=$?` rather than a set +e / set -e pair: toggling errexit inside a function that may
+    # itself have been invoked in a `||` or `if !` context re-arms it where the caller had
+    # deliberately suppressed it, and the run would then abort at the first non-zero status
+    # instead of diagnosing it.  A trapped signal interrupts the wait either way, which is the
+    # whole point of waiting rather than running the suite in the foreground.
+    wait "$SUITE_PGID" || rc=$?
+    SUITE_PGID=''
+    SUITE_PGID_GRACE=''
+    return "$rc"
+}
+
+# ONE cleanup handler, servicing every side effect this script has, installed once.
 #
 # Two separate EXIT traps cannot coexist: bash keeps a single handler per signal, so a second
 # `trap … EXIT` REPLACES the first, and whichever cleanup it displaced then has nobody to run
 # it -- leaving, for instance, an empty ${TMPDIR:-/tmp}/run_coverage_stage.* behind on every
-# run.  So do not add another EXIT trap: both actions live in this one handler, and both are
-# idempotent, so running it on a normal exit and again on a signal is harmless.
-#
-# The signal traps `exit` rather than re-raising, because a shell terminated by a signal with
-# its default disposition never runs its EXIT trap: re-raising would have skipped both the
-# staging cleanup and the removal of the private lcov HOME. `exit 130/143/129` reports the same
-# status a signalled shell would while guaranteeing the handler runs.
+# run.  So do not add another EXIT trap: every action lives in this one handler, and all of them
+# are idempotent, so running it on a normal exit and again on a signal is harmless.  Children
+# are stopped FIRST: a staging directory removed while the suite still writes into the tree is a
+# cleanup that has to be done twice.
 on_exit() {
     local rc=$?
+    # The signal that cancelled the run, when there was one, is the signal forwarded to whatever
+    # is still running: a run cancelled with SIGHUP should not report that it sent SIGTERM.
+    stop_suite_group "${SUITE_SIGNAL:-TERM}"
+    reap_suite_host
     cleanup_stage_dir
     cleanup_lcov_home
     return "$rc"
 }
+
+# The signal handler `exit`s rather than re-raising, because a shell terminated by a signal with
+# its default disposition never runs its EXIT trap: re-raising would have skipped the staging
+# cleanup, the private lcov HOME and -- now -- the suite and its host.  `exit 130/143/129`
+# reports the same status a signalled shell would while guaranteeing the handler runs.
+on_signal() { # $1 = signal name  $2 = exit status
+    SUITE_SIGNAL="$1"
+    warn "received SIG$1 -- cancelling this run"
+    stop_suite_group "$1"
+    reap_suite_host
+    exit "$2"
+}
 trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal HUP 129' HUP
 
 # Publish a staged artifact over its final name.  mv replaces the directory entry itself,
 # so even if the check above raced with a link being planted, the link is replaced rather
@@ -2552,6 +2783,11 @@ run_suite() {
     local results_base total=0 total_disabled=0 idx=0 archived shard_files=()
     results_base="$(basename -- "$results")"
 
+    # Snapshot what already exists BEFORE the first shard, so the cancellation and exit handlers
+    # can tell this run's Thunder host and COM-RPC socket from somebody else's.  Taken once for
+    # the whole level rather than per shard: a host left behind by shard 1 is still this run's.
+    note_pre_run_host_state "$level"
+
     while [ "$idx" -lt "$shards" ]; do
         if [ "$shards" -gt 1 ]; then
             # GoogleTest's own sharding contract: with both variables set it runs only the cases
@@ -2585,15 +2821,20 @@ run_suite() {
         # Thunder host and activates plugins over COM-RPC: an activation that never completes, or
         # a notification that is never delivered, hangs here with no further output, no exit and
         # no gate -- and in CI the job is eventually killed by the runner with nothing attached to
-        # explain it.  `timeout --foreground` keeps the child attached to the terminal so Ctrl-C
-        # still reaches it; --kill-after is added only where the local timeout preserves exit 124
+        # explain it.  --kill-after is added only where the local timeout preserves exit 124
         # alongside it (see the probe next to TIMEOUT_KILL_AFTER).  A timeout is reported as a
         # HANG in its own right, because a hang and a failing assertion need different fixes.
+        #
+        # CANCELLABLE, via run_suite_process: the command below is launched in the background in a
+        # process group of its own and waited on, so an external INT/TERM/HUP reaches this shell's
+        # handler while the suite runs instead of after it (see the block next to `trap on_exit`).
+        # `timeout --foreground` is kept for exactly that reason -- it deliberately does NOT put
+        # its child in a new process group, so `timeout`, the suite binary, the L2 controller's
+        # `sh -c` and WPEFramework all stay in the one group the handler signals.
         log "time limit      = ${suite_timeout}s ($( [ "$shards" -gt 1 ] && printf 'per shard, ' )SUITE_TIMEOUT_${level^^})"
         if valgrind_enabled; then
             log "running $binary_path under valgrind memcheck (options as in CI)"
-            (
-                cd -- "$run_dir" || exit 1
+            run_suite_process "$run_dir" \
                 "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$suite_timeout" \
                 "$VALGRIND_BIN" \
                     --tool=memcheck \
@@ -2602,16 +2843,20 @@ run_suite() {
                     --show-reachable=yes \
                     --track-fds=yes \
                     --fair-sched=try \
-                    "$binary_path"
-            ) || rc=$?
+                    "$binary_path" || rc=$?
         else
             log "running $binary_path"
-            (
-                cd -- "$run_dir" || exit 1
-                "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$suite_timeout" "$binary_path"
-            ) || rc=$?
+            run_suite_process "$run_dir" \
+                "$TIMEOUT_BIN" --foreground "${TIMEOUT_KILL_AFTER[@]}" "$suite_timeout" \
+                "$binary_path" || rc=$?
         fi
         rule
+        # The host is stopped between shards as well as at the end of the level: the controller
+        # normally stops it itself, but a shard that fell over part-way through would otherwise
+        # hand the next shard a bound socket and a live listener, which is indistinguishable from
+        # the next shard's own host.
+        reap_suite_host
+        note_pre_run_host_state "$level"
 
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
             local where=''
@@ -3116,10 +3361,10 @@ readonly CROSS_LEVEL_REFERENCE=(
     'l1/plugin/HdmiCecSinkImplementation.cpp=84.0'
     'l1/plugin/HdmiCecSinkImplementation.h=100.0'
     'l1/plugin/Module.cpp=0.0'
-    'l2/plugin/HdmiCecSink.cpp=78.0'
+    'l2/plugin/HdmiCecSink.cpp=81.4'
     'l2/plugin/HdmiCecSink.h=93.8'
-    'l2/plugin/HdmiCecSinkImplementation.cpp=81.4'
-    'l2/plugin/HdmiCecSinkImplementation.h=70.8'
+    'l2/plugin/HdmiCecSinkImplementation.cpp=81.5'
+    'l2/plugin/HdmiCecSinkImplementation.h=73.1'
     'l2/plugin/Module.cpp=100.0'
 )
 
@@ -3235,7 +3480,7 @@ report_floors() {
     log "must-not-regress floors (recorded ${level^^} baseline percentages, not live measurements):"
     if [ "$level" = l2 ]; then
         log "    Recorded per level and never carried across: the two levels reach different code, so"
-        log "    HdmiCecSinkImplementation.h measures 100.0% under L1 and 70.8% under L2 from the same"
+        log "    HdmiCecSinkImplementation.h measures 100.0% under L1 and 73.1% under L2 from the same"
         log "    sources -- which is why it is L2_GATE_EXEMPT and given no L2 floor.  These L2 floors"
         log "    were measured by this script from a real L2 capture taken once the cases that closed"
         log "    the aggregate gap were in place; before them the level had no floor of any kind."
@@ -3271,46 +3516,108 @@ gate_exempt_reason() {
             log "        change is required, only an execution model that loads the plugin.  Saying"
             log "        'uncoverable' without naming the level would therefore be false."
             ;;
-        l2/plugin/HdmiCecSink.cpp)
-            log "        Reason: the plugin shell has a hard L2 ceiling of 46/59 = 78.0%.  Thirteen"
-            log "        lines are unreachable from the L2 execution model, each for a checked reason:"
-            log "          - Information() (2 lines): IPlugin::Information() is pure virtual at"
-            log "            Thunder/Source/plugins/IPlugin.h:97 and is called nowhere in Thunder"
-            log "            R4.4.1 -- only the Controller's own override exists."
-            log "          - the Root<> failure arm (3 lines): a live Thunder host resolves Root<>"
-            log "            against an installed, loadable implementation library, so there is no"
-            log "            L2 seam that makes it return null."
-            log "          - the out-of-process teardown block (7 lines): the implementation runs"
-            log "            IN-PROCESS at L2, so _connectionId is 0 and RemoteConnection(0) is null."
-            log "          - Deactivated()'s id-match Submit (1 line): connection ids start at 1 and"
-            log "            _connectionId is 0 in-process, so the comparison never holds."
-            log "        This repository's own L1 suite measures the SAME file at 94.9% (56/59), so the"
-            log "        file is tested -- it is this level that cannot reach those lines.  No exclusion"
-            log "        glob was added and COVERAGE_MIN was not lowered; reaching them at L2 would need"
-            log "        an out-of-process host or a production change, both out of scope."
-            ;;
         l2/plugin/HdmiCecSinkImplementation.h)
-            log "        Reason: the port-map members of this header cannot be reached at L2, because"
-            log "        HdmiPortMap::addChild/removeChild/getRoute only run once the map has learned"
-            log "        its own logical address, and at L2 the frames that would teach it are decoded"
-            log "        by the SHARED CEC MOCK.  entservices-testframework/Tests/mocks/HdmiCec.h"
-            log "        carries a PhysicalAddress representation that is incompatible with the one the"
-            log "        production header expects, so the announced address never matches and the"
-            log "        chain is never registered.  The four route-map cases in this repository's L2"
-            log "        file are ENABLED and pass: each asserts unconditionally what is observable -"
-            log "        that COM-RPC and JSON-RPC agree on route availability, and that an"
-            log "        unavailable route reports zero length and an empty description rather than"
-            log "        stale state - and guards only the claimed-port branch behind 'if (available)',"
-            log "        so they cannot produce a false green and begin asserting the rest as soon as"
-            log "        the mock gains one representation.  The exemption rests on the mock defect"
-            log "        itself, not on any test being withheld."
-            log "        The required change is a single-representation PhysicalAddress in that mock"
-            log "        header.  It is a read-only authority for this pass (AAP Sec. 0.10.2), so the"
-            log "        change is REPORTED, NOT MADE, and no in-scope file can substitute for it -"
-            log "        the object is built inside the mock's own decoder, ahead of any test seam."
+            log "        Reason: MEASURED at 125/171 = 73.1% under L2 -- the same figure the per-file"
+            log "        table above prints, read off this run's trace.  FORTY-SIX lines are"
+            log "        uncovered.  Four BLOCKING REASONS account for all of them; the exact"
+            log "        per-function line split, which is the partition to reconcile against the"
+            log "        trace, is given after them.  The reasons, each checked in the code rather"
+            log "        than assumed:"
+            log "          - the claimed-port-guarded bodies of HdmiPortMap::addChild, removeChild"
+            log "            and getRoute (28 of the 46: 301, 303, 304, 306, 308, 310, 312, 316, 323;"
+            log "            332, 333, 335, 337, 339, 341, 345; 357-382).  Every one of them runs"
+            log "            only once a port has CLAIMED its own address, i.e. once"
+            log "            HdmiPortMap::m_logicalAddr holds something other than UNREGISTERED.  The"
+            log "            only write that CLAIMS one is update(const LogicalAddress&) at"
+            log "            header:291 as called from addChild's 'physical_addr == m_physicalAddr'"
+            log "            arm at header:320 -- removeDevice calls the same setter at cpp:2495 but"
+            log "            passes UNREGISTERED, so it releases rather than claims.  A port's own"
+            log "            address is built with the four-argument"
+            log "            PhysicalAddress constructor, which pushes FOUR bytes"
+            log "            (entservices-testframework/Tests/mocks/HdmiCec.h:399-405), while any"
+            log "            frame-derived address holds at most TWO (CECBytes MAX_LEN = 2), and"
+            log "            CECBytes::operator== is an exact vector compare (HdmiCec.h:237-240)."
+            log "            The comparison therefore cannot hold at L2, whatever a test injects."
+            log "          - addChild is never even ENTERED, so its own entry, guard and close"
+            log "            lines (294, 296, 298, 320, 325) are unreachable too.  updateDeviceChain"
+            log "            (HdmiCecSinkImplementation.cpp:1950) calls it only when the announced"
+            log "            address's byte 0 equals m_portID + 1, i.e. 1..3, but the shared mock"
+            log "            decodes ReportPhysicalAddress from startPos = 0 (HdmiCec.h:1067) while"
+            log "            CECFrame::getBuffer returns the WHOLE frame including its header"
+            log "            (HdmiCec.h:194), so byte 0 is the HEADER byte; the production handler"
+            log "            additionally requires header.to == BROADCAST"
+            log "            (HdmiCecSinkImplementation.cpp:346-352), which forces that byte's low"
+            log "            nibble to 0xF and its value to 15 or more.  This run's own log shows"
+            log "            it: 'addr = 79, portID = 0' and 'addr = 143, portID = 0'."
+            log "            (update()'s own 291-292 are NOT in this group: removeDevice can reach"
+            log "            them without addChild -- see the ceiling paragraph below.)"
+            log "          - the UserSettings notification sink (5 lines: 637, 639, 640, 642, 643)."
+            log "            The L2 host publishes no Exchange::IUserSettings, so the plugin logs"
+            log "            'Configure: Failed to get UserSettings interface' on every activation"
+            log "            and never constructs the sink."
+            log "          - the power-manager notification QueryInterface (615, 616) and"
+            log "            the FrameListener destructor (61), neither of which any test-reachable"
+            log "            path invokes at L2 -- msgFrameListener is new'd at"
+            log "            HdmiCecSinkImplementation.cpp:3070 and never deleted anywhere in that"
+            log "            file, so its destructor is a production leak rather than a test gap."
+            log "        The exact split, read off this run's trace: addChild 14 lines (294, 296,"
+            log "        298, 301, 303, 304, 306, 308, 310, 312, 316, 320, 323, 325); removeChild 10"
+            log "        (327, 329, 332, 333, 335, 337, 339, 341, 345, 349); getRoute's guarded body"
+            log "        12 (357, 359, 360, 362, 364, 367, 369, 372, 374, 377, 381, 382);"
+            log "        update(const LogicalAddress&) 2 (291, 292); UserSettings sink 5 (637, 639,"
+            log "        640, 642, 643); power-manager QueryInterface 2 (615, 616); FrameListener"
+            log "        destructor 1 (61).  14 + 10 + 12 + 2 + 5 + 2 + 1 = 46, and 171 - 46 = 125,"
+            log "        which reconciles with the printed 73.1%.  Read the trace, not this list, if"
+            log "        the two ever disagree."
+            log "        WHAT WAS CLOSED, and how far it can go.  ActiveSource(frame, startPos = 2)"
+            log "        DOES decode the real operands (HdmiCec.h:880), so an <Active Source> whose"
+            log "        first address byte matches a port drives getActiveRoute's port walk into"
+            log "        HdmiPortMap::getRoute; the case"
+            log "        ActiveSourceWithPortMatchingAddressByteDrivesThePortMapRouteWalk added by"
+            log "        the QA-remediation pass covers getRoute's entry and guard lines (351, 353,"
+            log "        355, 385) and moved this header from 121/171 = 70.8% to 125/171 = 73.1%."
+            log "        THE CEILING, AND HOW IT WAS ESTABLISHED.  Of the 46, exactly FIVE are"
+            log "        reachable in principle without touching the mock: removeChild's entry,"
+            log "        guard and close (327, 329, 349) plus update()'s two lines (291, 292), which"
+            log "        removeDevice reaches at cpp:2494-2495 when a device whose stored address"
+            log "        byte 0 matches a port is removed.  The other 41 cannot be reached at all:"
+            log "        addChild is never called, and every guarded body is gated on a port having"
+            log "        claimed a logical address, which the four-byte-versus-two-byte comparison"
+            log "        above forbids.  So the DERIVED test-only ceiling is 130/171 = 76.0% - still"
+            log "        below the bar, whatever is written.  That figure is derived from this"
+            log "        enumeration, not measured, and it is labelled so deliberately."
+            log "        A case that would have measured those five was written and run twice during"
+            log "        the QA-remediation pass and is NOT in the tree, because it could not be made"
+            log "        to pass: reaching removeDevice needs the poll thread to complete a PING"
+            log "        sweep that reports the announced device as disconnected, and the sweep does"
+            log "        not get there inside any bound this suite can afford - the announcement puts"
+            log "        the thread into POLL_THREAD_STATE_INFO, which walks every present device"
+            log "        asking for details the mock never answers, parking"
+            log "        HDMICECSINK_REQUEST_INTERVAL_TIME_MS between each"
+            log "        (HdmiCecSinkImplementation.cpp:2860-2895).  Provoking a sweep through"
+            log "        onHdmiHotPlug's disconnect arm, which the sibling hotplug case uses, did not"
+            log "        change the outcome inside 25 s either.  Leaving a failing case in the tree"
+            log "        would break the all-green requirement, and no coverage it could have added"
+            log "        changes this waiver: 130/171 is below the bar exactly as 125/171 is."
+            log "        REQUIRED CHANGE, reported and deliberately NOT made: give"
+            log "        entservices-testframework/Tests/mocks/HdmiCec.h ONE PhysicalAddress"
+            log "        representation (nibble-packed, two bytes, matching production) and decode"
+            log "        ReportPhysicalAddress from the operand offset rather than from 0.  That"
+            log "        header is a read-only authority for this pass (AAP Sec. 0.10.2) and no"
+            log "        in-scope file can substitute for it: the object is constructed inside the"
+            log "        mock's own decoder, ahead of any seam a test can reach."
+            log "        The four route and port-map cases in this repository's L2 file are ENABLED"
+            log "        and pass.  Each asserts unconditionally what IS observable -- that COM-RPC"
+            log "        and JSON-RPC agree on route availability, and that an unavailable route"
+            log "        reports zero length and an empty description rather than stale state --"
+            log "        and guards only the claimed-port branch behind 'if (available)', so they"
+            log "        cannot produce a false green and begin asserting the rest the moment the"
+            log "        mock gains one representation.  The waiver rests on the mock defect, not"
+            log "        on any test being withheld."
             log "        This repository's own L1 suite measures the SAME header at 100% (172/172),"
-            log "        so the header is fully tested -- it is this level that cannot reach it.  No"
-            log "        exclusion glob was added and COVERAGE_MIN was not lowered."
+            log "        so the TARGET meets the specification-section-0.9.2 bar; what is below the"
+            log "        bar is this one LEVEL's view of it.  No exclusion glob was added and"
+            log "        COVERAGE_MIN was not lowered."
             ;;
         *)
             warn "no documented reason is recorded for the exemption '$path' at ${level^^}."
@@ -3608,16 +3915,40 @@ check_all_admissible() {
 # cleanup is re-armed: STAGE_DIR is set inside the subshell and so is the subshell's to remove,
 # whereas the private lcov HOME belongs to the parent, whose own EXIT trap removes it once BOTH
 # levels are done.  Removing it here would leave level L2 with no HOME to run lcov under.
+#
+# It is also run in the BACKGROUND and waited on, for the same reason the suite itself is: a
+# foreground subshell would make `all` uncancellable even though each level inside it is
+# cancellable, because this shell could not reach its own handler until the level had finished.
+# The level's subshell re-arms the signal handler too, so a signal forwarded to its group is what
+# stops the suite running inside it -- the suite is in a group of its own, one level deeper, and
+# only that subshell knows its id.
 run_level_in_subshell() { # $1 = level
+    local pid rc=0
+    set -m
     (
         set -e
         set -o pipefail
-        trap cleanup_stage_dir EXIT
-        trap 'exit 130' INT
-        trap 'exit 143' TERM
-        trap 'exit 129' HUP
+        trap 'stop_suite_group TERM; reap_suite_host; cleanup_stage_dir' EXIT
+        trap 'on_signal INT 130' INT
+        trap 'on_signal TERM 143' TERM
+        trap 'on_signal HUP 129' HUP
         run_level_rebuild_hook "$1" && run_level "$1"
-    )
+    ) &
+    pid=$!
+    SUITE_PGID="$pid"
+    # A level subshell needs longer than a suite does: it has its OWN bounded stop to perform
+    # before it can exit, so the outer bound has to be able to contain the inner one.
+    SUITE_PGID_GRACE=$((SUITE_STOP_GRACE_SECONDS * 2 + 5))
+    set +m
+    # `|| rc=$?` rather than a set +e / set -e pair: toggling errexit inside a function that may
+    # itself have been invoked in a `||` or `if !` context re-arms it where the caller had
+    # deliberately suppressed it, and the run would then abort at the first non-zero status
+    # instead of diagnosing it.  A trapped signal interrupts the wait either way, which is the
+    # whole point of waiting rather than running the suite in the foreground.
+    wait "$pid" || rc=$?
+    SUITE_PGID=''
+    SUITE_PGID_GRACE=''
+    return "$rc"
 }
 
 # Switch a shared tree to the level about to run.  Only used by `all`, and only when the

@@ -151,14 +151,15 @@ get_vendor_id = [
 #   3. HdmiCecSinkImplementation::getCecVersion() is a private void internal helper called only
 #      from Configure() -- it neither returns a value to a caller nor is wired to the JSON-RPC
 #      surface;
-#   4. a workspace-wide grep for _T("getCecVersion") finds exactly two sites, both in the sink L1
-#      test file and both saying the same thing: HdmiCecSinkInitializedEventDsTest
-#      .DISABLED_getCecVersion (test_HdmiCecSink.cpp:1615), which stays disabled for precisely
-#      this reason, and HdmiCecSinkDsTest
-#      .cecVersionIsNotAPublishedMethodButIsObservableThroughTheDeviceList (:6745), which asserts
-#      the absence directly - EXPECT_NE(Core::ERROR_NONE, handler.Exists(_T("getCecVersion")))
-#      with a getDeviceList Exists() control beside it so a broken dispatcher cannot make the
-#      negative pass vacuously.
+#   4. a workspace-wide grep for _T("getCecVersion") finds only the sink L1 test file, where two
+#      ENABLED and passing cases assert the same absence from the two entry points the dispatcher
+#      offers: HdmiCecSinkInitializedEventDsTest.getCecVersion asserts the INVOKE-level refusal
+#      (ERROR_UNKNOWN_KEY, i.e. 22, and an empty response body), and HdmiCecSinkDsTest
+#      .cecVersionIsNotAPublishedMethodButIsObservableThroughTheDeviceList asserts the EXISTS-level
+#      refusal - each with a getDeviceList control beside it so a broken dispatcher cannot make the
+#      negative pass vacuously.  The first of those two was DISABLED until the QA-remediation pass:
+#      it expected the read-back {"CECVersion":"1.4","success":true}, which cannot happen, so its
+#      assertions were narrowed to the refusal that does happen and the case was enabled.
 # The mechanism behind all four: the method is absent from IHdmiCecSink.h's published set and
 # therefore from Exchange::JHdmiCecSink::Register, which is the plugin's only JSON-RPC
 # registration path. Publishing it is a production change - a declaration on
@@ -171,8 +172,9 @@ get_vendor_id = [
 # from a peer (Device_CEC_Version.yaml) is recorded by process(const CECVersion &, const Header &)
 # into that peer's device-list entry, and `get_device_list` above reads it back as the entry's
 # "cecVersion". If the plugin ever publishes the method, add a `get_cec_version` constant here
-# alongside the others and re-enable DISABLED_getCecVersion in
-# ../L1Tests/tests/test_HdmiCecSink.cpp.
+# alongside the others and restore the original read-back assertion in
+# HdmiCecSinkInitializedEventDsTest.getCecVersion (../L1Tests/tests/test_HdmiCecSink.cpp), which
+# currently asserts the refusal instead and will fail the moment the method appears.
 
 
 print_device_list = [
